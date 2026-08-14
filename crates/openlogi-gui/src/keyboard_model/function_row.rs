@@ -88,7 +88,13 @@ const CALLOUT_BAND_H: f32 = 118.;
 /// Vertical chrome around the keyboard pane (header, tab strip, screen
 /// padding, footer) — the viewport height minus this and the callout band is
 /// what the render may occupy before it scales down to fit.
-const KEYS_VERTICAL_RESERVE: f32 = 224.;
+///
+/// Derived from the theme's chrome for the same reason the mouse model's
+/// reserve is: a shorter header should widen the render, not go unspent.
+const KEYS_VERTICAL_RESERVE: f32 =
+    theme::HEADER_H + theme::FOOTER_H + 2. * theme::SCREEN_PAD + KEYS_TAB_STRIP_H;
+/// Height the detail tab strip occupies between the header and this tab body.
+const KEYS_TAB_STRIP_H: f32 = 54.;
 /// Floor on the render height so a tiny window still shows a usable model.
 const KEYBOARD_MIN_IMG_H: f32 = 160.;
 const KEY_CALLOUT_W: f32 = 60.;
@@ -1287,7 +1293,11 @@ mod tests {
         assert!((h - 700. * 1600. / 2760.).abs() < 0.01);
 
         // A short viewport shrinks the render instead of overflowing it.
-        let (w, h) = keyboard_render_size(Some(&g513), 500.);
+        // Derived, not a literal: the floor only engages below
+        // reserve + band + floor, and that threshold moves whenever the theme's
+        // chrome heights do.
+        let too_short = KEYS_VERTICAL_RESERVE + CALLOUT_BAND_H + KEYBOARD_MIN_IMG_H - 40.;
+        let (w, h) = keyboard_render_size(Some(&g513), too_short);
         assert_approx_eq(h, KEYBOARD_MIN_IMG_H);
         assert!((w - KEYBOARD_MIN_IMG_H * 2760. / 1600.).abs() < 0.01);
 

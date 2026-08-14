@@ -33,8 +33,14 @@ pub const STATUS_OFFLINE: u32 = 0x006b_7280;
 pub const STATUS_DISABLED: u32 = 0x00ef_4444;
 
 /// Sizes that several components need to agree on.
-pub const HEADER_H: f32 = 80.;
-pub const FOOTER_H: f32 = 50.;
+///
+/// Chrome heights are sized for a macOS toolbar and status bar rather than a
+/// web banner: at 80px the header read as a page masthead, which is most of
+/// why the window looked like a site instead of an app. Shrinking them frees
+/// real estate the device model can use, so the two `*_VERTICAL_RESERVE`
+/// constants that budget around them track these values.
+pub const HEADER_H: f32 = 56.;
+pub const FOOTER_H: f32 = 34.;
 
 /// Semantic spacing tokens (px), so surfaces that must agree share one value
 /// instead of each call site hand-picking a `p_*` / `gap_*` step.
@@ -44,20 +50,21 @@ pub const FOOTER_H: f32 = 50.;
 ///   two-column grid is sized against this exact value; see its card min-width).
 /// - `CARD_PAD` / `CARD_GAP` — a card's inner padding and its title-to-content
 ///   gap, so every [`panel_card`](crate::app) reads the same.
-pub const SCREEN_PAD: f32 = 20.;
-pub const CARD_PAD: f32 = 16.;
-pub const CARD_GAP: f32 = 12.;
+pub const SCREEN_PAD: f32 = 16.;
+pub const CARD_PAD: f32 = 12.;
+pub const CARD_GAP: f32 = 10.;
 
 /// Apple HIG / WCAG minimum contrast for normal text up to 17pt.
 const MIN_TEXT_CONTRAST: f32 = 4.5;
 
 /// How much of the macOS window material [`Palette::backdrop`] lets through.
 ///
-/// Deliberately high. The point is a hint of the desktop moving behind a
-/// surface that is still unmistakably the theme's own colour — and the muted
-/// text ramp is normalised for contrast against the opaque colour, so a deeper
-/// bleed would quietly undercut [`MIN_TEXT_CONTRAST`] over a bright wallpaper.
-const BACKDROP_ALPHA: f32 = 0.9;
+/// High on purpose, but not so high the material stops reading: at 0.9 the
+/// bleed was invisible against a dark desktop, which is the whole effect
+/// wasted. The ceiling is legibility — the muted text ramp is normalised for
+/// contrast against the *opaque* colour, so a deeper bleed than this would
+/// quietly undercut [`MIN_TEXT_CONTRAST`] over a bright wallpaper.
+const BACKDROP_ALPHA: f32 = 0.8;
 
 /// Fixed footprint of a device card in the Home gallery. Equal-width cards lay
 /// out in a horizontally scrollable row (centred when they fit, scrollable when
@@ -478,53 +485,67 @@ fn focus_ring(pal: Palette) -> BoxShadow {
 
 /// The app's type ramp as semantic roles, so a heading is `.text_heading()`
 /// everywhere instead of each call site re-picking a `text_*` size and a
-/// `font_weight`. Sizes, weights, and line heights live here once — an
-/// Apple-HIG-inspired scale, more generous and higher-contrast than the raw
-/// Tailwind steps it replaces — and every screen re-skins by editing this trait.
+/// `font_weight`. Sizes, weights, and line heights live here once, and every
+/// screen re-skins by editing this trait.
+///
+/// The sizes are AppKit's own text styles — title1 22, title2 17, headline /
+/// body 13, subheadline 11 — not a scale "inspired by" them. An earlier pass
+/// deliberately ran a rung larger and heavier than HIG; the result read as a
+/// web page rather than a Mac app, which is most of what "rough" meant. Native
+/// chrome is small text with roomy leading, so the *leading ratios are
+/// unchanged* — density comes from the size, not from crowding the lines.
+///
+/// Weight tops out at SEMIBOLD, again as HIG does: hierarchy is carried by the
+/// colour ramp ([`Palette::text_primary`] → `text_muted` → `text_ghost`), which
+/// is a quieter signal than size and weight both shouting.
 ///
 /// Blanket-implemented for every [`Styled`] element, the same way
 /// [`SelectableStyle`] extends styling. Colour stays a separate axis (the caller
 /// still picks `pal.text_primary` / `text_muted`); this trait only fixes size,
 /// weight, and leading.
 pub trait Typography: Styled + Sized {
-    /// Page / dialog hero title (empty states, connection notices). The
-    /// heaviest, largest step — the one place Bold is used.
+    /// Page / dialog hero title (empty states, connection notices). AppKit
+    /// title1.
     #[must_use]
     fn text_title(self) -> Self {
-        self.text_size(px(26.))
-            .font_weight(FontWeight::BOLD)
+        self.text_size(px(22.))
+            .font_weight(FontWeight::SEMIBOLD)
             .line_height(relative(1.2))
     }
 
     /// Screen / section heading — the Home title, a device name, a window's
-    /// primary heading.
+    /// primary heading. AppKit title2.
     #[must_use]
     fn text_heading(self) -> Self {
-        self.text_size(px(20.))
+        self.text_size(px(17.))
             .font_weight(FontWeight::SEMIBOLD)
             .line_height(relative(1.3))
     }
 
     /// Card / group title and item names — a heading one rung down, sitting
-    /// inside a card rather than titling a screen.
+    /// inside a card rather than titling a screen. AppKit headline: body size
+    /// at semibold, so a card title aligns with the values under it instead of
+    /// stepping out of the grid.
     #[must_use]
     fn text_subheading(self) -> Self {
-        self.text_size(px(15.))
+        self.text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .line_height(relative(1.4))
     }
 
-    /// Default body copy — control labels, descriptions, values.
+    /// Default body copy — control labels, descriptions, values. AppKit body,
+    /// which is also the system control size.
     #[must_use]
     fn text_body(self) -> Self {
-        self.text_size(px(15.)).line_height(relative(1.45))
+        self.text_size(px(13.)).line_height(relative(1.45))
     }
 
     /// De-emphasised metadata and helper text — the muted line under a label,
-    /// battery readouts, hints. Pair with `pal.text_muted`.
+    /// battery readouts, hints. AppKit subheadline. Pair with
+    /// `pal.text_muted`.
     #[must_use]
     fn text_caption(self) -> Self {
-        self.text_size(px(12.)).line_height(relative(1.4))
+        self.text_size(px(11.)).line_height(relative(1.4))
     }
 }
 

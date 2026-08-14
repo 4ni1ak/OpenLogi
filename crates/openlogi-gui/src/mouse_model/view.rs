@@ -39,7 +39,15 @@ const HOTSPOT_DOT: f32 = 12.;
 /// Vertical space around the model that it can't draw into: the detail header
 /// and footer, plus the buttons-tab padding. The model scales to fit whatever
 /// viewport height remains.
-const MODEL_VERTICAL_RESERVE: f32 = 224.;
+///
+/// Derived rather than measured: the three terms the theme owns come from it,
+/// so shrinking the chrome hands the model the space instead of leaving it
+/// budgeted for a header that is no longer that tall. The residual is the tab
+/// strip between them.
+const MODEL_VERTICAL_RESERVE: f32 =
+    theme::HEADER_H + theme::FOOTER_H + 2. * theme::SCREEN_PAD + DETAIL_TAB_STRIP_H;
+/// Height the detail tab strip occupies between the header and a tab body.
+const DETAIL_TAB_STRIP_H: f32 = 54.;
 /// Floor for the scaled model height. Below this the evenly-slotted side labels
 /// (≈[`LABEL_H`] each) start to overlap; the window's minimum height is sized to
 /// keep the viewport above [`MODEL_VERTICAL_RESERVE`] + this.

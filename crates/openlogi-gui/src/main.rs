@@ -593,7 +593,9 @@ fn main_window_options(cx: &mut gpui::App) -> WindowOptions {
         // Min height keeps the buttons tab's mouse model above its scale floor
         // (`MODEL_MIN_H` + the chrome/padding reserve) so its side labels never
         // overlap; below this the model can't shrink further without crowding.
-        window_min_size: Some(Size::new(px(720.), px(680.))),
+        // The floor dropped with the chrome: a 56 px header and 34 px footer
+        // need 176 px of reserve, not 224.
+        window_min_size: Some(Size::new(px(720.), px(640.))),
         // Linux: transparent chrome so `AppView::render` can draw a client-side
         // `TitleBar` (the compositor declines server-side decorations and gpui's
         // fallback is unpainted). macOS/Windows keep their native titlebar.
