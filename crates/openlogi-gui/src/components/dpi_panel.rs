@@ -395,6 +395,7 @@ fn preset_chip(idx: usize, value: u32, active: bool, presets: &[u32], pal: Palet
                 .xsmall()
                 .ghost()
                 .icon(IconName::Close)
+                .tooltip(tr!("Remove preset"))
                 .on_click(move |_event, _window, cx| {
                     let mut next = presets_for_remove.clone();
                     if idx < next.len() {

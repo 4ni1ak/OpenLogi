@@ -262,6 +262,7 @@ impl Carousel {
                 this.child(arrow(
                     "carousel-prev",
                     IconName::ChevronLeft,
+                    tr!("Previous"),
                     selected.saturating_sub(1),
                     selected == 0,
                     Size::Large,
@@ -273,6 +274,7 @@ impl Carousel {
                 this.child(arrow(
                     "carousel-next",
                     IconName::ChevronRight,
+                    tr!("Next"),
                     (selected + 1).min(len - 1),
                     selected + 1 >= len,
                     Size::Large,
@@ -455,6 +457,7 @@ fn controls(
             t.child(arrow(
                 "carousel-prev",
                 IconName::ChevronLeft,
+                tr!("Previous"),
                 selected.saturating_sub(1),
                 selected == 0,
                 Size::XSmall,
@@ -473,6 +476,7 @@ fn controls(
             t.child(arrow(
                 "carousel-next",
                 IconName::ChevronRight,
+                tr!("Next"),
                 (selected + 1).min(len - 1),
                 selected + 1 >= len,
                 Size::XSmall,
@@ -515,6 +519,9 @@ fn side_slot(
 fn arrow(
     id: &'static str,
     icon: IconName,
+    // The only name this control has: a bare chevron says nothing to a tooltip
+    // or to anything reading the button.
+    label: SharedString,
     target: usize,
     disabled: bool,
     size: Size,
@@ -524,6 +531,7 @@ fn arrow(
         .icon(icon)
         .ghost()
         .with_size(size)
+        .tooltip(label)
         .disabled(disabled)
         .when_some(on_select.filter(|_| !disabled), |this, handler| {
             this.on_click(move |_, window, cx| handler(&target, window, cx))

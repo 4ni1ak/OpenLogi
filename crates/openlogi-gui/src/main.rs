@@ -200,6 +200,10 @@ fn main() -> Result<()> {
     app.run(move |cx| {
         gpui_component::init(cx);
         theme::register_builtin_themes(cx);
+        // Before any window: gpui's animations read this flag, and a window
+        // that opened while it was still at its default would animate once
+        // against the user's stated preference.
+        platform::os::init_reduce_motion(cx);
         app_menu::install(cx);
 
         // Seed the Add Device window's initial state. Its buttons drive pairing
@@ -438,6 +442,9 @@ fn main() -> Result<()> {
                         }
                         Some(ipc_client::GuiUpdate::OutdatedGui) => {
                             cx.update(|cx| set_agent_link(state::AgentLink::OutdatedGui, cx));
+                        }
+                        Some(ipc_client::GuiUpdate::OutdatedAgent) => {
+                            cx.update(|cx| set_agent_link(state::AgentLink::OutdatedAgent, cx));
                         }
                         Some(ipc_client::GuiUpdate::LightCommandResult {
                             key,

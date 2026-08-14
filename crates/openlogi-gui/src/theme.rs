@@ -143,10 +143,14 @@ pub struct Palette {
     /// hand-painted cards follow the Appearance → radius slider — which the old
     /// hard-coded `rounded_*` helpers (fixed px, blind to the slider) could not.
     ///
-    /// Scaled `× 1.5` above the base control radius so a card reads as rounder
+    /// Scaled `× 2` above the base control radius so a card reads as rounder
     /// than the small controls nested inside it — the concentric-corner
     /// relationship (outer radius > inner radius) that a single flat radius
     /// can't express.
+    ///
+    /// At the theme's default 6px control radius that puts cards at 12, the
+    /// step native apps use. The previous `× 1.5` landed on 9, close enough to
+    /// the controls inside that the nesting stopped reading.
     pub card_radius: Pixels,
     /// Corner radius for the small controls nested inside cards — chips, pills,
     /// segmented items, toggles. The base `cx.theme().radius`, i.e. the same
@@ -249,7 +253,7 @@ pub fn palette(cx: &App) -> Palette {
         wash: t.foreground.opacity(0.06),
         wash_strong: t.foreground.opacity(0.1),
         ring: t.ring,
-        card_radius: t.radius * 1.5,
+        card_radius: t.radius * 2.,
         control_radius: t.radius,
     }
 }

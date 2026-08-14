@@ -81,6 +81,24 @@ pub(super) fn unreachable_body(pal: Palette) -> AnyElement {
     .into_any_element()
 }
 
+/// Whole-window frame when the agent answered with an *older* IPC protocol
+/// than this process speaks: a stale agent binary still holds the socket,
+/// usually because the app was updated while the old agent kept running.
+///
+/// Deliberately not [`unreachable_body`]: the socket is answering, so the
+/// "try reinstalling" advice there would send the user the wrong way. The
+/// spawn retry and the agent-side takeover already drive the replacement, so
+/// this frame only has to say what is happening.
+pub(super) fn outdated_agent_body(pal: Palette) -> AnyElement {
+    notice_body(
+        tr!("Waiting for the background service to update"),
+        tr!("An older version of the service is still running — it will be replaced shortly."),
+        pal,
+    )
+    .size_full()
+    .into_any_element()
+}
+
 /// Whole-window frame when the *agent* answered with a newer IPC protocol
 /// than this process speaks: the app bundle was updated while this window
 /// stayed open, and only a relaunch loads the new GUI. Without this frame the

@@ -451,6 +451,12 @@ impl Render for AppView {
                 window.set_window_title("OpenLogi");
                 return root.child(status::unreachable_body(pal)).into_any_element();
             }
+            AgentLink::OutdatedAgent => {
+                window.set_window_title("OpenLogi");
+                return root
+                    .child(status::outdated_agent_body(pal))
+                    .into_any_element();
+            }
             AgentLink::OutdatedGui => {
                 window.set_window_title("OpenLogi");
                 return root

@@ -66,6 +66,11 @@ pub enum GuiUpdate {
     /// updated on disk while this GUI kept running, and only a relaunch
     /// helps. Sent once per episode.
     OutdatedGui,
+    /// The mirror image: the agent answered with an *older* protocol, so a
+    /// stale agent binary is still holding the socket. Sent once per episode.
+    /// Distinct from [`Self::Unreachable`] because the socket is answering
+    /// fine — telling the user to reinstall would send them the wrong way.
+    OutdatedAgent,
     /// Result of an agent-owned standalone-light command. The typed failure
     /// reaches the GPUI state model instead of being reduced to a log line.
     LightCommandResult {
@@ -188,6 +193,7 @@ async fn poll_loop(
     let mut last_delivery: Option<Instant> = None;
     let mut notified_unreachable = false;
     let mut notified_outdated = false;
+    let mut notified_outdated_agent = false;
     let mut pacing = pacing::Pacing::new(poll_period, FAST_PHASE_MAX, started);
     let mut interval = ticker(None, STARTUP_POLL_PERIOD);
     loop {
@@ -205,6 +211,7 @@ async fn poll_loop(
                         last_delivery = Some(now);
                         notified_unreachable = false;
                         notified_outdated = false;
+                        notified_outdated_agent = false;
                         pacing.on_delivered(ready, now)
                     }
                     Ok(PollOutcome::NoAgent) => pacing.on_unreachable(now),
@@ -214,6 +221,16 @@ async fn poll_loop(
                             let _ = update_tx.send(GuiUpdate::OutdatedGui);
                         }
                         pacing.on_newer_agent(now)
+                    }
+                    Ok(PollOutcome::OlderAgent) => {
+                        if !notified_outdated_agent {
+                            notified_outdated_agent = true;
+                            let _ = update_tx.send(GuiUpdate::OutdatedAgent);
+                        }
+                        // Same cadence as an absent agent: the socket answers,
+                        // but nothing usable comes over it until the stale
+                        // binary is replaced — which the spawn retry drives.
+                        pacing.on_unreachable(now)
                     }
                     Err(()) => {
                         client = None; // drop the dead connection; reconnect next tick
@@ -465,10 +482,15 @@ fn agent_binary_path() -> Option<PathBuf> {
 
 /// Why [`ensure`] couldn't produce a usable client.
 enum ConnectFailure {
-    /// Socket down, handshake failed, or the agent is *older* than us — in
-    /// every case the fix is an agent (re)start, which the spawn retry and
-    /// the agent-side takeover drive; keep retrying.
+    /// Socket down or the handshake failed outright. The fix is an agent
+    /// (re)start, which the spawn retry and the agent-side takeover drive;
+    /// keep retrying.
     Unreachable,
+    /// The agent is *older* than us: a stale binary still holds the socket.
+    /// Recovery is the same retry loop as [`Self::Unreachable`] — the agent
+    /// has to be replaced — but the *cause* is worth telling the user apart,
+    /// because "reinstall the app" is the wrong advice for it.
+    OlderAgent,
     /// The agent is *newer* than us: this GUI process is the stale side and
     /// only a relaunch helps. Surfaced to the user as [`GuiUpdate::OutdatedGui`].
     NewerAgent,
@@ -497,7 +519,7 @@ async fn ensure(client: &mut Option<AgentClient>) -> Result<&AgentClient, Connec
                     gui = PROTOCOL_VERSION,
                     "agent IPC protocol is older — waiting for the agent to be replaced"
                 );
-                return Err(ConnectFailure::Unreachable);
+                return Err(ConnectFailure::OlderAgent);
             }
             Ok(version) => {
                 warn!(
@@ -525,6 +547,8 @@ enum PollOutcome {
     NoAgent,
     /// The agent speaks a newer protocol than this GUI.
     NewerAgent,
+    /// The agent speaks an older protocol than this GUI.
+    OlderAgent,
 }
 
 /// Poll status + inventory as one agent snapshot and push it. `Err` means a
@@ -538,6 +562,7 @@ async fn poll(
         Ok(client) => client,
         Err(ConnectFailure::Unreachable) => return Ok(PollOutcome::NoAgent),
         Err(ConnectFailure::NewerAgent) => return Ok(PollOutcome::NewerAgent),
+        Err(ConnectFailure::OlderAgent) => return Ok(PollOutcome::OlderAgent),
     };
     // Fetch status + inventory in one RPC so inventory readiness and the list
     // are interpreted from the same orchestrator state.

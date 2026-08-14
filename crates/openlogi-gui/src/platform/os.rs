@@ -124,3 +124,48 @@ pub fn configure_window_material(window: &gpui::Window) {
 
 #[cfg(not(target_os = "macos"))]
 pub fn configure_window_material(_window: &gpui::Window) {}
+
+/// Tell gpui whether the user asked the system to reduce motion.
+///
+/// gpui's `with_animation` already honours `App::reduce_motion`, but nothing
+/// ever *set* it, so the flag sat at its default and every animation ran
+/// regardless of the system preference. Call once at startup, before the
+/// window opens.
+///
+/// A direct `window.request_animation_frame` for decorative motion is not
+/// covered by that flag and must check `cx.reduce_motion()` itself.
+#[cfg(target_os = "macos")]
+pub fn init_reduce_motion(cx: &mut gpui::App) {
+    use objc2_app_kit::NSWorkspace;
+
+    cx.set_reduce_motion(NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion());
+}
+
+/// GNOME exposes the same preference through GSettings. Resolved off the UI
+/// thread — it shells out — and applied when it lands; frames only ever read
+/// gpui's in-memory flag.
+#[cfg(target_os = "linux")]
+pub fn init_reduce_motion(cx: &mut gpui::App) {
+    cx.spawn(async move |cx| {
+        let reduce = cx
+            .background_executor()
+            .spawn(async move { gnome_animations_disabled() })
+            .await;
+        cx.update(|cx| cx.set_reduce_motion(reduce)).ok();
+    })
+    .detach();
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_animations_disabled() -> bool {
+    std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "enable-animations"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn init_reduce_motion(_cx: &mut gpui::App) {}
