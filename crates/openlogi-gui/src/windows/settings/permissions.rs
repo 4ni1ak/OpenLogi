@@ -12,7 +12,11 @@ use super::{
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::platform::permissions;
-use crate::theme::{ControlStyle as _, Typography as _, WashStyle as _};
+use crate::theme::Typography as _;
+// The only styled control on this page is the macOS "Open System Settings"
+// row; the Linux page is plain text, so these would be unused imports there.
+#[cfg(target_os = "macos")]
+use crate::theme::{ControlStyle as _, WashStyle as _};
 
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),

@@ -141,19 +141,16 @@ pub fn init_reduce_motion(cx: &mut gpui::App) {
     cx.set_reduce_motion(NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion());
 }
 
-/// GNOME exposes the same preference through GSettings. Resolved off the UI
-/// thread — it shells out — and applied when it lands; frames only ever read
-/// gpui's in-memory flag.
+/// GNOME exposes the same preference through GSettings.
+///
+/// Read synchronously, like the macOS arm. It shells out, which is exactly the
+/// kind of work the render path must never touch — but this runs once before
+/// the first window exists, and resolving it in the background would let that
+/// window (and its first animation) be created while the flag still held its
+/// default, quietly ignoring the preference for the moment that matters most.
 #[cfg(target_os = "linux")]
 pub fn init_reduce_motion(cx: &mut gpui::App) {
-    cx.spawn(async move |cx| {
-        let reduce = cx
-            .background_executor()
-            .spawn(async move { gnome_animations_disabled() })
-            .await;
-        cx.update(|cx| cx.set_reduce_motion(reduce)).ok();
-    })
-    .detach();
+    cx.set_reduce_motion(gnome_animations_disabled());
 }
 
 #[cfg(target_os = "linux")]

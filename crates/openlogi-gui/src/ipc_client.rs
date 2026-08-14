@@ -214,7 +214,15 @@ async fn poll_loop(
                         notified_outdated_agent = false;
                         pacing.on_delivered(ready, now)
                     }
-                    Ok(PollOutcome::NoAgent) => pacing.on_unreachable(now),
+                    Ok(PollOutcome::NoAgent) => {
+                        // The socket is absent now, so any protocol mismatch we
+                        // reported describes an agent that is gone. Re-arm both
+                        // notices: this is a fresh episode, and the generic
+                        // unreachable notice below is right again.
+                        notified_outdated = false;
+                        notified_outdated_agent = false;
+                        pacing.on_unreachable(now)
+                    }
                     Ok(PollOutcome::NewerAgent) => {
                         if !notified_outdated {
                             notified_outdated = true;
@@ -241,8 +249,15 @@ async fn poll_loop(
                 if let Some(cadence) = cadence {
                     interval = apply_cadence(cadence, &pacing);
                 }
+                // A protocol mismatch leaves `client` at `None` too, so without
+                // the two guards this would talk over the specialised frame
+                // once the fast phase elapsed — telling the user to reinstall
+                // while the socket is answering. Both are cleared again the
+                // moment the socket actually goes away (see `NoAgent`).
                 if client.is_none()
                     && !notified_unreachable
+                    && !notified_outdated
+                    && !notified_outdated_agent
                     && now.duration_since(last_delivery.unwrap_or(started)) >= FAST_PHASE_MAX
                 {
                     notified_unreachable = true;

@@ -11,7 +11,11 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::theme::{self, ControlStyle as _, FOOTER_H, Palette, Typography as _};
+use crate::theme::{self, FOOTER_H, Palette, Typography as _};
+// The footer's only control is the macOS Accessibility indicator; every other
+// platform renders the footer as passive text.
+#[cfg(target_os = "macos")]
+use crate::theme::ControlStyle as _;
 
 /// Centered spinner over a muted one-line caption — the quiet "still working"
 /// body shared by the pre-connection frame and the scanning state, so the two
