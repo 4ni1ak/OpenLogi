@@ -24,7 +24,7 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, AppContext as _, BorrowAppContext as _, Bounds, Context, Entity, FontWeight, Hsla,
     InteractiveElement, IntoElement, ParentElement, PathBuilder, Render,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, hsla, point,
+    StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, point,
     prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_component::{h_flex, input::InputState, v_flex};
@@ -43,7 +43,7 @@ use crate::mouse_model::picker::{
     section_header,
 };
 use crate::state::AppState;
-use crate::theme::{self, ACCENT_BLUE, Palette};
+use crate::theme::{self, ACCENT_BLUE, ControlStyle as _, Palette};
 use gpui::ease_in_out;
 use gpui::{Animation, AnimationExt, img};
 
@@ -529,9 +529,11 @@ fn key_callout(
         .bg(if highlighted {
             theme::accent_tint()
         } else {
-            pal.surface_hover
+            pal.wash
         })
-        .cursor_pointer()
+        // No press wash: this chip carries the selection tint, which a neutral
+        // fill would momentarily erase.
+        .control(*pal)
         .hover(move |s| {
             s.bg(if highlighted {
                 theme::accent_tint_hover()
@@ -597,7 +599,7 @@ fn key_click_target(
     highlighted: bool,
     (img_w, img_h): (f32, f32),
     view: &Entity<FunctionRowView>,
-    _pal: &Palette,
+    pal: &Palette,
 ) -> AnyElement {
     let idx = slot.idx;
     let x_frac = slot.x_frac;
@@ -617,7 +619,8 @@ fn key_click_target(
         .flex()
         .items_center()
         .justify_center()
-        .cursor_pointer()
+        .control(*pal)
+        .press_wash(*pal)
         .when(highlighted, |el| {
             el.child(
                 div()
@@ -669,9 +672,20 @@ fn keyboard_leader_canvas(
         slots.iter().map(|s| (s.idx, s.x_frac, s.y_frac)).collect();
     canvas(
         move |_bounds, _, _| (guides, selected, hovered),
-        move |bounds, payload, window, _app| {
+        // Resolved at paint time rather than captured, so an appearance flip
+        // repaints these lines with the new theme (see `leader_canvas`).
+        move |bounds, payload, window, app| {
             let (guides, selected, hovered) = payload;
-            paint_keyboard_leaders(bounds, guides, selected, hovered, (img_w, img_h), window);
+            let pal = theme::palette(app);
+            paint_keyboard_leaders(
+                bounds,
+                guides,
+                selected,
+                hovered,
+                (img_w, img_h),
+                pal,
+                window,
+            );
         },
     )
     .absolute()
@@ -686,6 +700,7 @@ fn paint_keyboard_leaders(
     selected: Option<usize>,
     hovered: Option<usize>,
     (img_w, img_h): (f32, f32),
+    pal: Palette,
     window: &mut Window,
 ) {
     let count = guides.len();
@@ -707,7 +722,7 @@ fn paint_keyboard_leaders(
             if highlighted {
                 window.paint_path(path, rgb(ACCENT_BLUE));
             } else {
-                window.paint_path(path, hsla(0., 0., 0.55, 0.35));
+                window.paint_path(path, pal.text_ghost);
             }
         }
     }

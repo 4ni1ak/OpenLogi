@@ -35,6 +35,8 @@ use gpui_component::{
     h_flex, v_flex,
 };
 
+use crate::theme::{ControlStyle as _, Palette};
+
 type SelectHandler = Rc<dyn Fn(&usize, &mut Window, &mut App) + 'static>;
 type ItemRenderer = Rc<dyn Fn(usize, bool, &mut Window, &mut App) -> AnyElement + 'static>;
 
@@ -206,7 +208,7 @@ impl Carousel {
         let selected = selected.min(len - 1);
         let multi = len > 1;
         let accent = accent.unwrap_or(cx.theme().primary);
-        let dot_idle = cx.theme().border;
+        let dot_colors = DotColors::resolve(accent, cx);
 
         let scroll_state =
             window.use_keyed_state(SharedString::from(format!("{id}-scroll")), cx, |_, _| {
@@ -291,9 +293,7 @@ impl Carousel {
                         .justify_center()
                         .gap_1p5()
                         .children(
-                            (0..len).map(|i| {
-                                dot(i, i == selected, accent, dot_idle, on_select.clone())
-                            }),
+                            (0..len).map(|i| dot(i, i == selected, dot_colors, on_select.clone())),
                         ),
                 )
             })
@@ -324,7 +324,7 @@ impl Carousel {
         let selected = selected.min(len - 1);
         let multi = len > 1;
         let accent = accent.unwrap_or(cx.theme().primary);
-        let dot_idle = cx.theme().border;
+        let dot_colors = DotColors::resolve(accent, cx);
         let has_prev = selected > 0;
         let has_next = selected + 1 < len;
 
@@ -379,6 +379,8 @@ impl Carousel {
                 },
             );
 
+        // Both peeks differ only in their element and index.
+        let peek = |el, index| side_slot(el, index, side_frac, dot_colors.pal, on_select.clone());
         let stage = h_flex()
             .id("carousel-stage")
             .w_full()
@@ -389,22 +391,10 @@ impl Carousel {
             .gap(gap)
             .overflow_hidden()
             .when(multi, |this| {
-                this.child(side_slot(
-                    prev_el,
-                    selected.saturating_sub(1),
-                    side_frac,
-                    on_select.clone(),
-                ))
+                this.child(peek(prev_el, selected.saturating_sub(1)))
             })
             .child(focused_slot)
-            .when(multi, |this| {
-                this.child(side_slot(
-                    next_el,
-                    selected + 1,
-                    side_frac,
-                    on_select.clone(),
-                ))
-            });
+            .when(multi, |this| this.child(peek(next_el, selected + 1)));
 
         v_flex()
             .size_full()
@@ -416,12 +406,34 @@ impl Carousel {
                     selected,
                     arrows,
                     indicators,
-                    accent,
-                    dot_idle,
+                    dot_colors,
                     on_select.as_ref(),
                 ))
             })
             .into_any_element()
+    }
+}
+
+/// Everything a page-indicator dot paints itself with, bundled so it travels
+/// as one argument from the render pass down to [`dot`].
+#[derive(Clone, Copy)]
+struct DotColors {
+    /// Fill of the dot for the selected page.
+    accent: Hsla,
+    /// Fill of every other dot.
+    idle: Hsla,
+    /// Also the carousel's own control palette — the peeking slots read it too,
+    /// so resolving it once here keeps both render passes to one lookup.
+    pal: Palette,
+}
+
+impl DotColors {
+    fn resolve(accent: Hsla, cx: &App) -> Self {
+        Self {
+            accent,
+            idle: cx.theme().border,
+            pal: crate::theme::palette(cx),
+        }
     }
 }
 
@@ -431,8 +443,7 @@ fn controls(
     selected: usize,
     arrows: bool,
     indicators: bool,
-    accent: Hsla,
-    idle: Hsla,
+    colors: DotColors,
     on_select: Option<&SelectHandler>,
 ) -> impl IntoElement {
     h_flex()
@@ -451,9 +462,12 @@ fn controls(
             ))
         })
         .when(indicators, |t| {
-            t.child(h_flex().items_center().gap_1p5().children(
-                (0..len).map(|i| dot(i, i == selected, accent, idle, on_select.cloned())),
-            ))
+            t.child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .children((0..len).map(|i| dot(i, i == selected, colors, on_select.cloned()))),
+            )
         })
         .when(arrows, |t| {
             t.child(arrow(
@@ -473,6 +487,7 @@ fn side_slot(
     el: Option<AnyElement>,
     index: usize,
     frac: f32,
+    pal: Palette,
     on_select: Option<SelectHandler>,
 ) -> AnyElement {
     let base = div()
@@ -486,7 +501,7 @@ fn side_slot(
         Some(el) => base
             .id(("carousel-peek", index))
             .opacity(0.6)
-            .cursor_pointer()
+            .control(pal)
             .hover(|s| s.opacity(0.85))
             .when_some(on_select, |this, handler| {
                 this.on_click(move |_, window, cx| handler(&index, window, cx))
@@ -518,10 +533,10 @@ fn arrow(
 fn dot(
     index: usize,
     active: bool,
-    accent: Hsla,
-    idle: Hsla,
+    colors: DotColors,
     on_select: Option<SelectHandler>,
 ) -> impl IntoElement {
+    let DotColors { accent, idle, pal } = colors;
     let size = if active { px(8.) } else { px(6.) };
     div()
         .id(("carousel-dot", index))
@@ -529,7 +544,7 @@ fn dot(
         .h(size)
         .rounded_full()
         .bg(if active { accent } else { idle })
-        .cursor_pointer()
+        .control(pal)
         .when_some(on_select, |this, handler| {
             this.on_click(move |_, window, cx| handler(&index, window, cx))
         })

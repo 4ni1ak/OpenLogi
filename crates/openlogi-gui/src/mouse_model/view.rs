@@ -25,7 +25,7 @@ use crate::mouse_model::picker::{
 };
 use crate::mouse_model::thumbwheel::ThumbwheelPreset;
 use crate::state::AppState;
-use crate::theme::{self, ACCENT_BLUE, Palette, Typography as _};
+use crate::theme::{self, ACCENT_BLUE, ControlStyle as _, Palette, Typography as _};
 
 const SIDE_W: f32 = 180.;
 const SIDE_GAP: f32 = 24.;
@@ -258,7 +258,10 @@ fn leader_canvas(
 ) -> impl IntoElement {
     canvas(
         move |_bounds, _, _| (hotspots, labels, highlight),
-        move |bounds, payload, window, _app| {
+        // Resolved at paint time rather than captured: the canvas outlives an
+        // appearance flip, and a captured palette would keep painting the old
+        // theme's lines until something else forced a rebuild.
+        move |bounds, payload, window, app| {
             let (hotspots, labels, highlight) = payload;
             paint_leader_lines(
                 bounds,
@@ -270,6 +273,7 @@ fn leader_canvas(
                 &hotspots,
                 &labels,
                 highlight,
+                theme::palette(app),
                 window,
             );
         },
@@ -533,12 +537,20 @@ impl RenderOnce for LabelTrigger {
                 pal.border
             })
             .bg(if highlighted {
-                pal.surface
+                theme::accent_tint()
             } else {
-                pal.surface_hover
+                pal.wash
             })
-            .cursor_pointer()
-            .hover(move |s| s.bg(pal.surface))
+            // No press wash: this chip carries the selection tint, which a
+            // neutral fill would momentarily erase.
+            .control(pal)
+            .hover(move |s| {
+                s.bg(if highlighted {
+                    theme::accent_tint_hover()
+                } else {
+                    pal.wash_strong
+                })
+            })
             // Button name — the caption (xs / muted), the same size as the
             // popover title and category headers it shares the binding flow with.
             .child(
@@ -679,8 +691,8 @@ fn silhouette(w: f32, h: f32, pal: Palette) -> impl IntoElement {
         .h(px(h))
         .rounded_3xl()
         .border_1()
-        .border_color(pal.text_muted)
-        .bg(pal.surface_hover)
+        .border_color(pal.text_ghost)
+        .bg(pal.wash)
         .child(
             div()
                 .absolute()

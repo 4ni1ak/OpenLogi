@@ -59,9 +59,10 @@ use std::time::Instant;
 
 use anyhow::Result;
 use gpui::{
-    AppContext, BorrowAppContext as _, Bounds, Size, Styled, WindowBounds, WindowOptions, px,
+    AppContext, BorrowAppContext as _, Bounds, Size, Styled, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, px,
 };
-use gpui_component::{ActiveTheme, Root};
+use gpui_component::Root;
 use openlogi_core::brand::{APP_ID, DeeplinkCommand};
 use openlogi_core::config::Config;
 use openlogi_core::device::{DeviceInventory, StandaloneDevice};
@@ -597,6 +598,17 @@ fn main_window_options(cx: &mut gpui::App) -> WindowOptions {
         // `TitleBar` (the compositor declines server-side decorations and gpui's
         // fallback is unpainted). macOS/Windows keep their native titlebar.
         titlebar: Some(windows::titlebar_options("OpenLogi")),
+        // macOS: back the window with a real `NSVisualEffectView`, which gpui
+        // installs for `Blurred`, so the window sits on a live blur instead of
+        // being an opaque rectangle. `platform::os::configure_window_material`
+        // picks its material once the window exists, and `Palette::backdrop`
+        // supplies the theme colour over it. Elsewhere the window stays an
+        // ordinary opaque surface.
+        window_background: if cfg!(target_os = "macos") {
+            WindowBackgroundAppearance::Blurred
+        } else {
+            WindowBackgroundAppearance::Opaque
+        },
         ..WindowOptions::default()
     }
 }
@@ -627,12 +639,18 @@ fn open_main_window(inventories: &[DeviceInventory], cx: &mut gpui::App) {
         });
         view.update(cx, |v, _| v.set_appearance_obs(appearance_obs));
 
-        cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+        cx.new(|cx| Root::new(view, window, cx).bg(theme::palette(cx).backdrop))
     });
 
     match opened {
         Ok(handle) => {
-            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            let _ = handle.update(cx, |_, window, _| {
+                // After the window exists: gpui creates the visual-effect view
+                // while applying `window_background`, so there is nothing to
+                // retarget until then.
+                platform::os::configure_window_material(window);
+                window.activate_window();
+            });
             cx.default_global::<windows::WindowRegistry>().main = Some(handle);
             cx.activate(true);
         }

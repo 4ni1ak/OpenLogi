@@ -11,7 +11,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::theme::{self, FOOTER_H, Palette, Typography as _};
+use crate::theme::{self, ControlStyle as _, FOOTER_H, Palette, Typography as _};
 
 /// Centered spinner over a muted one-line caption — the quiet "still working"
 /// body shared by the pre-connection frame and the scanning state, so the two
@@ -170,7 +170,8 @@ fn accessibility_status(pal: Palette, granted: bool) -> AnyElement {
             .items_center()
             .text_caption()
             .text_color(pal.text_primary)
-            .cursor_pointer()
+            .control(pal)
+            .press_wash(pal)
             .child(
                 div()
                     .size_1p5()

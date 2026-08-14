@@ -12,7 +12,10 @@
 //!   own widgets — which is what keeps a popover from rendering white under
 //!   an otherwise dark UI (see `main.rs`'s appearance wiring).
 
-use gpui::{App, FontWeight, Hsla, Pixels, Rgba, Styled, Window, hsla, px, relative, rgb};
+use gpui::{
+    App, BoxShadow, FontWeight, Hsla, InteractiveElement, Pixels, Rgba, StatefulInteractiveElement,
+    Styled, Window, hsla, point, px, relative, rgb,
+};
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 use openlogi_core::config::Appearance;
 
@@ -48,6 +51,14 @@ pub const CARD_GAP: f32 = 12.;
 /// Apple HIG / WCAG minimum contrast for normal text up to 17pt.
 const MIN_TEXT_CONTRAST: f32 = 4.5;
 
+/// How much of the macOS window material [`Palette::backdrop`] lets through.
+///
+/// Deliberately high. The point is a hint of the desktop moving behind a
+/// surface that is still unmistakably the theme's own colour — and the muted
+/// text ramp is normalised for contrast against the opaque colour, so a deeper
+/// bleed would quietly undercut [`MIN_TEXT_CONTRAST`] over a bright wallpaper.
+const BACKDROP_ALPHA: f32 = 0.9;
+
 /// Fixed footprint of a device card in the Home gallery. Equal-width cards lay
 /// out in a horizontally scrollable row (centred when they fit, scrollable when
 /// they don't); `GALLERY_PHOTO_H` is the height of the device photo above the
@@ -68,16 +79,58 @@ pub const GALLERY_PHOTO_H: f32 = 230.;
 pub struct Palette {
     /// Window background.
     pub bg: Hsla,
+    /// The main window's backdrop — the fill every screen sits on, below the
+    /// cards and panels that paint their own surfaces.
+    ///
+    /// On macOS this is [`Palette::bg`] at [`BACKDROP_ALPHA`], because that
+    /// window is backed by a real `NSVisualEffectView` (see
+    /// [`crate::platform::os::configure_window_material`]). The theme still
+    /// owns the colour — only the last tenth of it is the live material
+    /// underneath, which is what makes the window read as glass rather than as
+    /// a flat fill.
+    ///
+    /// A single translucent layer is the whole trick: everything above it
+    /// (cards, panels, popovers) is opaque, so no two translucent GPUI
+    /// surfaces ever stack and accumulate alpha into a muddy patch.
+    ///
+    /// Everywhere else this *is* `bg`: auxiliary windows and the non-macOS
+    /// main window are ordinary opaque surfaces.
+    pub backdrop: Hsla,
     /// Raised card / panel fill.
     pub surface: Hsla,
-    /// Card hover / armed fill.
-    pub surface_hover: Hsla,
     /// Hairline border between cards and surface.
     pub border: Hsla,
+    /// The hairline, raised — a hovered or otherwise emphasised edge. An alpha
+    /// tint rather than a second opaque value, so "emphasised" is the same
+    /// *step* on every surface; call sites used to reach for `text_muted` here,
+    /// which is a text weight and reads as an outline rather than an edge.
+    pub border_strong: Hsla,
     /// Foreground text.
     pub text_primary: Hsla,
-    /// De-emphasised labels / metadata.
+    /// De-emphasised labels / metadata. The contrast-normalised step (see
+    /// [`accessible_muted_text`]), so it is the *floor* for anything the user
+    /// has to read — the step below it is deliberately under AA.
     pub text_muted: Hsla,
+    /// Decorative marks only — leader lines, placeholder outlines, disabled
+    /// glyphs. Deliberately under AA: never body copy, and never the only
+    /// carrier of a meaning.
+    pub text_ghost: Hsla,
+    /// The one neutral interaction wash: hover, and any transient highlight.
+    ///
+    /// An alpha tint of the foreground rather than an opaque fill, so it
+    /// composites correctly over *any* surface it lands on (window, card,
+    /// nested card) instead of matching exactly one of them — and so hover
+    /// reads the same on all three without a per-surface variant. Reach for
+    /// this before inventing a fill: hover states had drifted into four
+    /// dialects before it existed.
+    pub wash: Hsla,
+    /// The same wash, deeper. Two jobs, both "neutral but more committed than
+    /// hover": an armed / highlighted resting state, and a recessed well such
+    /// as a meter track.
+    pub wash_strong: Hsla,
+    /// Keyboard focus ring. The theme's own `ring` token, so a hand-painted
+    /// control's focus treatment matches the framework widgets' beside it.
+    pub ring: Hsla,
     /// Corner radius for the bespoke card / panel surfaces. Derived from the
     /// active gpui-component theme radius (`cx.theme().radius`) so the
     /// hand-painted cards follow the Appearance → radius slider — which the old
@@ -158,20 +211,37 @@ fn normalize_theme_text_contrast(theme: &mut Theme) {
 /// tokens, so the hand-painted surfaces (window, cards, mouse model) re-skin
 /// with the selected theme exactly as the framework widgets do.
 ///
-/// - `bg` ← `background` (window)
-/// - `surface` ← `group_box` (content cards), while `surface_hover` keeps the
-///   theme's interactive `secondary_hover` state.
+/// - `bg` ← `background` (window), `surface` ← `group_box` (content cards).
 /// - `border`, `text_primary` ← `foreground`, `text_muted` ← `muted_foreground`.
+///
+/// `text_ghost` fades `muted_foreground` toward whatever it is painted on
+/// rather than picking its own colour. That keeps the ramp ordered by
+/// construction — an alpha below 1 can only move a colour toward its
+/// background — so no user-selected theme can invert it past `muted`, and it
+/// inherits the AA normalisation already applied to `muted`.
+///
+/// The washes and `border_strong` tint `foreground` instead, which is what lets
+/// one value serve every surface: 6% of the text colour over a card and over
+/// the window are different pixels but the same *step*.
 #[must_use]
 pub fn palette(cx: &App) -> Palette {
     let t = cx.theme();
     Palette {
         bg: t.background,
+        backdrop: if cfg!(target_os = "macos") {
+            t.background.opacity(BACKDROP_ALPHA)
+        } else {
+            t.background
+        },
         surface: t.group_box,
-        surface_hover: t.secondary_hover,
         border: t.border,
+        border_strong: t.foreground.opacity(0.2),
         text_primary: t.foreground,
         text_muted: t.muted_foreground,
+        text_ghost: t.muted_foreground.opacity(0.5),
+        wash: t.foreground.opacity(0.06),
+        wash_strong: t.foreground.opacity(0.1),
+        ring: t.ring,
         card_radius: t.radius * 1.5,
         control_radius: t.radius,
     }
@@ -333,6 +403,78 @@ pub trait SelectableStyle: Styled + Sized {
 }
 
 impl<E: Styled> SelectableStyle for E {}
+
+/// The neutral hover decision, in one place — the counterpart to
+/// [`SelectableStyle`] for the *transient* half of interaction.
+///
+/// The split is deliberate and is the whole point of the two-axis colour
+/// system: an accent tint means "this is the chosen one" (a fact about state),
+/// a neutral wash means "the pointer is here" (a fact about the pointer). A row
+/// that is both keeps its accent fill and takes [`accent_tint_hover`] instead,
+/// so the two axes never fight over the same pixel.
+pub trait WashStyle: InteractiveElement + Sized {
+    /// The neutral wash under the pointer.
+    #[must_use]
+    fn hover_wash(self, pal: Palette) -> Self {
+        self.hover(move |style| style.bg(pal.wash))
+    }
+}
+
+impl<E: InteractiveElement> WashStyle for E {}
+
+/// What separates a hand-painted `div` from a real control: a native cursor,
+/// a tab stop, and a visible keyboard focus ring.
+///
+/// Framework widgets ([`gpui_component::button::Button`] and friends) already
+/// carry this. These methods are for the surfaces we paint ourselves — gallery
+/// cards, mouse-model labels, key targets, theme swatches — which had none of
+/// it and were reachable by mouse only.
+///
+/// **Activation comes free.** gpui maps enter / space to an element's click
+/// listeners while it is focused, so making the element focusable is the whole
+/// job; `on_click` stays exactly as the caller wrote it. gpui also keeps the
+/// focus handle for us, in element state under the element's id, so a control
+/// needs no `FocusHandle` field of its own — it only needs an `.id(..)`.
+pub trait ControlStyle: StatefulInteractiveElement + Styled + Sized {
+    /// Cursor, tab stop, and focus ring — the part every control wants, and
+    /// nothing that touches the element's fill.
+    ///
+    /// Fills stay separate because they are not universal: a neutral row wants
+    /// [`WashStyle::hover_wash`] and [`Self::press_wash`], a selectable one
+    /// wants [`accent_tint_hover`], and an element that paints its own colour
+    /// (a page dot, a peeking card) wants neither — a wash would overwrite the
+    /// very thing that identifies it.
+    #[must_use]
+    fn control(self, pal: Palette) -> Self {
+        self.cursor_default()
+            .tab_index(0)
+            .focus_visible(move |style| style.shadow(vec![focus_ring(pal)]))
+    }
+
+    /// The pressed state, one step past [`WashStyle::hover_wash`].
+    #[must_use]
+    fn press_wash(self, pal: Palette) -> Self {
+        self.active(move |style| style.bg(pal.wash_strong))
+    }
+}
+
+impl<E: StatefulInteractiveElement + Styled> ControlStyle for E {}
+
+/// The focus ring: an outer glow, not a border.
+///
+/// A border would resize the element the moment it takes focus, and these
+/// controls sit in tight rows and grids where one pixel of growth reflows the
+/// whole line. A shadow with no blur and a small spread draws the same ring
+/// outside the bounds, follows the corner radius, and costs no layout.
+fn focus_ring(pal: Palette) -> BoxShadow {
+    BoxShadow {
+        color: pal.ring.opacity(0.6),
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(2.),
+        inset: false,
+    }
+}
 
 /// The app's type ramp as semantic roles, so a heading is `.text_heading()`
 /// everywhere instead of each call site re-picking a `text_*` size and a

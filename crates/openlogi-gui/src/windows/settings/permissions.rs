@@ -12,7 +12,7 @@ use super::{
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::platform::permissions;
-use crate::theme::Typography as _;
+use crate::theme::{ControlStyle as _, Typography as _, WashStyle as _};
 
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -192,8 +192,9 @@ fn permission_field(
                 .border_1()
                 .border_color(pal.border)
                 .text_caption()
-                .cursor_pointer()
-                .hover(move |s| s.bg(pal.surface_hover))
+                .control(pal)
+                .press_wash(pal)
+                .hover_wash(pal)
                 .child(action_label)
                 .on_click(move |_, _, cx| {
                     // Accessibility must be prompted in the agent (it owns the
