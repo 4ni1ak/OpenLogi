@@ -51,7 +51,7 @@ let
       (src + "/LICENSE-APACHE")
       (src + "/LICENSE-MIT")
       (src + "/crates")
-      (src + "/design/icon/openlogi.png")
+      (src + "/design/icon")
       (src + "/docs/config.example.toml")
       (src + "/packaging/linux/desktop")
       (src + "/packaging/linux/systemd")
@@ -183,8 +183,15 @@ rustPlatform.buildRustPackage {
 
     install -Dm644 packaging/linux/desktop/openlogi.desktop \
       "$out/share/applications/openlogi.desktop"
+    # Every standard indexed hicolor size: a stock `hicolor/index.theme`
+    # stops at 512x512, so an icon installed only under `1024x1024/apps` is
+    # invisible to launchers that resolve by theme index.
     install -Dm644 design/icon/openlogi.png \
       "$out/share/icons/hicolor/1024x1024/apps/openlogi.png"
+    for size in 512 256 128 64 48 32 16; do
+      install -Dm644 "design/icon/openlogi-$size.png" \
+        "$out/share/icons/hicolor/''${size}x''${size}/apps/openlogi.png"
+    done
     install -Dm644 packaging/linux/udev/70-openlogi.rules \
       "$out/lib/udev/rules.d/70-openlogi.rules"
     install -Dm644 packaging/linux/systemd/openlogi-agent.service \
@@ -213,7 +220,9 @@ rustPlatform.buildRustPackage {
     test ! -e "$out/bin/openlogi-agent-mock"
     test -f "$out/lib/udev/rules.d/70-openlogi.rules"
     test -f "$out/share/applications/openlogi.desktop"
-    test -f "$out/share/icons/hicolor/1024x1024/apps/openlogi.png"
+    for size in 1024 512 256 128 64 48 32 16; do
+      test -f "$out/share/icons/hicolor/''${size}x''${size}/apps/openlogi.png"
+    done
     grep -Fqx \
       "ExecStart=$out/bin/openlogi-agent" \
       "$out/share/systemd/user/openlogi-agent.service"
