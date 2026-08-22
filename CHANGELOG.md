@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-08-22
+
+### Added
+
+- *(camera)* add anti-flicker and low-light controls ([#793](https://github.com/AprilNEA/OpenLogi/pull/793))
+- *(cli)* report feature flags and firmware entities in diag features ([#690](https://github.com/AprilNEA/OpenLogi/pull/690))
+- *(i18n)* add Ukrainian (uk) locale ([#715](https://github.com/AprilNEA/OpenLogi/pull/715))
+
+### Fixed
+
+- *(ci)* make the wasm job's drift check independent of the host
+- *(xtask)* skip the ci.yml drift tests where CI metadata is absent
+
 ## [0.7.4] - 2026-08-21
 
 ### Added
