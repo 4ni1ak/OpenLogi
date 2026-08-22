@@ -34,8 +34,8 @@ use crate::{
     KeyEvent, KeyModifiers, MouseEvent, TapLocation,
 };
 use watchdog::{
-    LifecycleDecision, LifecycleExitReason, LifecycleObservation, LifecycleWatchdog, TapPhase,
-    WatchdogSignals, stuck_callback,
+    LifecycleDecision, LifecycleExitReason, LifecycleObservation, LifecycleWatchdog, RearmBudget,
+    TapPhase, WatchdogSignals, stuck_callback,
 };
 
 /// Everything `Hook` needs to control the background thread.
@@ -76,6 +76,10 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const std::ffi::c_void);
+    /// Unregister a `CFMachPort` — for a tap port, this is what removes the tap
+    /// from the event chain. `CGEventTap`'s `Drop` calls it, so only the paths
+    /// that end in `process::exit` (which runs no destructors) need it by hand.
+    fn CFMachPortInvalidate(port: core_foundation::mach_port::CFMachPortRef);
 }
 
 /// The registry id of the device that produced `event`, via its backing
@@ -205,11 +209,38 @@ fn sender_device_info(sender_id: u64) -> SenderDeviceInfo {
     })
 }
 
-/// Check whether this process has been granted Accessibility access.
+/// Check whether this process can still install the hook's event tap.
+///
+/// `AXIsProcessTrusted()` alone is not that answer: it keeps returning `true`
+/// after the user *deletes* the app's row from System Settings → Privacy &
+/// Security → Accessibility, so a hook that believes it would never learn it
+/// had been revoked, would keep re-arming a tap macOS no longer lets it
+/// service, and would wedge clicks machine-wide until reboot (#674). Only
+/// creating a filtering tap tracks the live grant, so both are consulted: the
+/// trust read short-circuits the probe for a process that was never granted,
+/// which keeps a denied agent from asking `WindowServer` twice a second.
 pub(crate) fn has_accessibility() -> bool {
     // SAFETY: takes no arguments and only reads the current trust state — the
     // non-prompting counterpart of `AXIsProcessTrustedWithOptions`.
-    unsafe { AXIsProcessTrusted() }
+    let trusted = unsafe { AXIsProcessTrusted() };
+    trusted && can_filter_events()
+}
+
+/// Can this process create an *active* (event-filtering) tap right now?
+///
+/// The probe mirrors the real tap's location, placement and options — that is
+/// the capability being tested — but subscribes to `kCGEventNull`, an event
+/// type nothing ever posts, so it cannot gate a single real event during the
+/// microseconds it exists. Dropping it invalidates the port.
+fn can_filter_events() -> bool {
+    CGEventTap::new(
+        CGEventTapLocation::HID,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::Default,
+        vec![CGEventType::Null],
+        |_proxy: CGEventTapProxy, _etype: CGEventType, _event: &CGEvent| CallbackResult::Keep,
+    )
+    .is_ok()
 }
 
 /// Raise the Accessibility prompt + register the process. See
@@ -498,14 +529,15 @@ pub(crate) fn start(
     let cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
 
     let signals = Arc::new(WatchdogSignals::default());
-    let lifecycle_watchdog = spawn_lifecycle_watchdog(Arc::clone(&signals))?;
+    let armed = Arc::new(ArmedTap::default());
+    let lifecycle_watchdog = spawn_lifecycle_watchdog(Arc::clone(&signals), Arc::clone(&armed))?;
     let (rl_tx, rl_rx) = mpsc::channel::<CFRunLoop>();
 
     let thread = {
         let thread_signals = Arc::clone(&signals);
         match thread::Builder::new()
             .name("openlogi-hook".into())
-            .spawn(move || thread_main(cb, rl_tx, thread_signals))
+            .spawn(move || thread_main(cb, rl_tx, thread_signals, armed))
         {
             Ok(thread) => thread,
             Err(error) => {
@@ -604,6 +636,7 @@ fn run_tap_callback(
 /// the agent so macOS tears the tap down and system input recovers.
 fn spawn_callback_watchdog(
     signals: Arc<WatchdogSignals>,
+    armed: Arc<ArmedTap>,
     in_callback: Arc<AtomicBool>,
     entered_at_ms: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
@@ -641,8 +674,10 @@ fn spawn_callback_watchdog(
                     "OS mouse-hook callback stuck past budget — exiting agent to \
                      restore system input (HID CGEventTap freeze hazard)"
                 );
-                // Hard exit: disable_tap alone cannot unblock an in-flight
-                // callback, and a live active HID tap freezes all pointer I/O.
+                // Detaching cannot unblock an in-flight callback, so the
+                // process still has to go — but it goes with the tap already
+                // out of the chain rather than stranded there.
+                armed.detach();
                 #[expect(
                     clippy::exit,
                     reason = "this watchdog thread has no caller to return to and the stuck callback owns the active HID tap, which serialises every pointer event machine-wide; only process death makes macOS tear the tap down"
@@ -665,6 +700,7 @@ fn spawn_callback_watchdog(
 /// after that thread has exited.
 fn spawn_lifecycle_watchdog(
     signals: Arc<WatchdogSignals>,
+    armed: Arc<ArmedTap>,
 ) -> Result<thread::JoinHandle<()>, HookError> {
     thread::Builder::new()
         .name("openlogi-hook-lifecycle-watchdog".into())
@@ -712,6 +748,7 @@ fn spawn_lifecycle_watchdog(
                             "HID CGEventTap lifecycle did not make progress before deadline — \
                              exiting agent to restore system input"
                         );
+                        armed.detach();
                         #[expect(
                             clippy::exit,
                             reason = "the tap thread is wedged (TCC revocation can stall it inside CoreGraphics), so no unwinding path can reach it from this watchdog thread; a live HID tap left behind freezes all input until the process dies"
@@ -724,99 +761,29 @@ fn spawn_lifecycle_watchdog(
         .map_err(|error| HookError::MacOsTap(format!("could not spawn tap watchdog: {error}")))
 }
 
-/// Body of the background hook thread.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rl_tx must be owned: dropping it signals the parent's recv() to return Err on failure paths"
-)]
-fn thread_main(
-    cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
-    rl_tx: mpsc::Sender<CFRunLoop>,
-    signals: Arc<WatchdogSignals>,
-) {
-    // Declared first so it drops last, after the tap, callback, source, and run
-    // loop locals have unwound. The lifecycle watchdog treats this notification
-    // as proof that an explicit stop has completed, not merely been requested.
-    let _thread_exit = signals.thread_exit_guard();
+/// Detaches whatever tap is still armed when the tap thread unwinds.
+///
+/// Setup can fail after `CGEventTapCreate` has already installed the tap, and
+/// leaving it armed there would gate the HID stream with no run loop behind it.
+/// The ordinary teardown detaches explicitly, in order, before it publishes
+/// [`TapPhase::TapStopped`]; this only catches the paths that never get there.
+struct ArmGuard(Arc<ArmedTap>);
 
-    // A successful CGEventTapCreate may install the HID tap before returning,
-    // so lifecycle monitoring must be armed before entering CoreGraphics.
-    signals.mark_tap_progress();
-    signals.set_phase(TapPhase::Arming);
-
-    let in_callback = Arc::new(AtomicBool::new(false));
-    let entered_at_ms = Arc::new(AtomicU64::new(0));
-
-    let tap_result = {
-        let callback_signals = Arc::clone(&signals);
-        let in_callback = Arc::clone(&in_callback);
-        let entered_at_ms = Arc::clone(&entered_at_ms);
-        CGEventTap::new(
-            CGEventTapLocation::HID,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            hooked_event_types(),
-            move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
-                entered_at_ms.store(callback_signals.now_millis(), Ordering::Relaxed);
-                in_callback.store(true, Ordering::Release);
-                let disposition = run_tap_callback(cb.as_ref(), etype, event);
-                in_callback.store(false, Ordering::Release);
-                disposition
-            },
-        )
-    };
-
-    let Ok(tap) = tap_result else {
-        error!("CGEventTapCreate returned null — Accessibility may have been revoked");
-        // Dropping rl_tx causes rl_rx.recv() on the parent to return Err,
-        // which we surface as MacOsTap.
-        return;
-    };
-    signals.mark_tap_progress();
-
-    let Ok(loop_source) = tap.mach_port().create_runloop_source(0) else {
-        error!("CFRunLoopSourceCreate failed for event tap");
-        return;
-    };
-    signals.mark_tap_progress();
-
-    let run_loop = CFRunLoop::get_current();
-
-    // SAFETY: kCFRunLoopCommonModes is a static CF string constant that
-    // lives for the duration of the process.
-    unsafe {
-        run_loop.add_source(&loop_source, kCFRunLoopCommonModes);
+impl Drop for ArmGuard {
+    fn drop(&mut self) {
+        self.0.detach();
+        self.0.disarm();
     }
-    signals.mark_tap_progress();
-    if let Err(error) = spawn_callback_watchdog(
-        Arc::clone(&signals),
-        Arc::clone(&in_callback),
-        Arc::clone(&entered_at_ms),
-    ) {
-        error!(%error, "could not spawn callback watchdog — refusing to arm HID tap");
-        return;
-    }
-    signals.mark_tap_progress();
-    tap.enable();
-    signals.mark_tap_progress();
-    signals.set_phase(TapPhase::Armed);
+}
 
-    if rl_tx.send(run_loop.clone()).is_err() {
-        debug!("hook parent dropped before run loop was ready; stopping");
-        disable_tap(&tap);
-        // SAFETY: framework-provided static CFStringRef, 'static.
-        run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
-        drop(loop_source);
-        drop(tap);
-        signals.set_phase(TapPhase::TapStopped);
-        return;
-    }
-
+/// Service the tap until it has to be released: an explicit stop, a stopped run
+/// loop, a revoked permission, or a tap the OS will not keep enabled.
+fn service_tap(tap: &SharedTap, signals: &WatchdogSignals, tap_disabled: &AtomicBool) {
     // Service the tap in short slices instead of an unbounded
-    // `run_current()`. Between slices we re-check Accessibility: an active
-    // tap at the HID location that outlives its permission wedges the
-    // *entire* system input stream — mouse and keyboard alike — until
-    // reboot. If the user revokes access while we're live, tear the tap
+    // `run_current()`. Between slices we re-check that we may still filter
+    // events: an active tap at the HID location that outlives its permission
+    // wedges the *entire* system input stream — mouse and keyboard alike —
+    // until reboot. If the user revokes access while we're live, tear the tap
     // down right here, on the tap's own thread, so input is restored even
     // when the UI thread is already stuck.
     //
@@ -827,6 +794,7 @@ fn thread_main(
     // checked at the top of every slice, is the reliable signal: in
     // that race the thread notices one 500 ms slice later instead of joining
     // forever.
+    let mut rearm = RearmBudget::default();
     loop {
         if signals.stop_requested() {
             break;
@@ -849,17 +817,140 @@ fn thread_main(
             );
             break;
         }
-        // Recover from an OS-initiated disable (TapDisabledByTimeout/UserInput):
-        // re-enabling is idempotent while the tap is already live, so this brings
-        // a disabled tap back within one slice instead of the hook going
-        // permanently deaf. Only reached while Accessibility is still granted.
+        // Recover from an OS-initiated disable (TapDisabledByTimeout/UserInput),
+        // and *only* from that: re-enabling a tap the OS did not disable is a
+        // no-op at best, and once the permission check is the thing that is
+        // lying it is what turns a dead tap into a permanent gate on the HID
+        // stream. Re-arming is also budgeted, so a tap the system keeps
+        // disabling is eventually given up instead of fought over.
+        if !tap_disabled.swap(false, Ordering::AcqRel) {
+            continue;
+        }
+        if !rearm.allow(signals.now()) {
+            error!(
+                "the OS keeps disabling the HID tap — releasing it instead of \
+                 re-arming a tap nothing is servicing"
+            );
+            break;
+        }
         tap.enable();
     }
+}
+
+/// Body of the background hook thread.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rl_tx must be owned: dropping it signals the parent's recv() to return Err on failure paths"
+)]
+fn thread_main(
+    cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
+    rl_tx: mpsc::Sender<CFRunLoop>,
+    signals: Arc<WatchdogSignals>,
+    armed: Arc<ArmedTap>,
+) {
+    // Declared first so it drops last, after the tap, callback, source, and run
+    // loop locals have unwound. The lifecycle watchdog treats this notification
+    // as proof that an explicit stop has completed, not merely been requested.
+    let _thread_exit = signals.thread_exit_guard();
+
+    // A successful CGEventTapCreate may install the HID tap before returning,
+    // so lifecycle monitoring must be armed before entering CoreGraphics.
+    signals.mark_tap_progress();
+    signals.set_phase(TapPhase::Arming);
+
+    let in_callback = Arc::new(AtomicBool::new(false));
+    let entered_at_ms = Arc::new(AtomicU64::new(0));
+    // Latched by the callback when the OS disables the tap, consumed by the
+    // run-loop slice that decides whether to re-arm it.
+    let tap_disabled = Arc::new(AtomicBool::new(false));
+
+    let tap_result = {
+        let callback_signals = Arc::clone(&signals);
+        let in_callback = Arc::clone(&in_callback);
+        let entered_at_ms = Arc::clone(&entered_at_ms);
+        let tap_disabled = Arc::clone(&tap_disabled);
+        CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            hooked_event_types(),
+            move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
+                if matches!(
+                    etype,
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+                ) {
+                    tap_disabled.store(true, Ordering::Release);
+                }
+                entered_at_ms.store(callback_signals.now_millis(), Ordering::Relaxed);
+                in_callback.store(true, Ordering::Release);
+                let disposition = run_tap_callback(cb.as_ref(), etype, event);
+                in_callback.store(false, Ordering::Release);
+                disposition
+            },
+        )
+    };
+
+    let Ok(tap) = tap_result else {
+        error!("CGEventTapCreate returned null — Accessibility may have been revoked");
+        // Dropping rl_tx causes rl_rx.recv() on the parent to return Err,
+        // which we surface as MacOsTap.
+        return;
+    };
+    // Published before anything can fail: `CGEventTapCreate` may already have
+    // installed the tap, so from here on every exit path must be able to
+    // detach it — including the watchdogs' `process::exit`.
+    let tap = Arc::new(SharedTap(tap));
+    armed.arm(&tap);
+    let _disarm = ArmGuard(Arc::clone(&armed));
+    signals.mark_tap_progress();
+
+    let Ok(loop_source) = tap.0.mach_port().create_runloop_source(0) else {
+        error!("CFRunLoopSourceCreate failed for event tap");
+        return;
+    };
+    signals.mark_tap_progress();
+
+    let run_loop = CFRunLoop::get_current();
+
+    // SAFETY: kCFRunLoopCommonModes is a static CF string constant that
+    // lives for the duration of the process.
+    unsafe {
+        run_loop.add_source(&loop_source, kCFRunLoopCommonModes);
+    }
+    signals.mark_tap_progress();
+    if let Err(error) = spawn_callback_watchdog(
+        Arc::clone(&signals),
+        Arc::clone(&armed),
+        Arc::clone(&in_callback),
+        Arc::clone(&entered_at_ms),
+    ) {
+        error!(%error, "could not spawn callback watchdog — refusing to arm HID tap");
+        return;
+    }
+    signals.mark_tap_progress();
+    tap.enable();
+    signals.mark_tap_progress();
+    signals.set_phase(TapPhase::Armed);
+
+    if rl_tx.send(run_loop.clone()).is_err() {
+        debug!("hook parent dropped before run loop was ready; stopping");
+        tap.detach();
+        armed.disarm();
+        // SAFETY: framework-provided static CFStringRef, 'static.
+        run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        drop(loop_source);
+        drop(tap);
+        signals.set_phase(TapPhase::TapStopped);
+        return;
+    }
+
+    service_tap(&tap, &signals, &tap_disabled);
 
     // Detach the tap from the event stream synchronously before unwinding,
     // so input recovers immediately rather than whenever CF happens to
     // release the port.
-    disable_tap(&tap);
+    tap.detach();
+    armed.disarm();
     // SAFETY: framework-provided static CFStringRef, 'static.
     run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
     drop(loop_source);
@@ -871,20 +962,87 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Disable an active event tap now. core-graphics only exposes the enable
-/// side of `CGEventTapEnable`, so we bind the disable side ourselves.
-fn disable_tap(tap: &CGEventTap) {
-    use core_foundation::base::TCFType as _;
+/// The tap, shareable with the watchdog threads.
+///
+/// A watchdog that force-exits the agent has to be able to detach the tap
+/// first: `process::exit` runs no destructors, and a tap that dies with its
+/// process without being invalidated can be left behind in the system's tap
+/// chain, where it gates events nothing will ever answer for.
+struct SharedTap(CGEventTap<'static>);
 
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGEventTapEnable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+// SAFETY: a `CGEventTap` is a `CFMachPort` plus the boxed callback, which
+// `CGEventTap::new` already requires to be `Send + 'static` (type erasure is
+// what loses that bound). CoreFoundation objects may be retained, released and
+// invalidated from any thread, and `CGEventTapEnable` is likewise thread-safe.
+// The callback itself is only ever invoked by the run loop servicing the tap,
+// which never leaves the thread that created it.
+unsafe impl Send for SharedTap {}
+// SAFETY: as above — every method reachable through a shared reference is a
+// thread-safe CoreFoundation or CoreGraphics call on the port.
+unsafe impl Sync for SharedTap {}
+
+impl SharedTap {
+    /// Detach the tap from the event stream now, and unregister it.
+    ///
+    /// Disabling stops it gating events immediately rather than whenever
+    /// CoreFoundation happens to release the port; invalidating unregisters it
+    /// so an exit that skips `Drop` cannot strand it. Both are idempotent.
+    fn detach(&self) {
+        use core_foundation::base::TCFType as _;
+
+        // core-graphics only exposes the enable side of `CGEventTapEnable`.
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventTapEnable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+        }
+
+        let port = self.0.mach_port().as_concrete_TypeRef();
+        // SAFETY: `port` is a live `CFMachPort` owned by `self.0` for the
+        // duration of both calls.
+        unsafe {
+            CGEventTapEnable(port, false);
+            CFMachPortInvalidate(port);
+        }
     }
 
-    // SAFETY: `tap.mach_port()` is a live `CFMachPort` for the duration of
-    // the call; `CGEventTapEnable(.., false)` is idempotent and merely
-    // detaches the tap from the system event stream.
-    unsafe { CGEventTapEnable(tap.mach_port().as_concrete_TypeRef(), false) };
+    fn enable(&self) {
+        self.0.enable();
+    }
+}
+
+/// The armed tap, published so the watchdog threads can reach it.
+///
+/// Holding an `Arc` rather than a raw port keeps the tap alive for as long as a
+/// watchdog is touching it, so an emergency detach can never race the tap
+/// thread's teardown into a released port.
+#[derive(Default)]
+struct ArmedTap(std::sync::Mutex<Option<Arc<SharedTap>>>);
+
+impl ArmedTap {
+    fn arm(&self, tap: &Arc<SharedTap>) {
+        *self.lock() = Some(Arc::clone(tap));
+    }
+
+    fn disarm(&self) {
+        *self.lock() = None;
+    }
+
+    /// Detach the armed tap, if any. For watchdog threads on their way to
+    /// `process::exit`.
+    fn detach(&self) {
+        let tap = self.lock().clone();
+        if let Some(tap) = tap {
+            tap.detach();
+        }
+    }
+
+    /// A poisoned lock still holds a perfectly good tap handle, and this is the
+    /// path that keeps input alive — never panic on it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<SharedTap>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Mirror of CoreGraphics' `CGEventTapInformation`. `#[repr(C)]` reproduces the

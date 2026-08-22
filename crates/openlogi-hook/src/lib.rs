@@ -413,7 +413,12 @@ impl Hook {
     /// Returns `true` when the process has the permissions required to install
     /// the hook.
     ///
-    /// On macOS, checks the Accessibility entitlement. On Linux and Windows
+    /// On macOS this is a live capability check, not just a read of the
+    /// Accessibility trust flag: that flag keeps reporting `true` after the
+    /// user deletes the app's row from System Settings, so it is paired with a
+    /// throwaway event tap that only succeeds while the grant really stands.
+    /// Poll it for as long as a hook is installed — an active tap that outlives
+    /// its permission wedges system input until reboot. On Linux and Windows
     /// this always returns `true`; those platforms enforce permissions at a
     /// lower layer (device-node ownership / group membership on Linux; the
     /// Windows low-level hook needs no separate privacy grant).
