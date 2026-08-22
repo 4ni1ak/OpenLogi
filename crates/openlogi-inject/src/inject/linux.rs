@@ -6,6 +6,8 @@
 //! without panicking.
 
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
 
 use evdev::uinput::VirtualDevice;
@@ -708,13 +710,114 @@ fn try_mpris_command(command: &str) -> Option<()> {
     }
 }
 
+/// What an "Open application" target should do on Linux.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Launch {
+    /// Hand it to the desktop opener (`xdg-open`): URLs, folders, documents,
+    /// and `.desktop` entries — which xdg-open activates properly.
+    Opener,
+    /// Run it as a program: an executable file path, or a bare command name
+    /// resolved on `PATH`.
+    Program(PathBuf),
+}
+
+/// Decide how `target` should be launched.
+///
+/// `is_executable` and `on_path` are injected so the decision table is
+/// testable without touching the real filesystem or `PATH`.
+fn classify(
+    target: &str,
+    is_executable: &dyn Fn(&Path) -> bool,
+    on_path: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Launch {
+    if target.contains("://") {
+        return Launch::Opener;
+    }
+    // A desktop entry is the one "application" xdg-open launches correctly —
+    // it reads Exec= and applies the entry's Terminal / StartupNotify keys,
+    // which spawning the file directly would not.
+    if Path::new(target)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("desktop"))
+    {
+        return Launch::Opener;
+    }
+    if target.contains('/') {
+        let path = Path::new(target);
+        return if is_executable(path) {
+            Launch::Program(path.to_path_buf())
+        } else {
+            Launch::Opener
+        };
+    }
+    on_path(target).map_or(Launch::Opener, Launch::Program)
+}
+
+/// Whether `path` is a regular file with any execute bit set.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// First executable named `name` on `PATH`.
+fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|candidate| is_executable(candidate))
+    })
+}
+
+/// Run an "Open application" target as a program when that is what it is,
+/// reporting whether it was handled here.
+///
+/// `xdg-open` — what `opener` calls on Linux — *opens* a file: handed
+/// `/usr/bin/nautilus` it looks for something claiming
+/// `application/x-executable` and, finding nothing, does nothing at all
+/// (#775). A path to an executable, or a bare command name on `PATH`, has to
+/// be spawned instead. Everything the desktop genuinely knows how to open —
+/// URLs, folders, documents, `.desktop` entries — returns `false` and stays
+/// with the opener.
+///
+/// The child is waited on from a detached thread: a long-lived GUI app would
+/// otherwise linger as a zombie for the agent's whole lifetime.
+pub(super) fn launch_program(target: &str) -> bool {
+    let Launch::Program(program) = classify(target, &is_executable, &on_path) else {
+        return false;
+    };
+    std::thread::spawn(move || {
+        match std::process::Command::new(&program)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.wait();
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                program = %program.display(),
+                "could not launch the configured application"
+            ),
+        }
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use evdev::KeyCode;
     use openlogi_core::binding::{KeyCombo, Shortcut};
 
-    use super::{combo, hid_usage_to_linux, key_ev, key_phase_events, modifiers_to_keycodes, syn};
-    use crate::inject::KeyPhase;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        KeyPhase, Launch, classify, combo, hid_usage_to_linux, is_executable, key_ev,
+        key_phase_events, modifiers_to_keycodes, on_path, syn,
+    };
 
     #[test]
     fn held_chord_edges_use_inverse_key_order() {
@@ -736,6 +839,72 @@ mod tests {
                 key_ev(KeyCode::KEY_LEFTCTRL, 0),
                 syn(),
             ]
+        );
+    }
+
+    /// #775: configuring `/usr/bin/nautilus` (or bare `nautilus`) did
+    /// nothing, because `xdg-open` opens files rather than running them.
+    #[test]
+    fn executables_are_run_and_everything_else_goes_to_the_opener() {
+        let executable = |p: &Path| p == Path::new("/usr/bin/nautilus");
+        let on_path = |name: &str| (name == "nautilus").then(|| PathBuf::from("/usr/bin/nautilus"));
+
+        assert_eq!(
+            classify("/usr/bin/nautilus", &executable, &on_path),
+            Launch::Program(PathBuf::from("/usr/bin/nautilus")),
+            "an executable path is a program to run"
+        );
+        assert_eq!(
+            classify("nautilus", &executable, &on_path),
+            Launch::Program(PathBuf::from("/usr/bin/nautilus")),
+            "a bare command name resolves through PATH"
+        );
+
+        for opener in [
+            "https://example.com",
+            "/home/u/Documents",
+            "/home/u/notes.txt",
+            "/usr/share/applications/org.gnome.Nautilus.desktop",
+            "definitely-not-on-path",
+        ] {
+            assert_eq!(
+                classify(opener, &executable, &on_path),
+                Launch::Opener,
+                "{opener} belongs to the desktop opener"
+            );
+        }
+    }
+
+    /// The fakes above pin the decision table; this pins the two real probes
+    /// they stand in for against the filesystem. `sh` is on `PATH` and
+    /// executable on every Linux host.
+    #[test]
+    fn the_real_probes_resolve_a_shell_on_path() {
+        let resolved = on_path("sh").expect("sh is on PATH");
+        assert!(
+            is_executable(&resolved),
+            "{} is executable",
+            resolved.display()
+        );
+        assert_eq!(
+            classify("sh", &is_executable, &on_path),
+            Launch::Program(resolved)
+        );
+        assert_eq!(classify("/", &is_executable, &on_path), Launch::Opener);
+    }
+
+    /// A `.desktop` entry is executable often enough that the extension check
+    /// has to come first: xdg-open reads its `Exec=` and honours `Terminal=`
+    /// and `StartupNotify=`, which spawning the file itself would not.
+    #[test]
+    fn an_executable_desktop_entry_still_goes_to_the_opener() {
+        assert_eq!(
+            classify(
+                "/usr/share/applications/foo.desktop",
+                &|_: &Path| true,
+                &|_: &str| None
+            ),
+            Launch::Opener
         );
     }
 
