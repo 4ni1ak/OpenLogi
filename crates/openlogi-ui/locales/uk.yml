@@ -308,6 +308,7 @@ _version: 1
 "Update source": "Джерело оновлень"
 "View changelog": "Переглянути список змін"
 "No background updater — OpenLogi only connects when you turn on automatic checks or click Check for Updates.": "Жодного фонового оновлювача — OpenLogi підключається лише тоді, коли ви вмикаєте автоматичну перевірку або натискаєте «Перевірити наявність оновлень»."
+"Installed from a distribution package — updates come from your package manager.": "Встановлено з пакунка дистрибутива — оновлення надходять із вашого менеджера пакунків."
 "Stable channel": "Стабільний канал"
 "A native, local-first alternative to Logitech Options+.": "Нативна локальна альтернатива Logitech Options+."
 "Changelog": "Список змін"

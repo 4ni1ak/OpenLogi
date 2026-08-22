@@ -118,7 +118,13 @@ pub fn rebuild(cx: &mut App) {
 /// Run a manual update check and open Settings → Updates where its status is
 /// rendered. Shared by the app menu and agent tray IPC commands.
 pub fn check_for_updates(cx: &mut App) {
-    if let Some(updater) = crate::platform::updater::shared(cx) {
+    // Where releases ship no in-place-updatable artifact (Linux: distro
+    // packages only), running the check just resolves to "no release asset
+    // matched the current platform". Open the Updates page anyway — it says
+    // where updates come from on this install.
+    if crate::platform::updater::IN_APP_UPDATES
+        && let Some(updater) = crate::platform::updater::shared(cx)
+    {
         updater.update(cx, gpui_updater::Updater::check);
     }
     crate::windows::settings::open_at(crate::windows::settings::SettingsPage::Updates, cx);

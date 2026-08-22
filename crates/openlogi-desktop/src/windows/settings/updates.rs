@@ -12,6 +12,10 @@ use crate::ui::theme::Typography as _;
 /// the contextual check / install / restart action; the opt-in auto-check and
 /// auto-install switches; and where updates come from.
 pub(super) fn updates_page(updater: Entity<Updater>, pal: Palette) -> SettingPage {
+    if !crate::platform::updater::IN_APP_UPDATES {
+        return package_managed_page(pal);
+    }
+
     let hero = SettingGroup::new().item(SettingItem::render(move |_, _, cx| {
         update_hero(&updater, pal, cx)
     }));
@@ -69,6 +73,43 @@ pub(super) fn updates_page(updater: Entity<Updater>, pal: Palette) -> SettingPag
         .group(hero)
         .group(toggles)
         .group(source)
+}
+
+/// The Updates page for a build with no in-place-updatable artifact.
+///
+/// Linux releases ship distro packages only, so the check can never resolve to
+/// anything but "no release asset matched the current platform". Showing the
+/// check button and the auto-install switches there offers the user a control
+/// whose only possible outcome is a red "Update failed" pill; this page states
+/// the running version and where updates actually come from instead.
+fn package_managed_page(pal: Palette) -> SettingPage {
+    let hero = SettingGroup::new().item(SettingItem::render(move |_, _, _| {
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_3()
+            .child(img(crate::app_assets::LOGO).w(px(52.)).h(px(52.)))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(concat!("OpenLogi ", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child(div().text_caption().text_color(pal.text_muted).child(tr!(
+                        "Installed from a distribution package — updates come from your package manager."
+                    ))),
+            )
+            .into_any_element()
+    }));
+
+    SettingPage::new(tr!("Updates"))
+        .icon(IconName::ArrowDown)
+        .resettable(false)
+        .group(hero)
+        .group(SettingGroup::new().item(SettingItem::render(move |_, _, _| update_source(pal))))
 }
 
 /// The Updates hero row: logo, name + version, a status pill, the live status

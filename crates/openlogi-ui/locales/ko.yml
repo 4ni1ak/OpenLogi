@@ -308,6 +308,7 @@ _version: 1
 "Update source": "Update source"
 "View changelog": "View changelog"
 "No background updater — OpenLogi only connects when you turn on automatic checks or click Check for Updates.": "No background updater — OpenLogi only connects when you turn on automatic checks or click Check for Updates."
+"Installed from a distribution package — updates come from your package manager.": "배포판 패키지로 설치되었습니다 — 업데이트는 패키지 관리자에서 제공됩니다."
 "Stable channel": "Stable channel"
 "A native, local-first alternative to Logitech Options+.": "A native, local-first alternative to Logitech Options+."
 "Changelog": "Changelog"

@@ -308,6 +308,7 @@ _version: 1
 "Update source": "更新来源"
 "View changelog": "查看更新日志"
 "No background updater — OpenLogi only connects when you turn on automatic checks or click Check for Updates.": "无常驻更新器 —— 仅在你开启自动检查或点击「检查更新」时联网。"
+"Installed from a distribution package — updates come from your package manager.": "通过发行版软件包安装 — 更新由你的包管理器提供。"
 "Stable channel": "稳定版通道"
 "A native, local-first alternative to Logitech Options+.": "原生、本地优先的 Logitech Options+ 替代品。"
 "Changelog": "更新日志"
