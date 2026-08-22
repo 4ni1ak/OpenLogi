@@ -151,6 +151,66 @@ fn resolves_old_schema_depot_on_disk() {
     assert_eq!(asset.metadata.assignments().count(), 1);
 }
 
+/// A depot whose variants are handed rather than coloured ships none of
+/// [`METADATA_FILES`] — the Lift keys its metadata `core_metadata_left`
+/// / `core_metadata_right` and names the right one in the manifest's
+/// `image_metadata`. Resolving by well-known name alone skipped the
+/// depot outright and rendered the generic silhouette.
+#[test]
+fn resolves_depot_whose_metadata_is_only_named_by_the_manifest() {
+    let root = tempfile::tempdir().expect("create temp dir");
+    let depot = "mx_vertical_mini";
+    let dir = root.path().join(depot);
+    std::fs::create_dir_all(&dir).expect("create depot dir");
+    std::fs::write(
+        dir.join("manifest.json"),
+        r#"{"devices":[{"modelId":"b031_ext4","resources":[
+            {"key":"image_metadata","src":"core_metadata_right.json"},
+            {"key":"device_image","src":"front_ext_2.png"}
+        ]}]}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        dir.join("core_metadata_right.json"),
+        r#"{"images":[
+            {"key":"device_buttons_image","origin":{"width":860,"height":1256},
+             "assignments":[{"slotName":"SLOT_NAME_MIDDLE_BUTTON",
+                             "marker":{"x":50,"y":50},"label":{"x":0,"y":0}}]}
+        ]}"#,
+    )
+    .expect("write variant metadata");
+    std::fs::write(dir.join("front_ext_2.png"), png_header(860, 1256))
+        .expect("write variant render");
+
+    let resolver = AssetResolver {
+        read_roots: vec![root.path().to_path_buf()],
+        write_root: root.path().to_path_buf(),
+        has_bundle: false,
+        index: None,
+    };
+    let entry = DeviceEntry {
+        model_id: "b031".to_string(),
+        model_ids: Vec::new(),
+        display_name: "Lift".to_string(),
+        kind: "MOUSE".to_string(),
+        asset_path: format!("v1/devices/{depot}/"),
+        files: Vec::new(),
+    };
+    let model = DeviceModelInfo {
+        extended_model_id: 4,
+        ..bare_model()
+    };
+
+    let asset = resolver
+        .load_files(depot, &entry, &model)
+        .expect("manifest-named metadata should resolve the depot");
+    assert_eq!(
+        asset.image_path.file_name().expect("image has a file name"),
+        "front_ext_2.png"
+    );
+    assert_eq!(asset.metadata.assignments().count(), 1);
+}
+
 #[test]
 fn resolves_standalone_registry_model_without_synthetic_hidpp_info() {
     let root = tempfile::tempdir().expect("create temp dir");
