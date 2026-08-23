@@ -263,7 +263,7 @@ async fn arm_keys(
 async fn rearm_keys(rc: &ReprogControlsV4, diverted: &BTreeMap<u16, ButtonId>) {
     // A settling pause: the broadcast arrives the instant the link is back,
     // occasionally before the device accepts feature writes again.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    crate::time::sleep(std::time::Duration::from_millis(200)).await;
     for &cid in diverted.keys() {
         if let Err(e) = rc.set_cid_reporting(cid, true, false).await {
             warn!(
