@@ -820,22 +820,21 @@ fn service_tap(tap: &SharedTap, signals: &WatchdogSignals, tap_disabled: &Atomic
             );
             break;
         }
-        // Recover from an OS-initiated disable (TapDisabledByTimeout/UserInput),
-        // and *only* from that: re-enabling a tap the OS did not disable is a
-        // no-op at best, and once the permission check is the thing that is
-        // lying it is what turns a dead tap into a permanent gate on the HID
-        // stream. Re-arming is also budgeted, so a tap the system keeps
-        // disabling is eventually given up instead of fought over.
-        if !tap_disabled.swap(false, Ordering::AcqRel) {
-            continue;
-        }
-        if !rearm.allow(signals.now()) {
+        // An OS-initiated disable (TapDisabledByTimeout/UserInput) is answered
+        // on a budget: a tap the system disables slice after slice is one we
+        // are no longer servicing, and re-arming it just holds the HID stream
+        // hostage — which is what turned the revoked grant in #674 into a
+        // machine-wide freeze.
+        if tap_disabled.swap(false, Ordering::AcqRel) && !rearm.allow(signals.now()) {
             error!(
                 "the OS keeps disabling the HID tap — releasing it instead of \
                  re-arming a tap nothing is servicing"
             );
             break;
         }
+        // Enabling is idempotent while the tap is already live, so this both
+        // answers the notification above and recovers a tap that was disabled
+        // without one. Only reached while the grant still stands.
         tap.enable();
     }
 }

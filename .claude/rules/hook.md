@@ -18,9 +18,11 @@ paths:
   (`CGEventTapCreate` → NULL when the grant is gone); keep both, in that order — the
   trust read is the cheap short-circuit, the probe is the truth. Never probe with
   `ListenOnly`: that asks about Input Monitoring, a different grant.
-- Re-arm the tap only after the OS actually disabled it (`TapDisabledBy*`), and only
-  within `RearmBudget`. Re-enabling on a timer is what turns a tap we may no longer
-  service into a permanent gate on the HID stream.
+- Re-enabling the tap each slice is idempotent and recovers a disable the OS never
+  reported — but an OS-initiated disable (`TapDisabledBy*`) is answered on
+  `RearmBudget`, so a tap the system keeps disabling is let go instead of fought
+  over. Fighting it is what turns a tap we may no longer service into a permanent
+  gate on the HID stream.
 - No exit path may leave an armed tap behind. `process::exit` runs no destructors, so
   `ARMED_TAP` is detached from an `atexit` handler (covers the tray's Quit, the
   post-update self-restart, both watchdogs) and the agent handles SIGTERM/SIGINT
