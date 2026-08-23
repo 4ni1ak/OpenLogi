@@ -12,6 +12,19 @@ paths:
   The `NSWorkspace` read and the Accessibility-trust check/prompt are the parts that
   did move to the objc2 framework crates — see `.claude/rules/objc-ffi.md` for the rule that
   every TCC call uses a typed binding rather than a hand-written `extern` block.
+- `AXIsProcessTrusted()` is **not** a revocation signal: it keeps returning `true`
+  after the user deletes the app's row from System Settings, which is how #674 froze
+  clicks machine-wide. `has_accessibility` pairs it with a throwaway filtering tap
+  (`CGEventTapCreate` → NULL when the grant is gone); keep both, in that order — the
+  trust read is the cheap short-circuit, the probe is the truth. Never probe with
+  `ListenOnly`: that asks about Input Monitoring, a different grant.
+- Re-arm the tap only after the OS actually disabled it (`TapDisabledBy*`), and only
+  within `RearmBudget`. Re-enabling on a timer is what turns a tap we may no longer
+  service into a permanent gate on the HID stream.
+- No exit path may leave an armed tap behind. `process::exit` runs no destructors, so
+  `ARMED_TAP` is detached from an `atexit` handler (covers the tray's Quit, the
+  post-update self-restart, both watchdogs) and the agent handles SIGTERM/SIGINT
+  rather than dying with the tap installed.
 - The tap callback must never block and never panic: use `try_read`/`try_lock` only,
   queue bound actions off-thread, wrap the user callback in `catch_unwind`, and keep
   the stuck-callback watchdog that force-exits the agent if the budget is exceeded.
