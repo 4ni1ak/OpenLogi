@@ -17,6 +17,7 @@ use backon::{BackoffBuilder, ExponentialBuilder};
 use openlogi_assets::http;
 use openlogi_assets::{
     AssetRegistry, AssetSource, BUTTONS_RENDER_FILES, DepotManifest, DeviceEntry, FetchOutcome,
+    Index,
 };
 use openlogi_core::config::AssetSourcePreference;
 use openlogi_core::device::DeviceModelInfo;
@@ -99,37 +100,8 @@ pub fn sync(source: Option<AssetSource>, targets: &[AssetTarget]) -> Result<()> 
     // retries the whole sync on a later device snapshot, rather than latching
     // success off a run that downloaded nothing. Per-depot failures below stay
     // best-effort: an optional colour variant 404 shouldn't block everything.
-    // Each target carries the HID++ `extended_model_id` byte so the
-    // depot sync can fetch the right colour variant. `OPENLOGI_FORCE_DEPOT`
-    // doesn't correspond to a physical device, so we pass `ext = 0`
-    // and end up with the base PNG.
-    let mut depot_targets: Vec<(String, DeviceEntry, u8)> = Vec::new();
-    if let Ok(forced) = std::env::var("OPENLOGI_FORCE_DEPOT")
-        && let Some(entry) = index.devices.get(&forced)
-    {
-        depot_targets.push((forced, entry.clone(), 0));
-    }
-    for target in targets {
-        let match_result = match target {
-            AssetTarget::Hidpp { model, codename } => {
-                super::resolve_in_index(index, model, codename.as_deref())
-                    .map(|(depot, entry)| (depot, entry, model.extended_model_id))
-            }
-            AssetTarget::Standalone { registry_model_id } => index
-                .find_by_model_id(registry_model_id)
-                .map(|(depot, entry)| (depot, entry, 0)),
-        };
-        if let Some((depot, entry, ext)) = match_result {
-            depot_targets.push((depot.to_string(), entry.clone(), ext));
-        } else if let AssetTarget::Standalone { registry_model_id } = target {
-            info!(
-                registry_model_id,
-                "standalone model is not registered — using fallback art"
-            );
-        }
-    }
-    depot_targets.sort_by(|a, b| a.0.cmp(&b.0));
-    depot_targets.dedup_by(|a, b| a.0 == b.0);
+    let forced = std::env::var("OPENLOGI_FORCE_DEPOT").ok();
+    let depot_targets = depot_targets(index, targets, forced.as_deref());
 
     if depot_targets.is_empty() {
         debug!("sync: no matching depots for known devices");
@@ -143,6 +115,53 @@ pub fn sync(source: Option<AssetSource>, targets: &[AssetTarget]) -> Result<()> 
     }
     info!(devices = depot_targets.len(), "asset sync complete");
     Ok(())
+}
+
+/// The depots to sync for `targets`, each paired with its registry entry and
+/// the HID++ `extended_model_id` byte its manifest-mapped resources are keyed
+/// on. `forced` is `OPENLOGI_FORCE_DEPOT`, which names no physical device and
+/// so takes `ext = 0` — the base render.
+///
+/// Deduplicated on `(depot, ext)`, not on the depot alone. Two connected
+/// devices can share a depot while differing in `extended_model_id` — a colour
+/// pair, or the Lift's left- and right-handed variants — and each needs its own
+/// `device_image` / `device_buttons_image` / `image_metadata` resource. Keying
+/// on the depot dropped one of them before [`sync_depot`] ever read the
+/// manifest, leaving that device on fallback artwork with no hotspot metadata.
+/// The baseline files the second pass then re-requests are cache hits.
+fn depot_targets(
+    index: &Index,
+    targets: &[AssetTarget],
+    forced: Option<&str>,
+) -> Vec<(String, DeviceEntry, u8)> {
+    let mut depot_targets: Vec<(String, DeviceEntry, u8)> = Vec::new();
+    if let Some(depot) = forced
+        && let Some(entry) = index.devices.get(depot)
+    {
+        depot_targets.push((depot.to_owned(), entry.clone(), 0));
+    }
+    for target in targets {
+        let match_result = match target {
+            AssetTarget::Hidpp { model, codename } => {
+                super::resolve_in_index(index, model, codename.as_deref())
+                    .map(|(depot, entry)| (depot, entry, model.extended_model_id))
+            }
+            AssetTarget::Standalone { registry_model_id } => index
+                .find_by_model_id(registry_model_id)
+                .map(|(depot, entry)| (depot, entry, 0)),
+        };
+        if let Some((depot, entry, ext)) = match_result {
+            depot_targets.push((depot.to_owned(), entry.clone(), ext));
+        } else if let AssetTarget::Standalone { registry_model_id } = target {
+            info!(
+                registry_model_id,
+                "standalone model is not registered — using fallback art"
+            );
+        }
+    }
+    depot_targets.sort_by(|a, b| (&a.0, a.2).cmp(&(&b.0, b.2)));
+    depot_targets.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
+    depot_targets
 }
 
 fn sync_depot(
@@ -329,10 +348,85 @@ fn source_for_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::{AssetTarget, model_key, source_for_sync, sync_retry_delay};
-    use openlogi_assets::AssetSource;
+    use super::{AssetTarget, depot_targets, model_key, source_for_sync, sync_retry_delay};
+    use openlogi_assets::{AssetSource, DeviceEntry, Index};
     use openlogi_core::config::AssetSourcePreference;
+    use openlogi_core::device::{DeviceModelInfo, DeviceTransports};
+    use std::collections::HashMap;
     use std::time::Duration;
+
+    /// A one-depot index whose entry answers to `model_id`.
+    fn index_with(depot: &str, model_id: &str) -> Index {
+        let mut devices = HashMap::new();
+        devices.insert(
+            depot.to_owned(),
+            DeviceEntry {
+                model_id: model_id.to_owned(),
+                model_ids: Vec::new(),
+                display_name: "Lift".to_owned(),
+                kind: "MOUSE".to_owned(),
+                asset_path: format!("v1/devices/{depot}/"),
+                files: Vec::new(),
+            },
+        );
+        Index {
+            schema_version: 1,
+            devices,
+        }
+    }
+
+    fn hidpp_target(pid: u16, ext: u8) -> AssetTarget {
+        AssetTarget::Hidpp {
+            model: DeviceModelInfo {
+                entity_count: 0,
+                serial_number: None,
+                unit_id: [0; 4],
+                transports: DeviceTransports::default(),
+                model_ids: [pid, 0, 0],
+                extended_model_id: ext,
+            },
+            codename: None,
+        }
+    }
+
+    /// Two devices of one model differing only in `extended_model_id` — a
+    /// colour pair, or the Lift's left- and right-handed variants — share a
+    /// depot but need different `device_image` and `image_metadata`
+    /// resources. Deduplicating on the depot alone dropped one before
+    /// `sync_depot` ever read the manifest, leaving that device on fallback
+    /// artwork with no hotspot metadata.
+    #[test]
+    fn two_variants_of_one_depot_are_both_synced() {
+        let index = index_with("mx_vertical_mini", "b031");
+
+        let targets = depot_targets(
+            &index,
+            &[hidpp_target(0xb031, 4), hidpp_target(0xb031, 0)],
+            None,
+        );
+
+        let keyed: Vec<(&str, u8)> = targets
+            .iter()
+            .map(|(depot, _, ext)| (depot.as_str(), *ext))
+            .collect();
+        assert_eq!(keyed, [("mx_vertical_mini", 0), ("mx_vertical_mini", 4)]);
+    }
+
+    /// The same variant seen twice — two snapshots of one device — still
+    /// collapses to a single sync.
+    #[test]
+    fn the_same_variant_twice_is_synced_once() {
+        let index = index_with("mx_vertical_mini", "b031");
+
+        let targets = depot_targets(
+            &index,
+            &[hidpp_target(0xb031, 4), hidpp_target(0xb031, 4)],
+            None,
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].2, 4);
+    }
 
     #[test]
     fn retry_delay_doubles_then_caps() {
