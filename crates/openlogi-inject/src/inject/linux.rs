@@ -754,6 +754,12 @@ fn classify(
 }
 
 /// Whether `path` is a regular file with any execute bit set.
+///
+/// A mode check, not an effective-permission one: a file executable only by
+/// another user still answers `true` here. That is deliberate — this decides
+/// *classification*, and the exec itself is the authority on whether the
+/// program can actually run, so [`launch_program`] falls back to the opener
+/// when the spawn is refused.
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -781,30 +787,41 @@ fn on_path(name: &str) -> Option<PathBuf> {
 /// URLs, folders, documents, `.desktop` entries — returns `false` and stays
 /// with the opener.
 ///
-/// The child is waited on from a detached thread: a long-lived GUI app would
+/// The spawn runs on the calling thread so its result decides the return
+/// value; only the wait is detached, because a long-lived GUI app would
 /// otherwise linger as a zombie for the agent's whole lifetime.
+///
+/// `Command::spawn` reports a failed `exec` — the target is not executable by
+/// this user, is not a valid binary, or vanished between the check and the
+/// call — rather than succeeding and failing later, so a refused spawn is
+/// reported as unhandled here and the caller falls through to the opener.
+/// Without that, a file whose execute bit belongs to another user classified
+/// as a program, failed to start, and activating the slot did nothing at all.
 pub(super) fn launch_program(target: &str) -> bool {
     let Launch::Program(program) = classify(target, &is_executable, &on_path) else {
         return false;
     };
-    std::thread::spawn(move || {
-        match std::process::Command::new(&program)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(mut child) => {
+    match std::process::Command::new(&program)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
                 let _ = child.wait();
-            }
-            Err(error) => tracing::warn!(
+            });
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
                 %error,
                 program = %program.display(),
-                "could not launch the configured application"
-            ),
+                "could not launch the configured application — handing it to the desktop opener"
+            );
+            false
         }
-    });
-    true
+    }
 }
 
 #[cfg(test)]
@@ -814,9 +831,11 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::{
         KeyPhase, Launch, classify, combo, hid_usage_to_linux, is_executable, key_ev,
-        key_phase_events, modifiers_to_keycodes, on_path, syn,
+        key_phase_events, launch_program, modifiers_to_keycodes, on_path, syn,
     };
 
     #[test]
@@ -873,6 +892,32 @@ mod tests {
                 "{opener} belongs to the desktop opener"
             );
         }
+    }
+
+    /// A path that classifies as a program but cannot be exec'd must report
+    /// itself unhandled, so the caller still hands it to the desktop opener.
+    /// A regular file with no execute bit for *this* user is the case the
+    /// mode-based classification cannot see (#839 review).
+    #[test]
+    fn a_refused_spawn_is_reported_as_unhandled() {
+        let dir = std::env::temp_dir().join(format!("openlogi-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("not-a-binary");
+        std::fs::write(&path, b"\x7fELF this is not a loadable binary").expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("set mode");
+
+        let target = path.to_str().expect("utf-8 temp path");
+        assert_eq!(
+            classify(target, &is_executable, &on_path),
+            Launch::Program(path.clone()),
+            "the mode check classifies it as a program"
+        );
+        assert!(
+            !launch_program(target),
+            "an exec the kernel refuses must fall through to the opener"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The fakes above pin the decision table; this pins the two real probes
