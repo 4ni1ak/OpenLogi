@@ -57,6 +57,12 @@ pub(crate) struct HookInner {
 // threads; only CFRunLoopRun must be called on the owning thread.
 unsafe impl Send for HookInner {}
 
+unsafe extern "C" {
+    /// Register a handler the C runtime runs from `exit()` — which is what
+    /// `std::process::exit` calls, destructors skipped.
+    fn atexit(handler: extern "C" fn()) -> std::ffi::c_int;
+}
+
 /// Opaque `IOHIDEventRef` — the HID event backing a `CGEvent`.
 type IOHIDEventRef = *mut std::ffi::c_void;
 
@@ -529,15 +535,14 @@ pub(crate) fn start(
     let cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
 
     let signals = Arc::new(WatchdogSignals::default());
-    let armed = Arc::new(ArmedTap::default());
-    let lifecycle_watchdog = spawn_lifecycle_watchdog(Arc::clone(&signals), Arc::clone(&armed))?;
+    let lifecycle_watchdog = spawn_lifecycle_watchdog(Arc::clone(&signals))?;
     let (rl_tx, rl_rx) = mpsc::channel::<CFRunLoop>();
 
     let thread = {
         let thread_signals = Arc::clone(&signals);
         match thread::Builder::new()
             .name("openlogi-hook".into())
-            .spawn(move || thread_main(cb, rl_tx, thread_signals, armed))
+            .spawn(move || thread_main(cb, rl_tx, thread_signals))
         {
             Ok(thread) => thread,
             Err(error) => {
@@ -636,7 +641,6 @@ fn run_tap_callback(
 /// the agent so macOS tears the tap down and system input recovers.
 fn spawn_callback_watchdog(
     signals: Arc<WatchdogSignals>,
-    armed: Arc<ArmedTap>,
     in_callback: Arc<AtomicBool>,
     entered_at_ms: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
@@ -677,7 +681,7 @@ fn spawn_callback_watchdog(
                 // Detaching cannot unblock an in-flight callback, so the
                 // process still has to go — but it goes with the tap already
                 // out of the chain rather than stranded there.
-                armed.detach();
+                ARMED_TAP.detach();
                 #[expect(
                     clippy::exit,
                     reason = "this watchdog thread has no caller to return to and the stuck callback owns the active HID tap, which serialises every pointer event machine-wide; only process death makes macOS tear the tap down"
@@ -700,7 +704,6 @@ fn spawn_callback_watchdog(
 /// after that thread has exited.
 fn spawn_lifecycle_watchdog(
     signals: Arc<WatchdogSignals>,
-    armed: Arc<ArmedTap>,
 ) -> Result<thread::JoinHandle<()>, HookError> {
     thread::Builder::new()
         .name("openlogi-hook-lifecycle-watchdog".into())
@@ -748,7 +751,7 @@ fn spawn_lifecycle_watchdog(
                             "HID CGEventTap lifecycle did not make progress before deadline — \
                              exiting agent to restore system input"
                         );
-                        armed.detach();
+                        ARMED_TAP.detach();
                         #[expect(
                             clippy::exit,
                             reason = "the tap thread is wedged (TCC revocation can stall it inside CoreGraphics), so no unwinding path can reach it from this watchdog thread; a live HID tap left behind freezes all input until the process dies"
@@ -767,12 +770,12 @@ fn spawn_lifecycle_watchdog(
 /// leaving it armed there would gate the HID stream with no run loop behind it.
 /// The ordinary teardown detaches explicitly, in order, before it publishes
 /// [`TapPhase::TapStopped`]; this only catches the paths that never get there.
-struct ArmGuard(Arc<ArmedTap>);
+struct ArmGuard;
 
 impl Drop for ArmGuard {
     fn drop(&mut self) {
-        self.0.detach();
-        self.0.disarm();
+        ARMED_TAP.detach();
+        ARMED_TAP.disarm();
     }
 }
 
@@ -846,7 +849,6 @@ fn thread_main(
     cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
     rl_tx: mpsc::Sender<CFRunLoop>,
     signals: Arc<WatchdogSignals>,
-    armed: Arc<ArmedTap>,
 ) {
     // Declared first so it drops last, after the tap, callback, source, and run
     // loop locals have unwound. The lifecycle watchdog treats this notification
@@ -900,8 +902,8 @@ fn thread_main(
     // installed the tap, so from here on every exit path must be able to
     // detach it — including the watchdogs' `process::exit`.
     let tap = Arc::new(SharedTap(tap));
-    armed.arm(&tap);
-    let _disarm = ArmGuard(Arc::clone(&armed));
+    ARMED_TAP.arm(&tap);
+    let _disarm = ArmGuard;
     signals.mark_tap_progress();
 
     let Ok(loop_source) = tap.0.mach_port().create_runloop_source(0) else {
@@ -920,7 +922,6 @@ fn thread_main(
     signals.mark_tap_progress();
     if let Err(error) = spawn_callback_watchdog(
         Arc::clone(&signals),
-        Arc::clone(&armed),
         Arc::clone(&in_callback),
         Arc::clone(&entered_at_ms),
     ) {
@@ -935,7 +936,7 @@ fn thread_main(
     if rl_tx.send(run_loop.clone()).is_err() {
         debug!("hook parent dropped before run loop was ready; stopping");
         tap.detach();
-        armed.disarm();
+        ARMED_TAP.disarm();
         // SAFETY: framework-provided static CFStringRef, 'static.
         run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
         drop(loop_source);
@@ -950,7 +951,7 @@ fn thread_main(
     // so input recovers immediately rather than whenever CF happens to
     // release the port.
     tap.detach();
-    armed.disarm();
+    ARMED_TAP.disarm();
     // SAFETY: framework-provided static CFStringRef, 'static.
     run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
     drop(loop_source);
@@ -1010,16 +1011,37 @@ impl SharedTap {
     }
 }
 
-/// The armed tap, published so the watchdog threads can reach it.
+/// The tap this process has armed, if any.
 ///
-/// Holding an `Arc` rather than a raw port keeps the tap alive for as long as a
-/// watchdog is touching it, so an emergency detach can never race the tap
+/// A process-wide slot because the paths that must reach it hold no handle:
+/// the watchdog threads, and `atexit`. The agent runs exactly one hook (it is
+/// single-instance, and the tap is a process-wide resource either way), so one
+/// slot is the whole story.
+///
+/// Holding an `Arc` rather than a raw port keeps the tap alive for as long as
+/// anything is touching it, so an emergency detach can never race the tap
 /// thread's teardown into a released port.
-#[derive(Default)]
+static ARMED_TAP: ArmedTap = ArmedTap(std::sync::Mutex::new(None));
+
+/// Detach on the way out of a `process::exit`, which runs C `atexit` handlers
+/// but no Rust destructors. The tray's Quit, the post-update self-restart and
+/// both watchdogs all leave that way, and a tap that dies with its process
+/// without being invalidated can stay registered in the system's tap chain.
+extern "C" fn detach_armed_tap_at_exit() {
+    ARMED_TAP.detach();
+}
+
 struct ArmedTap(std::sync::Mutex<Option<Arc<SharedTap>>>);
 
 impl ArmedTap {
     fn arm(&self, tap: &Arc<SharedTap>) {
+        static REGISTER_ATEXIT: std::sync::Once = std::sync::Once::new();
+        REGISTER_ATEXIT.call_once(|| {
+            // SAFETY: `atexit` stores the handler for the process to run at
+            // exit; ours only locks a static mutex and makes CoreFoundation
+            // calls that are safe from any thread.
+            unsafe { atexit(detach_armed_tap_at_exit) };
+        });
         *self.lock() = Some(Arc::clone(tap));
     }
 
