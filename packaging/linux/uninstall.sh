@@ -72,7 +72,15 @@ for size in 1024 512 256 128 64 48 32 16; do
 done
 
 echo "Removing GNOME Shell extension …"
-sudo rm -rf "/usr/share/gnome-shell/extensions/openlogi-frontmost@openlogi.dev"
+# Remove only the two files the installer wrote, then the directory itself if
+# nothing else is left in it. `rm -rf` on the whole directory would delete
+# files a distro package or another install method put there while their
+# package manager still records them as present.
+EXT_DIR="/usr/share/gnome-shell/extensions/openlogi-frontmost@openlogi.dev"
+for file in metadata.json extension.js; do
+  sudo rm -f "$EXT_DIR/$file"
+done
+sudo rmdir "$EXT_DIR" 2>/dev/null || true
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   sudo gtk-update-icon-cache -qtf /usr/share/icons/hicolor || true
