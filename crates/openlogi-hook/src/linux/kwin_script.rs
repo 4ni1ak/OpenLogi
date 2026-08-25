@@ -14,20 +14,41 @@
 //! activation, because a KWin script can call D-Bus but cannot export a
 //! service.
 //!
-//! The script lives in `kwin-script/` in this crate and must be installed and
-//! enabled for this backend to be useful. The backend itself starts whenever
-//! the session bus is reachable and simply reports `None` until the first push
-//! arrives, so a Plasma session without the script keeps working exactly as it
-//! does today.
+//! # Why this backend loads the script itself
+//!
+//! Pushing has two consequences a polled backend does not have, and both are
+//! solved by making the load part of startup rather than a user step:
+//!
+//! - **A pushed value cannot be asked for again.** The script reports the
+//!   active window once at load and then only on change, so a script already
+//!   running when OpenLogi starts has *already* sent its only unprompted
+//!   update, into a bus name nobody owned yet. Focus would then stay unknown
+//!   until the user next switched windows — possibly not for hours.
+//! - **A push-fed backend cannot tell "no companion" from "nothing focused
+//!   yet".** Both are an empty cache, so simply serving the name and hoping
+//!   would make this candidate succeed on *every* session with a session bus
+//!   — GNOME included — permanently suppressing the X11/XWayland fallback that
+//!   is the only frontmost source those sessions have.
+//!
+//! So [`candidate`] claims the bus name first, then drives KWin's scripting
+//! interface to (re)load the script, and reports failure unless every step
+//! works. A session without the script installed, or without KWin at all,
+//! fails at a definite step and falls through to the next candidate exactly as
+//! before. Reloading an already-loaded script is deliberate: it is what makes
+//! the load-time push land *after* the name exists.
 //!
 //! `resourceClass` is the same string X11 reports as `WM_CLASS`, so per-app
 //! profile keys stay consistent across X11, XWayland and Plasma Wayland.
 
+use std::env;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tracing::debug;
 use zbus::blocking::connection::Builder;
-use zbus::interface;
+use zbus::{interface, proxy};
 
 use super::FrontmostSource;
 
@@ -38,9 +59,54 @@ use super::FrontmostSource;
 const DBUS_NAME: &str = "org.openlogi.KWinFrontmost";
 const DBUS_PATH: &str = "/org/openlogi/KWinFrontmost";
 
+/// The script's plugin id, which is also the name KWin's scripting interface
+/// keys a loaded script by. Must match `KPlugin.Id` in the script's
+/// `metadata.json`.
+const SCRIPT_PLUGIN_ID: &str = "openlogi-frontmost";
+
+/// Where the installed script sits inside an XDG data directory. KWin resolves
+/// its script packages the same way, so searching the same directories finds
+/// exactly what a System Settings install would have registered.
+const SCRIPT_SUBPATH: &str = "kwin/scripts/openlogi-frontmost/contents/code/main.js";
+
+/// Cap on every call into KWin. Without it a stalled compositor would block
+/// the polling thread forever — the probe runs inside the `FRONTMOST_SOURCE`
+/// initializer, so a stall there blocks every thread that touches it.
+const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The last class the script pushed. `None` until the first activation after
 /// the script starts, and cleared when KWin reports focus leaving every window.
 type Cached = Arc<Mutex<Option<String>>>;
+
+/// D-Bus proxy for KWin's scripting interface. Note the lowercase `kwin` in the
+/// interface name — `org.kde.KWin.Scripting` does not exist. Only the blocking
+/// proxy is generated (`gen_async = false`), matching the synchronous startup
+/// path this runs on.
+#[proxy(
+    interface = "org.kde.kwin.Scripting",
+    default_service = "org.kde.KWin",
+    default_path = "/Scripting",
+    gen_async = false
+)]
+///
+/// Every method carries an explicit `name`: KWin spells these members in
+/// camelCase, while zbus would otherwise derive PascalCase ones that simply do
+/// not exist on the interface.
+trait KWinScripting {
+    #[zbus(name = "isScriptLoaded")]
+    fn is_script_loaded(&self, plugin_id: &str) -> zbus::Result<bool>;
+    #[zbus(name = "unloadScript")]
+    fn unload_script(&self, plugin_id: &str) -> zbus::Result<bool>;
+    /// Returns the loaded script's id, which is of no use to us — the script
+    /// is addressed by plugin id everywhere else.
+    #[zbus(name = "loadScript")]
+    fn load_script(&self, file_path: &str, plugin_id: &str) -> zbus::Result<i32>;
+    /// Starts every loaded-but-not-yet-running script. A no-op for scripts that
+    /// are already running, which is why the reload above is what actually
+    /// re-triggers our script's load-time push.
+    #[zbus(name = "start")]
+    fn start(&self) -> zbus::Result<()>;
+}
 
 /// The D-Bus object the KWin script calls.
 struct Receiver {
@@ -81,21 +147,86 @@ impl FrontmostSource for KWinScriptSource {
     }
 }
 
-/// Claim the bus name and serve the push endpoint, or `None` when the session
-/// bus is unreachable or the name is already owned.
+/// The XDG data directories, most specific first: `XDG_DATA_HOME` (or its
+/// `~/.local/share` default) followed by `XDG_DATA_DIRS` (or its spec default).
+/// A per-user install therefore shadows a system-wide one, matching KWin.
+fn data_dirs() -> Vec<PathBuf> {
+    let home = env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+
+    let shared = env::var_os("XDG_DATA_DIRS")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("/usr/local/share:/usr/share"));
+
+    home.into_iter()
+        .chain(env::split_paths(&shared))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect()
+}
+
+/// First installed copy of the script, or `None` when it is not installed.
+///
+/// `exists` is injected so the search order can be tested without touching the
+/// filesystem.
+fn find_script(dirs: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(SCRIPT_SUBPATH))
+        .find(|path| exists(path))
+}
+
+/// Reload the script so its load-time push lands after we own the bus name.
+///
+/// Unloading first is what forces that push: `start` alone does nothing for a
+/// script KWin already started, so a script enabled through System Settings
+/// would otherwise stay silent until the next window activation.
+fn reload_script(connection: &zbus::blocking::Connection, path: &Path) -> zbus::Result<()> {
+    let scripting = KWinScriptingProxy::new(connection)?;
+
+    // The first call doubles as the "is this KWin at all?" probe: on a session
+    // without it, this fails and the whole candidate declines.
+    if scripting.is_script_loaded(SCRIPT_PLUGIN_ID)? {
+        scripting.unload_script(SCRIPT_PLUGIN_ID)?;
+    }
+    scripting.load_script(&path.to_string_lossy(), SCRIPT_PLUGIN_ID)?;
+    scripting.start()
+}
+
+/// Serve the push endpoint and load the companion script, or `None` when this
+/// is not a KWin session, the script is not installed, or the bus is
+/// unreachable — in which case backend selection falls through as before.
 pub(super) fn candidate() -> Option<Box<dyn FrontmostSource>> {
+    let path = find_script(&data_dirs(), Path::exists).or_else(|| {
+        debug!("kwin-script: no companion script installed under any XDG data directory");
+        None
+    })?;
+
     let cached: Cached = Arc::new(Mutex::new(None));
     let receiver = Receiver {
         cached: Arc::clone(&cached),
     };
+    // Claim the name *before* loading the script, so the script's load-time
+    // push has somewhere to land.
     let connection = Builder::session()
         .and_then(|builder| builder.name(DBUS_NAME))
         .and_then(|builder| builder.serve_at(DBUS_PATH, receiver))
+        .map(|builder| builder.method_timeout(METHOD_TIMEOUT))
         .and_then(Builder::build)
         .map_err(|error| debug!(%error, "kwin-script: could not serve the push endpoint"))
         .ok()?;
 
-    debug!("kwin-script: serving {DBUS_NAME} — waiting for the script to push");
+    // Dropping `connection` on the error path releases the bus name again, so a
+    // failure here leaves nothing behind for the next candidate to trip over.
+    reload_script(&connection, &path)
+        .map_err(|error| debug!(%error, "kwin-script: could not load the companion script"))
+        .ok()?;
+
+    debug!(
+        "kwin-script: loaded {} from {}",
+        SCRIPT_PLUGIN_ID,
+        path.display()
+    );
     Some(Box::new(KWinScriptSource {
         cached,
         _connection: connection,
@@ -159,5 +290,38 @@ mod tests {
         assert_eq!(read(&cached), Some("org.kde.kcalc".to_owned()));
         receiver.set_focused_window_class("org.kde.konsole");
         assert_eq!(read(&cached), Some("org.kde.konsole".to_owned()));
+    }
+
+    /// Not finding the script is the signal that this is not a KWin session
+    /// with the companion installed, which is what preserves the X11/XWayland
+    /// fallback for every other Wayland desktop.
+    #[test]
+    fn finds_no_script_when_it_is_installed_nowhere() {
+        let dirs = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+        assert_eq!(find_script(&dirs, |_| false), None);
+    }
+
+    #[test]
+    fn finds_the_script_inside_a_data_directory() {
+        let dirs = vec![PathBuf::from("/usr/share")];
+        assert_eq!(
+            find_script(&dirs, |path| path.starts_with("/usr/share")),
+            Some(PathBuf::from("/usr/share").join(SCRIPT_SUBPATH))
+        );
+    }
+
+    /// `data_dirs` is ordered most-specific-first, and `find_script` must keep
+    /// that order: a per-user install shadows a system-wide one, the same way
+    /// KWin resolves its own script packages.
+    #[test]
+    fn prefers_the_earliest_data_directory() {
+        let dirs = vec![
+            PathBuf::from("/home/user/.local/share"),
+            PathBuf::from("/usr/share"),
+        ];
+        assert_eq!(
+            find_script(&dirs, |_| true),
+            Some(PathBuf::from("/home/user/.local/share").join(SCRIPT_SUBPATH))
+        );
     }
 }
