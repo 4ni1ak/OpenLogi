@@ -44,7 +44,8 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 use zbus::blocking::connection::Builder;
@@ -74,9 +75,47 @@ const SCRIPT_SUBPATH: &str = "kwin/scripts/openlogi-frontmost/contents/code/main
 /// initializer, so a stall there blocks every thread that touches it.
 const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The last class the script pushed. `None` until the first activation after
-/// the script starts, and cleared when KWin reports focus leaving every window.
-type Cached = Arc<Mutex<Option<String>>>;
+/// What the companion script has told us so far.
+///
+/// [`Focus::Silent`] is deliberately distinct from [`Focus::Empty`]: a push
+/// carrying the empty string is KWin saying "nothing is focused", which is a
+/// working pipeline, while silence may equally mean the script never ran.
+/// Collapsing the two would make [`candidate`] unable to tell a live companion
+/// from a dead one.
+#[derive(Default, PartialEq, Eq)]
+enum Focus {
+    /// Nothing has been pushed yet.
+    #[default]
+    Silent,
+    /// KWin activated no window — desktop focus, or the last window closing.
+    Empty,
+    /// The focused window's `resourceClass`.
+    Window(String),
+}
+
+impl Focus {
+    /// The identifier per-app profiles are keyed by, which exists only for a
+    /// real window: both silence and an empty push mean "no frontmost app".
+    fn app_id(&self) -> Option<String> {
+        match self {
+            Self::Window(class) => Some(class.clone()),
+            Self::Silent | Self::Empty => None,
+        }
+    }
+}
+
+/// The latest [`Focus`], shared between the D-Bus receiver and the backend.
+type Cached = Arc<Mutex<Focus>>;
+
+/// How long [`candidate`] waits for the script's load-time push before giving
+/// up on it. The push is sent as the script loads, so this is normally over in
+/// milliseconds; the cap exists because `loadScript` reports success for a file
+/// KWin never actually runs, making an arrived push the only real proof that
+/// the companion works.
+const FIRST_PUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Gap between checks while waiting for that first push.
+const FIRST_PUSH_POLL: Duration = Duration::from_millis(25);
 
 /// D-Bus proxy for KWin's scripting interface. Note the lowercase `kwin` in the
 /// interface name — `org.kde.KWin.Scripting` does not exist. Only the blocking
@@ -121,7 +160,11 @@ impl Receiver {
     /// last window closing), which is reported as "no frontmost app" rather
     /// than as an app literally named "".
     fn set_focused_window_class(&self, class: &str) {
-        let value = (!class.is_empty()).then(|| class.to_owned());
+        let value = if class.is_empty() {
+            Focus::Empty
+        } else {
+            Focus::Window(class.to_owned())
+        };
         *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = value;
     }
 }
@@ -139,7 +182,7 @@ impl FrontmostSource for KWinScriptSource {
         self.cached
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .app_id()
     }
 
     fn name(&self) -> &'static str {
@@ -176,12 +219,34 @@ fn find_script(dirs: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Option<PathB
         .find(|path| exists(path))
 }
 
+/// Why the companion could not be brought up.
+#[derive(Debug, thiserror::Error)]
+enum ReloadError {
+    #[error("KWin scripting call failed: {0}")]
+    Bus(#[from] zbus::Error),
+    /// `loadScript` answers with a slot index, or `-1` when it refuses — which
+    /// it does when that plugin id is already loaded. Reaching this means the
+    /// unload above did not take effect, so the script KWin is running is not
+    /// the one we just asked for and its load-time push is never coming.
+    #[error("KWin refused to load the script (already loaded?)")]
+    Refused,
+    /// `loadScript` reports success for a path KWin never actually runs — it
+    /// does not validate the file — so a missing push is the only evidence that
+    /// the companion is not working.
+    #[error("the script never reported a focused window")]
+    Silent,
+}
+
 /// Reload the script so its load-time push lands after we own the bus name.
 ///
 /// Unloading first is what forces that push: `start` alone does nothing for a
 /// script KWin already started, so a script enabled through System Settings
 /// would otherwise stay silent until the next window activation.
-fn reload_script(connection: &zbus::blocking::Connection, path: &Path) -> zbus::Result<()> {
+fn reload_script(
+    connection: &zbus::blocking::Connection,
+    path: &Path,
+    cached: &Cached,
+) -> Result<(), ReloadError> {
     let scripting = KWinScriptingProxy::new(connection)?;
 
     // The first call doubles as the "is this KWin at all?" probe: on a session
@@ -189,8 +254,29 @@ fn reload_script(connection: &zbus::blocking::Connection, path: &Path) -> zbus::
     if scripting.is_script_loaded(SCRIPT_PLUGIN_ID)? {
         scripting.unload_script(SCRIPT_PLUGIN_ID)?;
     }
-    scripting.load_script(&path.to_string_lossy(), SCRIPT_PLUGIN_ID)?;
-    scripting.start()
+    if scripting.load_script(&path.to_string_lossy(), SCRIPT_PLUGIN_ID)? < 0 {
+        return Err(ReloadError::Refused);
+    }
+    scripting.start()?;
+    await_first_push(cached)
+}
+
+/// Block until the script pushes, or [`FIRST_PUSH_TIMEOUT`] elapses.
+///
+/// This is what keeps a broken or absent companion from capturing the backend
+/// slot: without proof that pushes arrive, the candidate must decline so that
+/// selection falls through to X11/XWayland.
+fn await_first_push(cached: &Cached) -> Result<(), ReloadError> {
+    let deadline = Instant::now() + FIRST_PUSH_TIMEOUT;
+    loop {
+        if *cached.lock().unwrap_or_else(PoisonError::into_inner) != Focus::Silent {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ReloadError::Silent);
+        }
+        thread::sleep(FIRST_PUSH_POLL);
+    }
 }
 
 /// Serve the push endpoint and load the companion script, or `None` when this
@@ -202,7 +288,7 @@ pub(super) fn candidate() -> Option<Box<dyn FrontmostSource>> {
         None
     })?;
 
-    let cached: Cached = Arc::new(Mutex::new(None));
+    let cached: Cached = Arc::new(Mutex::new(Focus::default()));
     let receiver = Receiver {
         cached: Arc::clone(&cached),
     };
@@ -218,8 +304,8 @@ pub(super) fn candidate() -> Option<Box<dyn FrontmostSource>> {
 
     // Dropping `connection` on the error path releases the bus name again, so a
     // failure here leaves nothing behind for the next candidate to trip over.
-    reload_script(&connection, &path)
-        .map_err(|error| debug!(%error, "kwin-script: could not load the companion script"))
+    reload_script(&connection, &path, &cached)
+        .map_err(|error| debug!(%error, "kwin-script: companion script unusable"))
         .ok()?;
 
     debug!(
@@ -239,7 +325,7 @@ mod tests {
 
     /// Build a receiver plus the cache it writes into, without touching D-Bus.
     fn receiver() -> (Receiver, Cached) {
-        let cached: Cached = Arc::new(Mutex::new(None));
+        let cached: Cached = Arc::new(Mutex::new(Focus::default()));
         (
             Receiver {
                 cached: Arc::clone(&cached),
@@ -248,24 +334,26 @@ mod tests {
         )
     }
 
-    fn read(cached: &Cached) -> Option<String> {
+    /// Read through the same mapping the backend uses, so the tests exercise
+    /// `Focus::app_id` rather than the cache representation directly.
+    fn frontmost(cached: &Cached) -> Option<String> {
         cached
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .app_id()
     }
 
     #[test]
     fn reports_nothing_until_the_script_pushes() {
         let (_receiver, cached) = receiver();
-        assert_eq!(read(&cached), None);
+        assert_eq!(frontmost(&cached), None);
     }
 
     #[test]
     fn records_the_pushed_window_class() {
         let (receiver, cached) = receiver();
         receiver.set_focused_window_class("org.kde.konsole");
-        assert_eq!(read(&cached), Some("org.kde.konsole".to_owned()));
+        assert_eq!(frontmost(&cached), Some("org.kde.konsole".to_owned()));
     }
 
     /// The script sends `""` when KWin activated no window — focus on the
@@ -277,7 +365,18 @@ mod tests {
         let (receiver, cached) = receiver();
         receiver.set_focused_window_class("org.kde.konsole");
         receiver.set_focused_window_class("");
-        assert_eq!(read(&cached), None);
+        assert_eq!(frontmost(&cached), None);
+    }
+
+    /// Both report "no app", but only one of them proves the companion is
+    /// alive — which is the whole basis on which the candidate decides whether
+    /// to keep the backend slot.
+    #[test]
+    fn an_empty_push_still_counts_as_having_been_heard() {
+        let (receiver, cached) = receiver();
+        await_first_push(&cached).expect_err("silence must not count as heard");
+        receiver.set_focused_window_class("");
+        await_first_push(&cached).expect("an empty push is still a push");
     }
 
     /// Activations overwrite rather than accumulate — the cache is the *last*
@@ -287,9 +386,19 @@ mod tests {
         let (receiver, cached) = receiver();
         receiver.set_focused_window_class("org.kde.konsole");
         receiver.set_focused_window_class("org.kde.kcalc");
-        assert_eq!(read(&cached), Some("org.kde.kcalc".to_owned()));
+        assert_eq!(frontmost(&cached), Some("org.kde.kcalc".to_owned()));
         receiver.set_focused_window_class("org.kde.konsole");
-        assert_eq!(read(&cached), Some("org.kde.konsole".to_owned()));
+        assert_eq!(frontmost(&cached), Some("org.kde.konsole".to_owned()));
+    }
+
+    /// `loadScript` reports success for a file KWin never runs, so silence is
+    /// the only signal that the companion is not working — and it has to end
+    /// the candidate rather than hold the slot with an empty cache.
+    #[test]
+    fn a_script_that_never_pushes_is_rejected() {
+        let (_receiver, cached) = receiver();
+        let error = await_first_push(&cached).expect_err("silence must not pass");
+        assert!(matches!(error, ReloadError::Silent));
     }
 
     /// Not finding the script is the signal that this is not a KWin session
