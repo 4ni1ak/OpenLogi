@@ -813,11 +813,25 @@ pub(super) fn launch_program(target: &str) -> bool {
             });
             true
         }
+        // Not executable *by this user*: the opener cannot run it either, and
+        // handing a binary to `xdg-open` risks it landing in a text editor.
+        // Report it handled so nothing else is tried, and say why.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                %error,
+                program = %program.display(),
+                "the configured application is not executable by this user — nothing to run"
+            );
+            true
+        }
+        // Any other refusal means the mode bit was misleading — a data file
+        // with the bit set, a script with no interpreter, a path that vanished.
+        // Those are the desktop opener's business after all.
         Err(error) => {
             tracing::warn!(
                 %error,
                 program = %program.display(),
-                "could not launch the configured application — handing it to the desktop opener"
+                "not a runnable program — handing it to the desktop opener"
             );
             false
         }
@@ -915,6 +929,33 @@ mod tests {
         assert!(
             !launch_program(target),
             "an exec the kernel refuses must fall through to the opener"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file whose execute bit belongs to someone else classifies as a
+    /// program but cannot be run here — and the desktop opener cannot run it
+    /// either, so falling through to it would only repeat the failure with a
+    /// binary in a text editor as the best case. Report it handled instead.
+    #[test]
+    fn an_unexecutable_program_is_not_passed_to_the_opener() {
+        let dir = std::env::temp_dir().join(format!("openlogi-eacces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("no-permission");
+        std::fs::write(&path, b"#!/bin/sh\ntrue\n").expect("write file");
+        // Executable for group and other, never for the owner running this.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o011)).expect("set mode");
+
+        let target = path.to_str().expect("utf-8 temp path");
+        assert_eq!(
+            classify(target, &is_executable, &on_path),
+            Launch::Program(path.clone()),
+            "the mode check still sees an execute bit"
+        );
+        assert!(
+            launch_program(target),
+            "an exec refused for permissions must not fall through to the opener"
         );
 
         std::fs::remove_dir_all(&dir).ok();
