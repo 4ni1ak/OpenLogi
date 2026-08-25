@@ -538,6 +538,7 @@ fn device_thread(
 // and gnome-shell backends are all available; see `wayland_candidates`.
 
 mod gnome_shell;
+mod kwin_script;
 mod wlr_foreign_toplevel;
 
 /// A backend that reports which application is currently frontmost.
@@ -693,7 +694,21 @@ fn x11_candidate() -> Option<Box<dyn FrontmostSource>> {
 /// support none of these fall through to the X11/XWayland path (which resolves
 /// XWayland windows, `None` for native Wayland apps).
 fn wayland_candidates() -> Vec<Candidate> {
-    vec![wlr_foreign_toplevel::candidate, gnome_shell::candidate]
+    // Order is "most specific first". The two shell-assisted backends only
+    // start where their companion is installed, and wlroots' protocol only
+    // binds where the compositor offers it, so whichever matches this session
+    // wins and the rest fall through to X11/XWayland.
+    //
+    // KWin comes last of the three because it is the one that starts
+    // optimistically: it claims its bus name whenever the session bus is
+    // reachable and reports `None` until the script pushes, so on a session
+    // where another backend would also work, trying it first could park us on
+    // a source that never answers.
+    vec![
+        wlr_foreign_toplevel::candidate,
+        gnome_shell::candidate,
+        kwin_script::candidate,
+    ]
 }
 
 /// Pick the frontmost backend for this session, trying each candidate in order
