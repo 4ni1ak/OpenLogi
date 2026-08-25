@@ -52,6 +52,7 @@ The script installs:
   /usr/lib/systemd/user/openlogi-agent.service  (if systemd is present)
   /usr/share/applications/openlogi.desktop
   /usr/share/icons/hicolor/<size>/apps/openlogi.png  (16 … 1024)
+  /usr/share/gnome-shell/extensions/openlogi-frontmost@openlogi.dev/  (GNOME Shell extension)
 EOF
   exit 0
 fi
@@ -141,6 +142,21 @@ if [ -f "$ICON_SRC" ]; then
   if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     sudo gtk-update-icon-cache -qtf /usr/share/icons/hicolor || true
   fi
+fi
+
+# ── GNOME Shell companion extension ───────────────────────────────────────────
+
+# Per-app profiles read the focused window's WM_CLASS through this; Mutter
+# exposes it nowhere else. Installed, not enabled: GNOME only loads an
+# extension the user opted into, and Wayland needs a new session to pick it up.
+EXT_SRC="${REPO_ROOT}/crates/openlogi-hook/gnome-shell-extension/openlogi-frontmost@openlogi.dev"
+if [ -d "$EXT_SRC" ]; then
+  echo "Installing GNOME Shell extension …"
+  for file in metadata.json extension.js; do
+    sudo install -Dm644 "$EXT_SRC/$file" "/usr/share/gnome-shell/extensions/openlogi-frontmost@openlogi.dev/$file"
+  done
+  echo "  enable it with: gnome-extensions enable openlogi-frontmost@openlogi.dev"
+  echo "  (log out and back in first — Wayland cannot reload the shell)"
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
