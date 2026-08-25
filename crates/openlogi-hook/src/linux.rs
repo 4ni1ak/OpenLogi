@@ -699,11 +699,9 @@ fn wayland_candidates() -> Vec<Candidate> {
     // binds where the compositor offers it, so whichever matches this session
     // wins and the rest fall through to X11/XWayland.
     //
-    // KWin comes last of the three because it is the one that starts
-    // optimistically: it claims its bus name whenever the session bus is
-    // reachable and reports `None` until the script pushes, so on a session
-    // where another backend would also work, trying it first could park us on
-    // a source that never answers.
+    // KWin comes last only because it is the most expensive probe: unlike the
+    // other two it loads its companion script as part of starting, so letting
+    // the cheap checks decline first avoids that work on non-KDE sessions.
     vec![
         wlr_foreign_toplevel::candidate,
         gnome_shell::candidate,

@@ -29,6 +29,9 @@ installed keeps working exactly as it does today.
 
 ## Install
 
+Copy the script into an XDG data directory; OpenLogi looks in `XDG_DATA_HOME`
+first, then `XDG_DATA_DIRS`, exactly as KWin resolves its own script packages:
+
 ```sh
 UUID=openlogi-frontmost
 DEST="$HOME/.local/share/kwin/scripts/$UUID"
@@ -36,20 +39,24 @@ mkdir -p "$DEST"
 cp -r "$UUID"/. "$DEST"/
 ```
 
-Then enable it and make KWin pick it up:
+That is the whole install. **Enabling it in System Settings is not required**:
+OpenLogi loads the script through KWin's scripting interface when the hook
+starts, and reloads it if it is already running.
 
-```sh
-kwriteconfig6 --file kwinrc --group Plugins --key "${UUID}Enabled" true
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start
-```
+The reload is the point rather than an accident. The script reports the active
+window once at load and then only on change, so a script that KWin started
+before OpenLogi did has already spent its only unprompted update on a bus name
+nobody owned yet — focus would stay unknown until the user next switched
+windows. Loading it from OpenLogi, after the bus name exists, makes that first
+report land.
 
-The script is also listed under *System Settings → Window Management → KWin
-Scripts* once installed, where it can be toggled without the command line.
+The script still appears under *System Settings → Window Management → KWin
+Scripts* once the files are in place, and enabling it there is harmless.
 
 ## Verify
 
-With OpenLogi's hook running (so the bus name is claimed), load the script and
-watch the backend follow the focus:
+Run the hook's frontmost smoke test — it loads the script for you — and watch
+the backend follow the focus:
 
 ```sh
 cargo run --example frontmost_app -p openlogi-hook
@@ -62,8 +69,9 @@ printing `(none …)`, check that the name is actually served:
 busctl --user list | grep org.openlogi.KWinFrontmost
 ```
 
-An owner there but no updates means the script is not loaded; no owner means
-the hook is not running, and the script's pushes are being dropped.
+No owner means the backend declined: either the script is not installed in a
+directory OpenLogi searches, or this is not a KWin session — in both cases
+OpenLogi falls back to X11/XWayland, which only resolves XWayland windows.
 
 ## Notes
 
