@@ -69,9 +69,12 @@ printing `(none …)`, check that the name is actually served:
 busctl --user list | grep org.openlogi.KWinFrontmost
 ```
 
-No owner means the backend declined: either the script is not installed in a
-directory OpenLogi searches, or this is not a KWin session — in both cases
-OpenLogi falls back to X11/XWayland, which only resolves XWayland windows.
+No owner means the backend declined and released the name. That happens when
+the script is not installed in a directory OpenLogi searches, when this is not
+a KWin session, or when the script loaded but never pushed — KWin reports a
+successful load for a file it does not actually run, so OpenLogi waits briefly
+for the first push and treats silence as a broken companion. In every case it
+falls back to X11/XWayland, which only resolves XWayland windows.
 
 ## Notes
 
