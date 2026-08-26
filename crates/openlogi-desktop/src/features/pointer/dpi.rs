@@ -486,21 +486,27 @@ fn numeric_input_element(
 
 /// Parse the DPI numeric field's raw text into a device value.
 ///
-/// `None` for empty or non-numeric input — [`DpiPanel::commit_numeric_dpi`]
-/// treats that as "leave the last known-good DPI alone" rather than writing
-/// garbage. A value too large for the wire format's `u16` saturates to its
-/// maximum instead of being rejected outright: the field's own
-/// [`InputState::validate`] filter already keeps the text digits-only, so the
-/// only way to reach an out-of-range number here is typing more digits than
-/// any real DPI needs.
+/// `None` for empty input — [`DpiPanel::commit_numeric_dpi`] treats that as
+/// "leave the last known-good DPI alone" rather than writing garbage. A value
+/// too large for the wire format's `u16` saturates to its maximum instead of
+/// being rejected outright: the field's own [`InputState::validate`] filter
+/// already keeps the text digits-only, so the only way to reach an
+/// out-of-range number here is typing more digits than any real DPI needs —
+/// and with enough of them the string overflows `u32` before it ever reaches
+/// the `u16` conversion, which is why the overflow case is matched directly
+/// rather than folded into a single `.ok()`.
 fn parse_dpi_input(text: &str) -> Option<Dpi> {
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    text.parse::<u32>()
-        .ok()
-        .map(|value| Dpi::new(u16::try_from(value).unwrap_or(u16::MAX)))
+    match text.parse::<u32>() {
+        Ok(value) => Some(Dpi::new(u16::try_from(value).unwrap_or(u16::MAX))),
+        Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => {
+            Some(Dpi::new(u16::MAX))
+        }
+        Err(_) => None,
+    }
 }
 
 const CHIP_H: f32 = 28.;
@@ -616,5 +622,16 @@ mod tests {
     #[test]
     fn saturates_a_value_above_the_wire_format() {
         assert_eq!(parse_dpi_input("999999"), Some(Dpi::new(u16::MAX)));
+    }
+
+    /// A digit string long enough to overflow the `u32` the text is first
+    /// parsed into (not just the final `u16`) must still saturate rather than
+    /// silently fail to commit.
+    #[test]
+    fn saturates_a_value_that_overflows_the_intermediate_parse() {
+        assert_eq!(
+            parse_dpi_input("99999999999999999999"),
+            Some(Dpi::new(u16::MAX))
+        );
     }
 }
