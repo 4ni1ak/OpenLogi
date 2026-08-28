@@ -73,9 +73,10 @@ fn unit_path() -> io::Result<PathBuf> {
 /// against the system `bluetooth.service` via `After=`, so without this a
 /// kernel-side adapter bring-up racing this agent's own probing at login can
 /// leave the adapter's HCI commands timing out for the rest of the session
-/// (#1065). Bounded at 10s, and a no-op within milliseconds on a machine with
-/// no Bluetooth adapter at all — mirrors the packaged unit at
-/// `packaging/linux/systemd/openlogi-agent.service`.
+/// (#1065). A machine with no Bluetooth subsystem at all (no
+/// `/sys/class/bluetooth`) returns immediately; otherwise bounded at 10s,
+/// matching any `hciN` node rather than assuming `hci0` — mirrors the
+/// packaged unit at `packaging/linux/systemd/openlogi-agent.service`.
 fn render_unit(exe: &str) -> String {
     let exec_start = escape_systemd_exec(exe);
     format!(
@@ -85,7 +86,7 @@ fn render_unit(exe: &str) -> String {
         \n\
         [Service]\n\
         Type=simple\n\
-        ExecStartPre=/usr/bin/bash -c 'for i in $(seq 1 20); do [ -e /sys/class/bluetooth/hci0 ] && sleep 3 && exit 0; sleep 0.5; done'\n\
+        ExecStartPre=/usr/bin/bash -c '[ -d /sys/class/bluetooth ] || exit 0; for i in $(seq 1 20); do ls /sys/class/bluetooth/hci* >/dev/null 2>&1 && {{ sleep 3; exit 0; }}; sleep 0.5; done'\n\
         ExecStart={exec_start}\n\
         Restart=on-failure\n\
         RestartSec=5\n\
@@ -162,7 +163,12 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("ExecStartPre="))
             .expect("ExecStartPre line");
-        assert!(exec_start_pre.contains("/sys/class/bluetooth/hci0"));
+        // Matches any hciN node, not just hci0, and exits immediately when
+        // the Bluetooth subsystem isn't present at all rather than always
+        // running the bounded wait loop.
+        assert!(exec_start_pre.contains("[ -d /sys/class/bluetooth ] || exit 0"));
+        assert!(exec_start_pre.contains("/sys/class/bluetooth/hci*"));
+        assert!(!exec_start_pre.contains("hci0"));
         // Must precede ExecStart, not follow it — systemd runs ExecStartPre
         // entries in the order they appear.
         assert!(body.find("ExecStartPre=").unwrap() < body.find("ExecStart=/usr").unwrap());

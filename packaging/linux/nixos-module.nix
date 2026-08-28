@@ -36,7 +36,7 @@ in
         # order against system bluetooth.service via after=, so this waits for
         # the adapter node to appear (and settle) before HID++ probing starts,
         # avoiding a boot-time race with kernel-side Bluetooth bring-up (#1065).
-        ExecStartPre = "${pkgs.bash}/bin/bash -c 'for i in $(seq 1 20); do [ -e /sys/class/bluetooth/hci0 ] && sleep 3 && exit 0; sleep 0.5; done'";
+        ExecStartPre = "${pkgs.bash}/bin/bash -c '[ -d /sys/class/bluetooth ] || exit 0; for i in $(seq 1 20); do ls /sys/class/bluetooth/hci* >/dev/null 2>&1 && { sleep 3; exit 0; }; sleep 0.5; done'";
         ExecStart = lib.getExe' cfg.package "openlogi-agent";
         Restart = "on-failure";
         RestartSec = 5;
