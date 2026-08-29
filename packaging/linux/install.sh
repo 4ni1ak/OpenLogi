@@ -151,9 +151,31 @@ fi
 # extension the user opted into, and Wayland needs a new session to pick it up.
 EXT_SRC="${REPO_ROOT}/crates/openlogi-hook/gnome-shell-extension/openlogi-frontmost@openlogi.dev"
 if [ -d "$EXT_SRC" ]; then
+  # A native package (.deb/.rpm/.pkg.tar.zst) ships these same two filenames at
+  # this same shared path. Overwriting a package-owned copy here would leave
+  # its package manager's checksum/record pointing at bytes it didn't put
+  # there — mirrors the ownership check uninstall.sh does on removal.
+  ext_file_is_package_owned() {
+    path="$1"
+    if command -v dpkg >/dev/null 2>&1 && dpkg -S "$path" >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v rpm >/dev/null 2>&1 && rpm -qf "$path" >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v pacman >/dev/null 2>&1 && pacman -Qo "$path" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  }
   echo "Installing GNOME Shell extension …"
   for file in metadata.json extension.js; do
-    sudo install -Dm644 "$EXT_SRC/$file" "/usr/share/gnome-shell/extensions/openlogi-frontmost@openlogi.dev/$file"
+    target="/usr/share/gnome-shell/extensions/openlogi-frontmost@openlogi.dev/$file"
+    if [ -e "$target" ] && ext_file_is_package_owned "$target"; then
+      echo "  $file is owned by a distro package — leaving it as installed"
+      continue
+    fi
+    sudo install -Dm644 "$EXT_SRC/$file" "$target"
   done
   echo "  enable it with: gnome-extensions enable openlogi-frontmost@openlogi.dev"
   echo "  (log out and back in first — Wayland cannot reload the shell)"
