@@ -15,7 +15,9 @@ use openlogi_ipc::ActionRingInvocation;
 use openlogi_ui::action_icons::RING_CANCEL_ICON;
 use openlogi_ui::color;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::sync::oneshot;
 
 use crate::agent::OverlayCommand;
 use crate::platform;
@@ -518,7 +520,14 @@ async fn linux_wayland_ring_host(
     Some((handle.into(), cursor))
 }
 
+// `async` only to match the Linux implementation's signature, which the
+// caller `.await`s unconditionally — this stub has nothing to await.
 #[cfg(not(target_os = "linux"))]
+#[expect(clippy::allow_attributes, reason = "see below")]
+#[allow(
+    clippy::unused_async,
+    reason = "kept async to match the Linux implementation's signature"
+)]
 async fn linux_wayland_ring_host(
     _cx: &mut gpui::AsyncApp,
     _session_id: u64,
