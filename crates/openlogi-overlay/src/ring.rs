@@ -15,7 +15,9 @@ use openlogi_ipc::ActionRingInvocation;
 use openlogi_ui::action_icons::RING_CANCEL_ICON;
 use openlogi_ui::color;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::sync::oneshot;
 
 use crate::agent::OverlayCommand;
 use crate::platform;
@@ -388,11 +390,25 @@ pub(crate) async fn open_ring(
         },
     );
     let host = host.map(|(host, _)| host);
-    let handle = cx.update(|cx| {
+    let opened = cx.update(|cx| {
         cx.open_window(options, move |_, cx| {
             cx.new(|_| RingView::new(invocation, commands, &live_session, host))
         })
-    })?;
+    });
+    let handle = match opened {
+        Ok(handle) => handle,
+        Err(error) => {
+            // No RingView exists for this host yet, so nothing else will ever
+            // close it — leaving it open would block clicks across the whole
+            // screen until the next ring invocation or process exit.
+            if let Some(host) = host {
+                cx.update(|cx| {
+                    let _ = host.update(cx, |_, window, _| window.remove_window());
+                });
+            }
+            return Err(error);
+        }
+    };
     Ok((handle, host))
 }
 
@@ -501,14 +517,27 @@ async fn linux_wayland_ring_host(
             None
         }
     };
-    let cursor = match cursor {
-        Some(cursor) => cursor,
-        None => cx.update(ring_placement).1,
+    let cursor = if let Some(cursor) = cursor {
+        cursor
+    } else {
+        // `ring_placement`'s origin is in global desktop coordinates (what
+        // the `WindowKind::PopUp` fallback wants), but this anchor must be
+        // local to the host's own surface — the same conversion the host
+        // itself exists to avoid needing on the happy path.
+        let (_, origin, display_bounds) = cx.update(ring_placement);
+        display_bounds.map_or(origin, |bounds| origin - bounds.origin)
     };
     Some((handle.into(), cursor))
 }
 
+// `async` only to match the Linux implementation's signature, which the
+// caller `.await`s unconditionally — this stub has nothing to await.
 #[cfg(not(target_os = "linux"))]
+#[expect(clippy::allow_attributes, reason = "see below")]
+#[allow(
+    clippy::unused_async,
+    reason = "kept async to match the Linux implementation's signature"
+)]
 async fn linux_wayland_ring_host(
     _cx: &mut gpui::AsyncApp,
     _session_id: u64,
