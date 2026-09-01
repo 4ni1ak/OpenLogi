@@ -297,8 +297,8 @@ impl DeviceConfig {
     ///
     /// `invert_scroll` is a bare `bool` (unlike [`Self::dpi`] /
     /// [`Self::smartshift`]'s `Option`), so a device-level `false` is
-    /// indistinguishable from never-set — see the same ambiguity noted at
-    /// [`super::identity`]'s legacy-config fold. A link override is still
+    /// indistinguishable from never-set — see the same ambiguity noted in the
+    /// `identity` module's legacy-config fold. A link override is still
     /// real signal either way, because it is an `Option<bool>`. Reapplying an
     /// unconfigured `false` would force every capable device's native invert
     /// bit off on every reconnect, silently undoing an inversion set through
