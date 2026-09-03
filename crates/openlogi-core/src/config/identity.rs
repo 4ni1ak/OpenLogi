@@ -112,7 +112,7 @@ impl Config {
     /// indirection existed. An online [`DeviceStableId::Direct`] device that
     /// still has no physical key at that point (no serial, an all-zero unit
     /// id — a Bluetooth-direct M535, for example) falls back once more to
-    /// [`DeviceStableId::route_only_key`] rather than answering `None`, so
+    /// `DeviceStableId::route_only_key` rather than answering `None`, so
     /// its settings have somewhere to be written at all.
     #[must_use]
     pub fn resolve_device_key(
