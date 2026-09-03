@@ -259,7 +259,7 @@ impl DeviceIdentity {
 
 impl PhysicalDeviceKey {
     /// Parse a key emitted by [`DeviceStableId::physical_key`] or
-    /// [`DeviceStableId::route_only_key`].
+    /// `DeviceStableId::route_only_key`.
     ///
     /// Legacy model-scoped configuration keys (a bare `direct:vvvv:pppp`,
     /// with no third segment) intentionally return `None`; callers can use
