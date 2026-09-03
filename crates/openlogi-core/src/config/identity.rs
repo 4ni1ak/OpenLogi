@@ -41,6 +41,12 @@ pub fn canonical_device_key(
         .and_then(DeviceIdentity::config_key)
         .and_then(|key| PhysicalDeviceKey::parse(&key))
         .or_else(|| stable.physical_key())
+        .or_else(|| {
+            identity
+                .is_some()
+                .then(|| stable.route_only_key())
+                .flatten()
+        })
 }
 
 impl Config {
@@ -103,7 +109,11 @@ impl Config {
     /// Failing both, and for a device whose identity is unreadable (asleep),
     /// the route is resolved through the persisted `links` index, then finally
     /// through the route-derived key that every entry used before this
-    /// indirection existed.
+    /// indirection existed. An online [`DeviceStableId::Direct`] device that
+    /// still has no physical key at that point (no serial, an all-zero unit
+    /// id — a Bluetooth-direct M535, for example) falls back once more to
+    /// [`DeviceStableId::route_only_key`] rather than answering `None`, so
+    /// its settings have somewhere to be written at all.
     #[must_use]
     pub fn resolve_device_key(
         &self,
@@ -140,7 +150,12 @@ impl Config {
         {
             return Some(key);
         }
-        stable.physical_key()
+        stable.physical_key().or_else(|| {
+            identity
+                .is_some()
+                .then(|| stable.route_only_key())
+                .flatten()
+        })
     }
 
     /// Record that the device keyed `canonical` was reached by `route_key`,
@@ -658,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_device_with_no_identity_stays_non_persistent() {
+    fn an_asleep_direct_device_with_no_identity_stays_non_persistent() {
         let config = Config::default();
         let anonymous = DeviceStableId::Direct {
             vendor_id: 0x046d,
@@ -666,6 +681,24 @@ mod tests {
             identity: DeviceIdentity::Unit([0; 4]),
         };
         assert_eq!(config.resolve_device_key(&anonymous, None), None);
+    }
+
+    #[test]
+    fn an_online_direct_device_with_no_identity_falls_back_to_its_route() {
+        // #1213: a Bluetooth-direct M535 reports neither a serial nor a
+        // non-zero unit id even while online, so it never had a physical key
+        // and every binding change was silently kept in memory only.
+        let config = Config::default();
+        let zero = DeviceIdentity::Unit([0; 4]);
+        let anonymous = DeviceStableId::Direct {
+            vendor_id: 0x046d,
+            product_id: 0xc08d,
+            identity: zero.clone(),
+        };
+        let key = config
+            .resolve_device_key(&anonymous, Some(&zero))
+            .expect("an online device falls back to a route-only key");
+        assert_eq!(key.as_str(), "direct:046d:c08d:route");
     }
 
     #[test]
