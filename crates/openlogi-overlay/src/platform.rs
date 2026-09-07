@@ -163,6 +163,10 @@ pub fn display_containing(x: f64, y: f64) -> Option<CursorDisplay> {
     unsafe_code,
     reason = "MonitorFromPoint/GetMonitorInfoW/GetDpiForMonitor are plain Win32 FFI; GPUI exposes no DPI query before a window exists"
 )]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "native cursor coordinates are screen-sized and exactly usable as an i32 POINT"
+)]
 pub fn display_containing(x: f64, y: f64) -> Option<CursorDisplay> {
     use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::Graphics::Gdi::{
