@@ -125,12 +125,23 @@ pub(crate) fn cameras() -> Vec<Camera> {
 /// Collapse `(usb_device, Camera)` pairs to one `Camera` per distinct
 /// `usb_device`, keeping the highest-resolution entry in each group and
 /// otherwise preserving first-seen order.
+///
+/// A node's resolution is `None` when its primary format only ever reported
+/// stepwise/continuous frame sizes, or enumeration failed outright — that is
+/// *unknown*, not "0x0". Ranking it below any node with a discrete size would
+/// let a tiny-but-known secondary/IR node (see [`cameras`]) outrank an
+/// unmeasured primary sensor and steal its `unique_id`. So resolution only
+/// ever decides the winner when both sides are known; otherwise the
+/// first-seen node keeps its place, same as an exact tie.
 fn merge_by_usb_device(nodes: impl IntoIterator<Item = (PathBuf, Camera)>) -> Vec<Camera> {
     let mut by_device: Vec<(PathBuf, Camera)> = Vec::new();
     for (usb_device, camera) in nodes {
         match by_device.iter_mut().find(|(dev, _)| *dev == usb_device) {
             Some((_, best)) => {
-                if resolution_area(camera.max_resolution) > resolution_area(best.max_resolution) {
+                if let (Some(candidate), Some(current)) =
+                    (camera.max_resolution, best.max_resolution)
+                    && resolution_area(candidate) > resolution_area(current)
+                {
                     *best = camera;
                 }
             }
@@ -141,9 +152,10 @@ fn merge_by_usb_device(nodes: impl IntoIterator<Item = (PathBuf, Camera)>) -> Ve
 }
 
 /// Pixel count of a resolution, for comparing which capture node is the
-/// primary sensor. `None` sorts as smallest.
-fn resolution_area(resolution: Option<(u32, u32)>) -> u64 {
-    resolution.map_or(0, |(w, h)| u64::from(w) * u64::from(h))
+/// primary sensor.
+fn resolution_area(resolution: (u32, u32)) -> u64 {
+    let (w, h) = resolution;
+    u64::from(w) * u64::from(h)
 }
 
 /// The `by-id` symlink for `path` when udev created one (it embeds the USB
@@ -302,9 +314,27 @@ mod tests {
     }
 
     #[test]
-    fn resolution_area_treats_unknown_resolution_as_smallest() {
-        assert_eq!(resolution_area(None), 0);
-        assert_eq!(resolution_area(Some((340, 340))), 340 * 340);
-        assert!(resolution_area(Some((4096, 2160))) > resolution_area(Some((340, 340))));
+    fn resolution_area_compares_pixel_counts() {
+        assert_eq!(resolution_area((340, 340)), 340 * 340);
+        assert!(resolution_area((4096, 2160)) > resolution_area((340, 340)));
+    }
+
+    #[test]
+    fn unknown_resolution_does_not_lose_to_a_known_smaller_node() {
+        // Reproduces the failure mode from the #1234 review: if the primary
+        // node only reports stepwise/continuous frame sizes (or enumeration
+        // fails), `max_resolution` is `None`, not "0x0". It must not be
+        // outranked by a sibling IR/secondary node just because that node
+        // happens to report a small discrete size.
+        let usb_device = PathBuf::from("/sys/devices/usb1/1-1");
+        let primary_unknown = camera("Logitech BRIO", None);
+        let ir = camera("Logitech BRIO", Some((340, 340)));
+
+        let cameras = merge_by_usb_device([
+            (usb_device.clone(), primary_unknown.clone()),
+            (usb_device, ir),
+        ]);
+
+        assert_eq!(cameras, vec![primary_unknown]);
     }
 }
