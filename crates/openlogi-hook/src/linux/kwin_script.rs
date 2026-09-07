@@ -51,7 +51,7 @@ use tracing::debug;
 use zbus::blocking::connection::Builder;
 use zbus::{interface, proxy};
 
-use super::FrontmostSource;
+use super::{FrontmostSource, PublishAppId, StopToken};
 
 /// Bus name and object path the companion script pushes to. Distinct from the
 /// GNOME extension's `org.openlogi.Frontmost`, which is a *served* interface
@@ -104,8 +104,35 @@ impl Focus {
     }
 }
 
-/// The latest [`Focus`], shared between the D-Bus receiver and the backend.
-type Cached = Arc<Mutex<Focus>>;
+/// State shared between the D-Bus receiver (which runs on zbus's own executor
+/// thread) and the backend: the latest [`Focus`], plus the observer worker's
+/// publish callback while one is subscribed.
+///
+/// The script pushes on its own schedule, not on a poll the observer worker
+/// drives, so a push has to reach `publish` directly from the receiver rather
+/// than through a loop in [`KWinScriptSource::observe`].
+struct Shared {
+    cached: Mutex<Focus>,
+    publish: Mutex<Option<PublishAppId>>,
+}
+
+impl Shared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cached: Mutex::new(Focus::default()),
+            publish: Mutex::new(None),
+        })
+    }
+
+    fn app_id(&self) -> Option<String> {
+        self.cached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .app_id()
+    }
+}
+
+type Cached = Arc<Shared>;
 
 /// How long [`candidate`] waits for the script's load-time push before giving
 /// up on it. The push is sent as the script loads, so this is normally over in
@@ -154,7 +181,8 @@ struct Receiver {
 
 #[interface(name = "org.openlogi.KWinFrontmost")]
 impl Receiver {
-    /// Record the newly activated window's `resourceClass`.
+    /// Record the newly activated window's `resourceClass`, and forward it to
+    /// the observer worker's subscribers when one is watching.
     ///
     /// An empty string means KWin activated no window (desktop focus, or the
     /// last window closing), which is reported as "no frontmost app" rather
@@ -165,7 +193,20 @@ impl Receiver {
         } else {
             Focus::Window(class.to_owned())
         };
-        *self.cached.lock().unwrap_or_else(PoisonError::into_inner) = value;
+        *self
+            .cached
+            .cached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = value;
+        if let Some(publish) = self
+            .cached
+            .publish
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            publish(self.cached.app_id());
+        }
     }
 }
 
@@ -178,11 +219,35 @@ pub(super) struct KWinScriptSource {
 }
 
 impl FrontmostSource for KWinScriptSource {
-    fn frontmost_app_id(&self) -> Option<String> {
-        self.cached
+    fn frontmost_app_id(&mut self) -> Option<String> {
+        self.cached.app_id()
+    }
+
+    /// The script pushes on its own schedule via [`Receiver`], which runs on
+    /// zbus's executor thread rather than this one, so there is nothing to
+    /// poll here: register the publish callback, then read the snapshot.
+    /// Registering first (rather than after) is what keeps a push racing with
+    /// startup from being missed: at worst it is published twice, once from
+    /// here and once from the receiver, which the hub's version check
+    /// collapses into the latest value.
+    fn observe(
+        self: Box<Self>,
+        stop: StopToken,
+        publish: PublishAppId,
+    ) -> Box<dyn FrontmostSource> {
+        *self
+            .cached
+            .publish
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .app_id()
+            .unwrap_or_else(PoisonError::into_inner) = Some(publish.clone());
+        publish(self.cached.app_id());
+        stop.wait();
+        *self
+            .cached
+            .publish
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self
     }
 
     fn name(&self) -> &'static str {
@@ -269,7 +334,7 @@ fn reload_script(
 fn await_first_push(cached: &Cached) -> Result<(), ReloadError> {
     let deadline = Instant::now() + FIRST_PUSH_TIMEOUT;
     loop {
-        if *cached.lock().unwrap_or_else(PoisonError::into_inner) != Focus::Silent {
+        if *cached.cached.lock().unwrap_or_else(PoisonError::into_inner) != Focus::Silent {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -288,7 +353,7 @@ pub(super) fn candidate() -> Option<Box<dyn FrontmostSource>> {
         None
     })?;
 
-    let cached: Cached = Arc::new(Mutex::new(Focus::default()));
+    let cached: Cached = Shared::new();
     let receiver = Receiver {
         cached: Arc::clone(&cached),
     };
@@ -325,7 +390,7 @@ mod tests {
 
     /// Build a receiver plus the cache it writes into, without touching D-Bus.
     fn receiver() -> (Receiver, Cached) {
-        let cached: Cached = Arc::new(Mutex::new(Focus::default()));
+        let cached: Cached = Shared::new();
         (
             Receiver {
                 cached: Arc::clone(&cached),
@@ -337,10 +402,7 @@ mod tests {
     /// Read through the same mapping the backend uses, so the tests exercise
     /// `Focus::app_id` rather than the cache representation directly.
     fn frontmost(cached: &Cached) -> Option<String> {
-        cached
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .app_id()
+        cached.app_id()
     }
 
     #[test]
@@ -354,6 +416,27 @@ mod tests {
         let (receiver, cached) = receiver();
         receiver.set_focused_window_class("org.kde.konsole");
         assert_eq!(frontmost(&cached), Some("org.kde.konsole".to_owned()));
+    }
+
+    /// A push that arrives while an observer is registered must reach its
+    /// `publish` callback directly — nothing else drives delivery, since the
+    /// receiver runs on zbus's own executor thread rather than a loop this
+    /// backend polls.
+    #[test]
+    fn a_push_while_observed_reaches_the_publish_callback() {
+        let (receiver, cached) = receiver();
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let publish: PublishAppId = Arc::new(move |app| sink.lock().unwrap().push(app));
+        *cached.publish.lock().unwrap() = Some(publish);
+
+        receiver.set_focused_window_class("org.kde.konsole");
+        receiver.set_focused_window_class("");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("org.kde.konsole".to_owned()), None]
+        );
     }
 
     /// The script sends `""` when KWin activated no window — focus on the
