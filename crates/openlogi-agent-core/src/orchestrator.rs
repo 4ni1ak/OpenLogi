@@ -432,11 +432,21 @@ impl Orchestrator {
     }
 
     /// One capture plan per online device, from the current config + app.
+    ///
+    /// Standalone raw-HID devices (`DeviceRoute::RawHid` — Litra lights, and
+    /// now the raw OS-hook-only mouse family) are excluded: that route can
+    /// never carry HID++ traffic (see its doc comment), so building a plan
+    /// for one only makes the gesture watcher open a session that fails
+    /// immediately and retries forever. `is_hidpp_device` is the same signal
+    /// [`pick_current`] already uses to keep these out of the capture-target
+    /// selection.
     fn capture_plans_for(&self) -> Vec<DeviceCapturePlan> {
         let rearm_generation = self.shared.capture_rearm_generation.load(Ordering::Relaxed);
         self.devices
             .iter()
-            .filter(|dev| dev.online && self.config.device_enabled(&dev.config_key))
+            .filter(|dev| {
+                dev.online && self.config.device_enabled(&dev.config_key) && is_hidpp_device(dev)
+            })
             .filter_map(|dev| {
                 let route = dev.route.clone()?;
                 let identity = DeviceIdentity::from_parts(dev.serial.as_deref(), dev.unit_id);
