@@ -7,7 +7,7 @@ use openlogi_core::hid::LOGITECH_VENDOR_ID;
 use openlogi_device_registry::litra::find_litra;
 
 use super::InventoryError;
-use crate::backend::{HidBackend, NodeId, NodeInfo};
+use crate::backend::{HidBackend, NodeInfo};
 use crate::write::litra_capabilities;
 
 /// Enumerate recognized standalone devices without probing them as HID++.
@@ -15,16 +15,16 @@ use crate::write::litra_capabilities;
 /// The returned descriptors are intentionally separate from receiver
 /// inventories. A raw device has no HID++ pairing slot and must be routed by
 /// its full HID identity tuple.
+///
+/// One [`HidBackend::enumerate`] call: every node it returns already carries
+/// [`NodeInfo::is_hidpp_candidate`], computed by the backend at the same time
+/// as everything else here — no second live query is needed (and a second
+/// query's own transient failure must never discard what this one already
+/// found; see `raw_mice_from_nodes`'s doc for why that matters).
 pub async fn enumerate_standalone(
     backend: &dyn HidBackend,
 ) -> Result<Vec<StandaloneDevice>, InventoryError> {
     let all = backend.enumerate().await?;
-    let hidpp_ids: HashSet<NodeId> = backend
-        .enumerate_hidpp()
-        .await?
-        .into_iter()
-        .map(|node| node.id)
-        .collect();
 
     let mut devices: Vec<StandaloneDevice> = all
         .iter()
@@ -57,7 +57,7 @@ pub async fn enumerate_standalone(
             })
         })
         .collect();
-    devices.extend(raw_mice_from_nodes(&all, &hidpp_ids));
+    devices.extend(raw_mice_from_nodes(&all));
     validate_no_ambiguous_nodes(&devices)?;
     Ok(devices)
 }
@@ -96,57 +96,68 @@ const RAW_MOUSE_CAPABILITIES: Capabilities = Capabilities {
 /// [`StandaloneDevice::driver_id`], mirroring the Litra convention.
 const RAW_MOUSE_DRIVER_ID: &str = "raw-mouse";
 
-/// Synthesize one [`StandaloneDevice`] per physical Logitech mouse that
-/// exposes a boot-mouse collection but *no* HID++ collection at all.
+/// Synthesize one [`StandaloneDevice`] per boot-mouse *node* belonging to a
+/// physical Logitech device that has *no* HID++ collection at all.
 ///
-/// Grouped by `(vendor_id, product_id)` — the finest identity every HID
-/// backend on every platform reports without reading a report descriptor. A
-/// device that also produced any node in `hidpp_ids` is skipped entirely: a
-/// real HID++ mouse may additionally expose a boot-mouse collection for
-/// BIOS/pre-OS compatibility, and it must not be double-listed as a second,
+/// One entry per node, not one per `(vendor_id, product_id)` group: two
+/// identical serial-less receivers (completely normal — that's this exact
+/// device's retail packaging) share a product id, and collapsing them to a
+/// single representative would silently drop one from inventory before
+/// [`validate_no_ambiguous_nodes`] ever got a chance to flag the collision.
+/// Each node keeps its own [`raw_mouse_identity`]; two identical units
+/// produce the same `stable:` identity (since it is derived only from the
+/// fixed HID tuple, not the node), and `validate_no_ambiguous_nodes` rejects
+/// that exactly the way it already rejects two identical serial-less Litra
+/// lights — same validation path, not a special case for mice.
+///
+/// Whether the *physical device* has HID++ at all is answered per
+/// `(vendor_id, product_id)` group, from [`NodeInfo::is_hidpp_candidate`]
+/// already computed on every node in `all` — a real HID++ mouse may
+/// additionally expose a boot-mouse collection for BIOS/pre-OS
+/// compatibility, and it must not be double-listed as a second,
 /// capability-crippled "raw mouse" entry.
-fn raw_mice_from_nodes(all: &[NodeInfo], hidpp_ids: &HashSet<NodeId>) -> Vec<StandaloneDevice> {
-    let mut by_device: HashMap<(u16, u16), Vec<&NodeInfo>> = HashMap::new();
+fn raw_mice_from_nodes(all: &[NodeInfo]) -> Vec<StandaloneDevice> {
+    let mut hidpp_by_device: HashMap<(u16, u16), bool> = HashMap::new();
     for node in all
         .iter()
         .filter(|node| node.vendor_id == LOGITECH_VENDOR_ID)
     {
-        by_device
+        let has_hidpp = hidpp_by_device
             .entry((node.vendor_id, node.product_id))
-            .or_default()
-            .push(node);
+            .or_insert(false);
+        *has_hidpp |= node.is_hidpp_candidate;
     }
 
-    let mut devices: Vec<_> = by_device
-        .into_iter()
-        .filter(|(_, nodes)| !nodes.iter().any(|node| hidpp_ids.contains(&node.id)))
-        .filter_map(|((vendor_id, product_id), nodes)| {
-            let node = *nodes
-                .iter()
-                .find(|node| is_boot_mouse_collection(node.usage_page, node.usage_id))?;
-            Some(StandaloneDevice {
-                address: RawDeviceAddress {
-                    vendor_id,
-                    product_id,
-                    usage_page: node.usage_page,
-                    usage_id: node.usage_id,
-                    identity: raw_mouse_identity(node),
-                },
-                display_name: node.name.clone(),
-                manufacturer: node.manufacturer.clone(),
-                serial_number: node.serial_number.clone(),
-                unit_id: [0; 4],
-                kind: DeviceKind::Mouse,
-                online: true,
-                capabilities: Some(RAW_MOUSE_CAPABILITIES),
-                light_capabilities: None,
-                driver_id: RAW_MOUSE_DRIVER_ID.to_owned(),
-                registry_model_id: None,
-            })
+    let mut devices: Vec<_> = all
+        .iter()
+        .filter(|node| node.vendor_id == LOGITECH_VENDOR_ID)
+        .filter(|node| is_boot_mouse_collection(node.usage_page, node.usage_id))
+        .filter(|node| !hidpp_by_device[&(node.vendor_id, node.product_id)])
+        .map(|node| StandaloneDevice {
+            address: RawDeviceAddress {
+                vendor_id: node.vendor_id,
+                product_id: node.product_id,
+                usage_page: node.usage_page,
+                usage_id: node.usage_id,
+                identity: raw_mouse_identity(node),
+            },
+            display_name: node.name.clone(),
+            manufacturer: node.manufacturer.clone(),
+            serial_number: node.serial_number.clone(),
+            unit_id: [0; 4],
+            kind: DeviceKind::Mouse,
+            online: true,
+            capabilities: Some(RAW_MOUSE_CAPABILITIES),
+            light_capabilities: None,
+            driver_id: RAW_MOUSE_DRIVER_ID.to_owned(),
+            registry_model_id: None,
         })
         .collect();
-    // Deterministic order regardless of HashMap iteration.
-    devices.sort_by_key(|device| device.address.product_id);
+    // Deterministic order regardless of backend enumeration order.
+    devices.sort_by(|a, b| {
+        (a.address.product_id, &a.address.identity)
+            .cmp(&(b.address.product_id, &b.address.identity))
+    });
     devices
 }
 
@@ -211,8 +222,6 @@ fn validate_no_ambiguous_nodes(devices: &[StandaloneDevice]) -> Result<(), Inven
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use openlogi_core::device::{DeviceKind, RawDeviceAddress, StandaloneDevice};
 
     use crate::backend::{NodeId, NodeInfo};
@@ -232,6 +241,7 @@ mod tests {
             name: "Logitech Wireless Receiver Mouse".into(),
             manufacturer: Some("Logitech".into()),
             serial_number: None,
+            is_hidpp_candidate: false,
         }
     }
 
@@ -247,13 +257,14 @@ mod tests {
             name: "HID-compliant mouse".into(),
             manufacturer: Some("Logitech".into()),
             serial_number: None,
+            is_hidpp_candidate: true,
         }
     }
 
     #[test]
     fn boot_mouse_only_device_becomes_a_raw_mouse() {
         let nodes = vec![boot_mouse_node("id:1", 0xc542)];
-        let devices = raw_mice_from_nodes(&nodes, &HashSet::new());
+        let devices = raw_mice_from_nodes(&nodes);
         assert_eq!(devices.len(), 1);
         let device = &devices[0];
         assert_eq!(device.kind, DeviceKind::Mouse);
@@ -278,8 +289,7 @@ mod tests {
         // BIOS/pre-OS compatibility — the whole physical device already has a
         // HID++ node, so it must not additionally synthesize a raw entry.
         let nodes = vec![boot_mouse_node("id:1", 0xb023), hidpp_node("id:2", 0xb023)];
-        let hidpp_ids: HashSet<NodeId> = nodes[1..].iter().map(|n| n.id.clone()).collect();
-        let devices = raw_mice_from_nodes(&nodes, &hidpp_ids);
+        let devices = raw_mice_from_nodes(&nodes);
         assert!(
             devices.is_empty(),
             "an already-HID++ device must not also appear as a raw mouse"
@@ -292,7 +302,7 @@ mod tests {
             boot_mouse_node("id:1", 0xc542),
             boot_mouse_node("id:2", 0xc52f),
         ];
-        let devices = raw_mice_from_nodes(&nodes, &HashSet::new());
+        let devices = raw_mice_from_nodes(&nodes);
         let mut pids: Vec<u16> = devices.iter().map(|d| d.address.product_id).collect();
         pids.sort_unstable();
         assert_eq!(pids, vec![0xc52f, 0xc542]);
@@ -302,8 +312,36 @@ mod tests {
     fn non_logitech_boot_mouse_is_ignored() {
         let mut node = boot_mouse_node("id:1", 0xc542);
         node.vendor_id = 0x1234;
-        let devices = raw_mice_from_nodes(&[node], &HashSet::new());
+        let devices = raw_mice_from_nodes(&[node]);
         assert!(devices.is_empty());
+    }
+
+    /// Two identical serial-less nano receivers is this exact device's
+    /// normal retail packaging (a pair pack), not an edge case. Each keeps
+    /// its own node in `raw_mice_from_nodes`'s output (rather than one
+    /// group-representative silently dropping the other), so the identical
+    /// `stable:` identity they both compute reaches
+    /// `validate_no_ambiguous_nodes` and is rejected there — the exact same
+    /// path that already rejects two identical serial-less Litra lights.
+    #[test]
+    fn two_identical_serial_less_raw_mice_are_flagged_ambiguous_not_collapsed() {
+        let nodes = vec![
+            boot_mouse_node("id:1", 0xc542),
+            boot_mouse_node("id:2", 0xc542),
+        ];
+        let devices = raw_mice_from_nodes(&nodes);
+        assert_eq!(
+            devices.len(),
+            2,
+            "both physical nodes must survive into the pre-validation list"
+        );
+        assert!(
+            matches!(
+                validate_no_ambiguous_nodes(&devices),
+                Err(InventoryError::AmbiguousRawDevice)
+            ),
+            "two identical serial-less raw mice must be rejected, not silently merged into one"
+        );
     }
 
     #[test]
@@ -350,5 +388,61 @@ mod tests {
             validation.is_ok(),
             "serial-backed nodes stay distinguishable: {validation:?}"
         );
+    }
+
+    /// A backend whose `enumerate_hidpp` is broken (device I/O suspended, a
+    /// transient transport error, whatever) must not cost `enumerate_standalone`
+    /// anything: the raw-mouse/HID++ dedup answer comes from
+    /// `NodeInfo::is_hidpp_candidate`, already carried on every node
+    /// `enumerate` returned, so a second, separately-fallible backend query
+    /// is never made in the first place.
+    struct BrokenHidppQueryBackend {
+        nodes: Vec<NodeInfo>,
+    }
+
+    #[hidpp::async_trait]
+    impl crate::backend::HidBackend for BrokenHidppQueryBackend {
+        async fn enumerate(&self) -> Result<Vec<NodeInfo>, crate::backend::BackendError> {
+            Ok(self.nodes.clone())
+        }
+
+        async fn enumerate_hidpp(&self) -> Result<Vec<NodeInfo>, crate::backend::BackendError> {
+            Err(crate::backend::BackendError::Backend(
+                "transient transport error".into(),
+            ))
+        }
+
+        async fn open_hidpp(
+            &self,
+            _node: &NodeInfo,
+        ) -> Result<
+            Option<std::sync::Arc<hidpp::channel::HidppChannel>>,
+            crate::backend::BackendError,
+        > {
+            Err(crate::backend::BackendError::Disconnected)
+        }
+
+        async fn open_raw_writer(
+            &self,
+            _node: &NodeInfo,
+        ) -> Result<Box<dyn crate::backend::RawWriter>, crate::backend::BackendError> {
+            Err(crate::backend::BackendError::Disconnected)
+        }
+
+        fn watch(&self) -> Result<crate::backend::HotplugStream, crate::backend::BackendError> {
+            Ok(Box::new(futures_lite::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_second_hidpp_query_does_not_discard_standalone_results() {
+        let backend = BrokenHidppQueryBackend {
+            nodes: vec![boot_mouse_node("id:1", 0xc542)],
+        };
+        let devices = super::enumerate_standalone(&backend)
+            .await
+            .expect("enumerate_standalone must not fail on a call it never makes");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].driver_id, "raw-mouse");
     }
 }
