@@ -238,5 +238,6 @@ pub(crate) fn scripted_node_info(id: &str) -> NodeInfo {
         name: format!("scripted node {id}"),
         manufacturer: Some("Logitech".into()),
         serial_number: None,
+        is_hidpp_candidate: true,
     }
 }
