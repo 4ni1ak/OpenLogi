@@ -224,6 +224,7 @@ pub(crate) fn spawn_hidpp_watchers(
         &shared.host_switch_links,
         shared.channel_pool.clone(),
         shared.receiver_access.clone(),
+        shared.channel_registry.clone(),
         shared.device_io.clone(),
     );
     let keyboard = watchers::keyboard::spawn(
