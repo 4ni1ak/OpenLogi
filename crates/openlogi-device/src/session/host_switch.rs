@@ -107,8 +107,11 @@ pub enum HostSwitchError {
     },
 }
 
-/// Capture host switch keys on `keyboard` until one is pressed or `shutdown`
-/// resolves. Controls are restored before a requested host is returned.
+/// Capture host switch keys until a press, shutdown, or channel retirement.
+///
+/// Returns any requested host together with the restoration outcome. The caller
+/// must retain pending restoration and finish it before switching hosts or
+/// starting a successor session.
 pub async fn run_host_switch_session(
     keyboard: DeviceRoute,
     shutdown: oneshot::Receiver<HostSwitchStopReason>,
