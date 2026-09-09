@@ -283,6 +283,22 @@ fn standalone_selection_never_replaces_the_hidpp_capture_target() {
     assert_eq!(pick_current(&devices, None), 1);
 }
 
+/// A standalone raw-HID device (`DeviceRoute::RawHid` — a Litra light, or a
+/// raw non-HID++ mouse) must never get a capture plan: that route can never
+/// carry HID++ traffic, so arming a session for it only makes the gesture
+/// watcher retry a doomed open forever (spamming "capture session ended
+/// unexpectedly" and burning CPU in a tight retry loop).
+#[test]
+fn raw_hid_devices_never_get_a_capture_plan() {
+    let mut orch = orchestrator(Config::default());
+    orch.devices = vec![raw_light_dev("light"), dev("mouse", 1, true)];
+    orch.rebuild();
+
+    let plans = orch.shared.capture_plans.borrow();
+    assert_eq!(plans.len(), 1, "only the HID++ device gets a capture plan");
+    assert_eq!(plans[0].dispatch.config_key, "mouse");
+}
+
 #[test]
 fn runtime_selection_falls_back_from_saved_offline_device_to_online_device() {
     let devices = [dev("saved", 1, false), dev("online", 2, true)];
