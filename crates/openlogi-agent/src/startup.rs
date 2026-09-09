@@ -177,30 +177,18 @@ pub(crate) struct HidppWatcherHandles {
 }
 
 impl HidppWatcherHandles {
-    /// Stop all managers concurrently with the bounded policy for a terminal
-    /// process exit.
-    pub(crate) async fn stop_and_wait(self) {
-        let _outcomes = tokio::join!(
+    /// Stop all managers concurrently and confirm firmware teardown. The
+    /// lifecycle retains this future and owns the terminal-exit deadline.
+    pub(crate) async fn stop_and_wait(self) -> bool {
+        let (gesture, host_switch, keyboard) = tokio::join!(
             self.gesture.stop_and_wait("gesture"),
             self.host_switch.stop_and_wait("host-switch"),
             self.keyboard.stop_and_wait("keyboard"),
         );
+        [gesture, host_switch, keyboard]
+            .into_iter()
+            .all(StopOutcome::is_stopped)
     }
-
-    /// Stop all managers concurrently and retain firmware ownership past the
-    /// diagnostic deadline before starting any replacement process image.
-    pub(crate) async fn stop_and_wait_confirmed(self) -> bool {
-        let (gesture, host_switch, keyboard) = tokio::join!(
-            self.gesture.stop_and_wait_confirmed("gesture"),
-            self.host_switch.stop_and_wait_confirmed("host-switch"),
-            self.keyboard.stop_and_wait_confirmed("keyboard"),
-        );
-        all_stopped(gesture, host_switch, keyboard)
-    }
-}
-
-fn all_stopped(gesture: StopOutcome, host_switch: StopOutcome, keyboard: StopOutcome) -> bool {
-    gesture.is_stopped() && host_switch.is_stopped() && keyboard.is_stopped()
 }
 
 /// Start the HID++ background sessions that do not need Accessibility.

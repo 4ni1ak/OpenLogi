@@ -18,6 +18,8 @@
 //! sunk launch-at-login switch makes an unwanted login start possible; Windows
 //! and Linux only ever start wanted, so their gate passes unconditionally.
 
+mod transition;
+
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -37,8 +39,9 @@ use tracing::{debug, info, warn};
 #[cfg(target_os = "macos")]
 use openlogi_ipc::ClientKind;
 
+use self::transition::{Replacement, WatcherFleet};
 use crate::shutdown::{self, ShutdownRequest, ShutdownRequests, ShutdownSignals};
-use crate::startup::{self, Core, HidppWatcherHandles, InputServices};
+use crate::startup::{self, Core, InputServices};
 use crate::{autostart, overlay, server};
 
 /// How long a dormant agent waits before leaving — generous next to the
@@ -230,7 +233,7 @@ impl Wanted {
                 ring_haptics,
                 signals,
                 shutdown_requests,
-                hidpp_watchers: None,
+                hidpp_watchers: WatcherFleet::Inactive,
                 hook: None,
                 capture_mouse_events,
             },
@@ -255,7 +258,7 @@ struct Running {
     ring_haptics: server::RingHapticPlayer,
     signals: ShutdownSignals,
     shutdown_requests: ShutdownRequests,
-    hidpp_watchers: Option<HidppWatcherHandles>,
+    hidpp_watchers: WatcherFleet,
     /// The OS hook, installed once Accessibility is granted and dropped on
     /// revoke (dropping the handle stops its thread).
     hook: Option<Hook>,
@@ -275,26 +278,28 @@ impl Armed {
         }
 
         // HID++ watchers need no Accessibility — start them up front.
-        running.hidpp_watchers = Some(startup::spawn_hidpp_watchers(
-            &running.shared,
-            &running.inputs,
-        ));
+        running.restart_hidpp_watchers();
         let (mut watchers, inventory_refresh) = startup::spawn_state_watchers(&running.shared);
 
         info!("openlogi-agent started");
         loop {
             tokio::select! {
-                Some(event) = watchers.next() => {
-                    running.apply_watcher(event, &inventory_refresh).await;
-                }
-                Some(device_key) = running.inputs.triggers.recv() => {
-                    running.begin_action_ring(device_key.as_deref()).await;
-                }
+                biased;
+
                 () = running.signals.recv() => {
                     running.shut_down("shutdown signal", None).await;
                 }
                 Some(request) = running.shutdown_requests.recv() => {
                     running.handle_shutdown_request(request).await;
+                }
+                (request, stopped) = running.hidpp_watchers.replacement_ready() => {
+                    running.complete_replacement(request, stopped);
+                }
+                Some(event) = watchers.next() => {
+                    running.apply_watcher(event, &inventory_refresh).await;
+                }
+                Some(device_key) = running.inputs.triggers.recv() => {
+                    running.begin_action_ring(device_key.as_deref()).await;
                 }
                 else => break,
             }
@@ -476,54 +481,32 @@ impl Running {
             ShutdownRequest::Uninstalled => {
                 self.shut_down("the app was uninstalled", None).await;
             }
-            ShutdownRequest::Restart { path, retry } => self.restart(path, retry).await,
+            ShutdownRequest::Restart { path, retry } => {
+                self.hidpp_watchers
+                    .begin_replacement(Replacement { path, retry });
+            }
         }
     }
 
-    /// Stop the HID++ watcher fleet with the bounded policy for a terminal
-    /// process exit. `None` means arming never reached watcher startup.
-    async fn stop_hidpp_watchers(&mut self) {
-        let Some(watchers) = self.hidpp_watchers.take() else {
-            return;
-        };
-        watchers.stop_and_wait().await;
-    }
-
-    /// A new process image must not inherit unresolved firmware ownership,
-    /// even when restoring it exceeds the terminal-exit deadline.
-    async fn stop_hidpp_watchers_confirmed(&mut self) -> bool {
-        let Some(watchers) = self.hidpp_watchers.take() else {
-            return true;
-        };
-        watchers.stop_and_wait_confirmed().await
-    }
-
-    /// Resolve firmware ownership before replacement and restore the current
-    /// image's managers if ordered teardown could not be confirmed.
-    async fn prepare_process_replacement(&mut self) -> bool {
-        let stopped = self.stop_hidpp_watchers_confirmed().await;
+    /// Called only after the old fleet has acknowledged teardown. Failed
+    /// teardown resumes the current image instead of replacing it.
+    fn complete_replacement(&mut self, request: Replacement, stopped: bool) {
         if !stopped {
+            warn!("HID++ teardown was unclean — refusing replacement and retrying");
             self.restart_hidpp_watchers();
+            let _ = request.retry.send(());
+            return;
         }
-        stopped
+        self.restart(request);
     }
 
     fn restart_hidpp_watchers(&mut self) {
-        self.hidpp_watchers = Some(startup::spawn_hidpp_watchers(&self.shared, &self.inputs));
+        self.hidpp_watchers =
+            WatcherFleet::Running(startup::spawn_hidpp_watchers(&self.shared, &self.inputs));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    async fn restart(&mut self, path: std::path::PathBuf, retry: tokio::sync::oneshot::Sender<()>) {
-        info!(path = %path.display(), "executable changed — draining HID++ sessions before exec");
-        if !self.prepare_process_replacement().await {
-            warn!(
-                path = %path.display(),
-                "one or more HID++ managers did not complete graceful teardown — refusing exec and retrying"
-            );
-            let _ = retry.send(());
-            return;
-        }
-
+    fn restart(&mut self, Replacement { path, retry }: Replacement) {
         let error = crate::binary_watch::replace_process(&path);
         warn!(%error, path = %path.display(), "exec of the updated agent failed — restoring the current image and retrying");
         self.restart_hidpp_watchers();
@@ -531,16 +514,7 @@ impl Running {
     }
 
     #[cfg(target_os = "macos")]
-    async fn restart(&mut self, path: std::path::PathBuf, retry: tokio::sync::oneshot::Sender<()>) {
-        info!(path = %path.display(), "executable changed — draining HID++ sessions before macOS relaunch");
-        if !self.prepare_process_replacement().await {
-            warn!(
-                path = %path.display(),
-                "one or more HID++ managers did not complete graceful teardown — refusing relaunch and retrying"
-            );
-            let _ = retry.send(());
-            return;
-        }
+    fn restart(&mut self, Replacement { path, retry }: Replacement) {
         if let Err(error) = crate::binary_watch::schedule(&path) {
             warn!(%error, "could not schedule updated agent relaunch — keeping the current image and retrying");
             self.restart_hidpp_watchers();
@@ -551,16 +525,7 @@ impl Running {
     }
 
     #[cfg(not(unix))]
-    async fn restart(&mut self, path: std::path::PathBuf, retry: tokio::sync::oneshot::Sender<()>) {
-        info!(path = %path.display(), "executable changed — draining HID++ sessions before the updated agent starts");
-        if !self.prepare_process_replacement().await {
-            warn!(
-                path = %path.display(),
-                "one or more HID++ managers did not complete graceful teardown — refusing replacement and retrying"
-            );
-            let _ = retry.send(());
-            return;
-        }
+    fn restart(&mut self, _request: Replacement) {
         self.exit_after_replacement_teardown("binary update");
     }
 
@@ -569,11 +534,13 @@ impl Running {
         reason: &str,
         tray_guard: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> ! {
-        self.stop_hidpp_watchers().await;
+        std::mem::replace(&mut self.hidpp_watchers, WatcherFleet::Inactive)
+            .stop_for_exit()
+            .await;
         shutdown::release_hook_and_exit(self.hook.take(), &mut self.inputs, reason, tray_guard)
     }
 
-    /// End after [`Self::prepare_process_replacement`] resolved firmware
+    /// End after [`Self::complete_replacement`] resolved firmware
     /// ownership, so a successor starts from native device state.
     #[cfg(any(target_os = "macos", not(unix)))]
     fn exit_after_replacement_teardown(&mut self, reason: &str) -> ! {

@@ -6,18 +6,8 @@
 //! one explicit stop request and one acknowledgement that the manager no
 //! longer owns a task capable of writing the device.
 
-use std::time::Duration;
-
 use tokio::sync::oneshot;
 use tracing::warn;
-
-/// How long a terminal process exit waits for one watcher manager to stop.
-///
-/// HID++ restore writes normally take tens of milliseconds. A bounded exit
-/// prevents one disconnected device from keeping an uninstalled or quitting
-/// process alive indefinitely; process replacement uses the confirmed form
-/// because it must not hand unresolved firmware ownership to a new image.
-const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Whether a watcher manager acknowledged that it no longer owns live
 /// firmware-writing tasks.
@@ -25,8 +15,6 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum StopOutcome {
     /// The manager completed its requested graceful stop.
     Stopped,
-    /// A terminal exit reached its watcher-shutdown deadline.
-    TimedOut,
     /// The manager ended through another control-plane channel before it could
     /// perform the requested graceful stop.
     Unclean,
@@ -53,7 +41,7 @@ impl StopOutcome {
 
 /// Process-lifecycle handle for one HID++ watcher manager.
 pub struct WatcherHandle {
-    stop: Option<oneshot::Sender<()>>,
+    stop: oneshot::Sender<()>,
     done: oneshot::Receiver<ManagerCompletion>,
 }
 
@@ -64,51 +52,17 @@ impl WatcherHandle {
         stop: oneshot::Sender<()>,
         done: oneshot::Receiver<ManagerCompletion>,
     ) -> Self {
-        Self {
-            stop: Some(stop),
-            done,
-        }
+        Self { stop, done }
     }
 
-    /// Request an ordered stop and wait up to the terminal-exit deadline.
-    pub async fn stop_and_wait(mut self, watcher: &'static str) -> StopOutcome {
-        self.request_stop();
-        if let Ok(result) = tokio::time::timeout(STOP_TIMEOUT, &mut self.done).await {
-            completion(result, watcher)
-        } else {
-            warn!(
-                watcher,
-                timeout = ?STOP_TIMEOUT,
-                "watcher did not stop before process-exit deadline"
-            );
-            StopOutcome::TimedOut
-        }
-    }
-
-    /// Request an ordered stop and continue waiting after the diagnostic
-    /// deadline until the manager is known to have ended.
+    /// Request an ordered stop and wait for confirmed teardown.
     ///
-    /// Process replacement uses this form on every platform: firmware state
-    /// outlives a process image, so replacement must not discard unresolved
-    /// restore ownership merely because the terminal-exit deadline elapsed.
-    pub async fn stop_and_wait_confirmed(mut self, watcher: &'static str) -> StopOutcome {
-        self.request_stop();
-        if let Ok(result) = tokio::time::timeout(STOP_TIMEOUT, &mut self.done).await {
-            completion(result, watcher)
-        } else {
-            tracing::info!(
-                watcher,
-                timeout = ?STOP_TIMEOUT,
-                "watcher shutdown is slow — continuing to wait before process replacement"
-            );
-            completion(self.done.await, watcher)
-        }
-    }
-
-    fn request_stop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
+    /// The process lifecycle owns the deadline policy. It must retain this
+    /// future across control-plane events during replacement, and may abandon
+    /// it at a deadline only when the process is about to exit.
+    pub async fn stop_and_wait(self, watcher: &'static str) -> StopOutcome {
+        let _ = self.stop.send(());
+        completion(self.done.await, watcher)
     }
 }
 
