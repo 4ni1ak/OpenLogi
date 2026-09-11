@@ -235,13 +235,17 @@ impl AssetResolver {
         let index = self.index.as_ref()?;
         let (depot, entry) = resolve_in_index(index, model, codename)?;
         let extended_model_id = model.extended_model_id;
-        self.remembered(
+        let mut asset = self.remembered(
             AssetKey::Variant {
                 depot: depot.to_owned(),
                 extended_model_id,
             },
             || self.load_files(depot, entry, extended_model_id),
-        )
+        )?;
+        // Assets are shared by model variant; the firmware name belongs to
+        // this device and must never overwrite another device's cached name.
+        asset.display_name = variant_display_name(&asset.display_name, codename);
+        Some(asset)
     }
 
     /// Resolve a standalone device directly by its registry model id.
@@ -552,6 +556,47 @@ pub(crate) fn resolve_in_index<'a>(
         "asset matched via codename↔displayName fallback"
     );
     Some(hit)
+}
+
+/// Device-type words a firmware marketing name may append that carry no
+/// variant information (`"Signature M650 Mouse"`) — stripped before the
+/// prefix comparison in [`variant_display_name`] so they don't block it.
+const GENERIC_CODENAME_SUFFIXES: [&str; 3] = ["mouse", "keyboard", "trackball"];
+
+/// The catalog stores one static `displayName` per depot regardless of
+/// which `extended_model_id` colour/hand variant this physical unit is —
+/// issue #1332: a plain Signature M650 (BLE direct) shares the Signature
+/// M650 *L* depot's `modelId`, so the depot's only name, "Signature M650
+/// L", is wrong for it. The firmware's own reported name is the one
+/// per-device signal the catalog can't carry.
+///
+/// Only override the catalog name when it is *exactly* the device's own
+/// name plus extra trailing qualifier word(s) — i.e. the catalog is a
+/// strict superset of the codename. That is the shape a wrong variant
+/// suffix takes; a catalog name that isn't a superset (a genuinely
+/// different or more complete name than a terse codename) is left alone,
+/// so the catalog stays authoritative for the common case.
+fn variant_display_name(catalog_name: &str, codename: Option<&str>) -> String {
+    let Some(codename) = codename else {
+        return catalog_name.to_string();
+    };
+    let codename_words: Vec<&str> = codename
+        .split_whitespace()
+        .filter(|w| !GENERIC_CODENAME_SUFFIXES.contains(&w.to_lowercase().as_str()))
+        .collect();
+    let catalog_words: Vec<&str> = catalog_name.split_whitespace().collect();
+    if codename_words.is_empty() || catalog_words.len() <= codename_words.len() {
+        return catalog_name.to_string();
+    }
+    let is_prefix = codename_words
+        .iter()
+        .zip(catalog_words.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b));
+    if is_prefix {
+        catalog_words[..codename_words.len()].join(" ")
+    } else {
+        catalog_name.to_string()
+    }
 }
 
 fn strict_candidates(model: &DeviceModelInfo) -> Vec<String> {
