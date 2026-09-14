@@ -1193,29 +1193,45 @@ fn plan_reapply(
 /// its configuration remains stable.
 ///
 /// The saved selection is honored regardless of device kind — including a
-/// standalone raw-HID device (a Litra light, or a raw non-HID++ mouse) the
-/// user explicitly selected in the GUI, since [`Orchestrator::current_key`]
-/// is also where that device's own OS-hook bindings get published. Only the
-/// *auto-pick* fallback (no saved selection, or it's offline) stays
-/// HID++-only: a raw-HID device must never silently steal the default
+/// standalone raw-HID device (a raw non-HID++ mouse) the user explicitly
+/// selected in the GUI, since [`Orchestrator::current_key`] is also where
+/// that device's own OS-hook bindings get published — but only when the
+/// saved device actually [`may_own_hook_bindings`]. A Litra light (or any
+/// other standalone device with no button capability) must never win this
+/// selection: it has no configured bindings of its own, so making it "the"
+/// device would silently replace whatever real mouse's bindings were active
+/// in the OS hook's single global map with the light's empty defaults. Only
+/// the *auto-pick* fallback (no eligible saved selection, or it's offline)
+/// stays HID++-only: a raw-HID device must never silently steal the default
 /// capture target away from a real mouse/keyboard just by being first in the
 /// device list.
 fn pick_current(devices: &[AgentDevice], saved: Option<&str>) -> usize {
     let saved = saved.and_then(|key| devices.iter().position(|device| device.config_key == key));
     saved
-        .filter(|&idx| devices[idx].online)
+        .filter(|&idx| devices[idx].online && may_own_hook_bindings(&devices[idx]))
         .or_else(|| {
             devices
                 .iter()
                 .position(|device| device.online && is_hidpp_device(device))
         })
-        .or(saved)
+        .or_else(|| saved.filter(|&idx| may_own_hook_bindings(&devices[idx])))
         .or_else(|| devices.iter().position(is_hidpp_device))
         .unwrap_or(0)
 }
 
 fn is_hidpp_device(device: &AgentDevice) -> bool {
     !matches!(device.route, Some(DeviceRoute::RawHid { .. }))
+}
+
+/// Whether `device` has any input capability worth remapping — real
+/// mice/keyboards (HID++) always do, and a raw-HID device qualifies only when
+/// it actually reports button capability (the raw mice from this same
+/// feature; a Litra light's `capabilities` is `None`). This is the gate for
+/// "may this device become the OS-hook's single, global selected device" —
+/// deliberately *not* `is_hidpp_device`, which is a narrower, unrelated check
+/// for the HID++ capture-target auto-pick (see [`pick_current`]).
+fn may_own_hook_bindings(device: &AgentDevice) -> bool {
+    is_hidpp_device(device) || device.capabilities.is_some_and(|caps| caps.buttons)
 }
 
 /// Replace the value behind an `RwLock`, logging (not panicking) on poison so a

@@ -70,6 +70,36 @@ fn raw_light_dev(key: &str) -> AgentDevice {
     }
 }
 
+fn raw_mouse_dev(key: &str) -> AgentDevice {
+    AgentDevice {
+        config_key: key.to_string(),
+        model_key: "Logitech Wireless Receiver Mouse".to_string(),
+        route: Some(DeviceRoute::RawHid {
+            vendor_id: 0x046d,
+            product_id: 0xc542,
+            usage_page: 0x0001,
+            usage_id: 0x0002,
+            identity: "serial:raw-mouse-1".to_string(),
+        }),
+        slot: DIRECT_DEVICE_INDEX,
+        serial: Some("raw-mouse-1".to_string()),
+        unit_id: [0; 4],
+        capabilities: Some(Capabilities {
+            buttons: true,
+            pointer: false,
+            lighting: false,
+            scroll_inversion: false,
+            hires_wheel: false,
+            thumbwheel: false,
+            haptic_feedback: false,
+            haptic_panel: false,
+        }),
+        kind: DeviceKind::Mouse,
+        light_capabilities: None,
+        online: true,
+    }
+}
+
 fn direct_inventory(serial_number: Option<&str>, unit_id: [u8; 4]) -> DeviceInventory {
     DeviceInventory {
         receiver: ReceiverInfo {
@@ -285,16 +315,43 @@ fn auto_pick_without_a_saved_selection_never_lands_on_a_standalone_device() {
     assert_eq!(pick_current(&devices, None), 1);
 }
 
-/// An explicit saved selection of a standalone raw-HID device (the user
-/// picked a Litra light, or a raw non-HID++ mouse, in the GUI) *is* honored —
-/// unlike the capture target, `current_key()`'s consumers (the OS hook's
-/// global binding map, the Actions Ring session) need to know a raw device is
-/// selected so its own bindings actually get published/read.
+/// An explicit saved selection of a standalone raw-HID device with real
+/// button capability (a raw non-HID++ mouse) *is* honored — unlike the
+/// capture target, `current_key()`'s consumers (the OS hook's global binding
+/// map, the Actions Ring session) need to know a raw mouse is selected so its
+/// own bindings actually get published/read.
 #[test]
-fn saved_selection_of_a_standalone_device_is_honored() {
+fn saved_selection_of_a_raw_mouse_is_honored() {
+    let devices = [raw_mouse_dev("mouse"), dev("other", 1, true)];
+
+    assert_eq!(pick_current(&devices, Some("mouse")), 0);
+}
+
+/// A saved selection of a standalone device with NO button capability (a
+/// Litra light: `capabilities: None`, no `Capabilities::buttons`) must never
+/// win — regression test for the case Greptile flagged: selecting a light
+/// must not silently replace a real mouse's bindings in the OS hook's single
+/// global binding map with the light's own (empty) defaults. Falls back to
+/// the online HID++ mouse instead.
+#[test]
+fn saved_selection_of_a_light_falls_back_to_the_hidpp_device() {
     let devices = [raw_light_dev("light"), dev("mouse", 1, true)];
 
-    assert_eq!(pick_current(&devices, Some("light")), 0);
+    assert_eq!(pick_current(&devices, Some("light")), 1);
+}
+
+/// Same as above, but every device is offline: the light must still not be
+/// preserved as the stability fallback — an offline light coming back online
+/// later must not resurrect as the hook's selected device either.
+#[test]
+fn saved_selection_of_a_light_is_not_preserved_when_everything_is_offline() {
+    let light = AgentDevice {
+        online: false,
+        ..raw_light_dev("light")
+    };
+    let devices = [light, dev("mouse", 1, false)];
+
+    assert_eq!(pick_current(&devices, Some("light")), 1);
 }
 
 /// A standalone raw-HID device (`DeviceRoute::RawHid` — a Litra light, or a
