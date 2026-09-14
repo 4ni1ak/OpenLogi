@@ -116,39 +116,80 @@ pub(crate) fn describe(node: &Node) -> Camera {
 /// still resolves every node individually, so a secondary node stays
 /// controllable if some other path ever needs it.
 pub(crate) fn cameras() -> Vec<Camera> {
-    let described = nodes()
-        .into_iter()
-        .map(|node| (node.usb_device.clone(), describe(&node)));
+    let described = nodes().into_iter().map(|node| {
+        let is_color = Device::with_path(&node.path).is_ok_and(|device| has_color_format(&device));
+        (node.usb_device.clone(), describe(&node), is_color)
+    });
     merge_by_usb_device(described)
 }
 
-/// Collapse `(usb_device, Camera)` pairs to one `Camera` per distinct
-/// `usb_device`, keeping the highest-resolution entry in each group and
-/// otherwise preserving first-seen order.
+/// Collapse `(usb_device, Camera, is_color)` triples to one `Camera` per
+/// distinct `usb_device`, and otherwise preserving first-seen order.
 ///
 /// A node's resolution is `None` when its primary format only ever reported
 /// stepwise/continuous frame sizes, or enumeration failed outright — that is
 /// *unknown*, not "0x0". Ranking it below any node with a discrete size would
 /// let a tiny-but-known secondary/IR node (see [`cameras`]) outrank an
 /// unmeasured primary sensor and steal its `unique_id`. So resolution only
-/// ever decides the winner when both sides are known; otherwise the
-/// first-seen node keeps its place, same as an exact tie.
-fn merge_by_usb_device(nodes: impl IntoIterator<Item = (PathBuf, Camera)>) -> Vec<Camera> {
-    let mut by_device: Vec<(PathBuf, Camera)> = Vec::new();
-    for (usb_device, camera) in nodes {
-        match by_device.iter_mut().find(|(dev, _)| *dev == usb_device) {
-            Some((_, best)) => {
-                if let (Some(candidate), Some(current)) =
-                    (camera.max_resolution, best.max_resolution)
-                    && resolution_area(candidate) > resolution_area(current)
-                {
+/// ever decides the winner when both sides are known.
+///
+/// When resolution can't decide (either side unknown, or a tie), `is_color`
+/// breaks it instead: a node that reports at least one non-monochrome pixel
+/// format (see [`has_color_format`]) wins over a mono-only IR/depth node,
+/// regardless of which `/dev/videoN` enumerated first — node numbering order
+/// is not a reliable signal (issue: an IR node like `/dev/video10` can sort
+/// before the color node `/dev/video2`). Only when neither resolution nor
+/// color-capability can decide does the first-seen node keep its place, same
+/// as an exact tie.
+fn merge_by_usb_device(nodes: impl IntoIterator<Item = (PathBuf, Camera, bool)>) -> Vec<Camera> {
+    let mut by_device: Vec<(PathBuf, Camera, bool)> = Vec::new();
+    for (usb_device, camera, is_color) in nodes {
+        match by_device.iter_mut().find(|(dev, _, _)| *dev == usb_device) {
+            Some((_, best, best_is_color)) => {
+                let by_resolution = match (camera.max_resolution, best.max_resolution) {
+                    (Some(candidate), Some(current)) => {
+                        Some(resolution_area(candidate) > resolution_area(current))
+                    }
+                    _ => None,
+                };
+                let candidate_wins = by_resolution.unwrap_or(is_color && !*best_is_color);
+                if candidate_wins {
                     *best = camera;
+                    *best_is_color = is_color;
                 }
             }
-            None => by_device.push((usb_device, camera)),
+            None => by_device.push((usb_device, camera, is_color)),
         }
     }
-    by_device.into_iter().map(|(_, camera)| camera).collect()
+    by_device.into_iter().map(|(_, camera, _)| camera).collect()
+}
+
+/// Whether `device` reports at least one pixel format that isn't a
+/// known monochrome-only V4L2 format.
+///
+/// UVC webcams with a secondary IR/depth sensor (e.g. the Brio's Windows
+/// Hello node, issue #1191) expose it as a plain capture node just like the
+/// primary color sensor, so it can't be told apart by `/dev/videoN` order or
+/// resolution alone. IR sensors report single-channel formats (`GREY`/`Y8`,
+/// `Y10`, `Y12`, `Y16`) where the color sensor reports YUV/RGB/compressed
+/// formats, so this is checked instead of relying on enumeration order. A
+/// node whose format list can't be read is *not* claimed to be a color node.
+fn has_color_format(device: &Device) -> bool {
+    let Ok(formats) = device.enum_formats() else {
+        return false;
+    };
+    formats
+        .iter()
+        .any(|format| !is_monochrome_fourcc(format.fourcc))
+}
+
+/// Whether `fourcc` names a known monochrome-only V4L2 pixel format (as
+/// opposed to a YUV/RGB/Bayer/compressed one carrying color information).
+fn is_monochrome_fourcc(fourcc: FourCC) -> bool {
+    matches!(
+        &fourcc.repr,
+        b"GREY" | b"Y8  " | b"Y10 " | b"Y12 " | b"Y16 "
+    )
 }
 
 /// Pixel count of a resolution, for comparing which capture node is the
@@ -295,7 +336,10 @@ mod tests {
         let main = camera("Logitech BRIO", Some((4096, 2160)));
         let ir = camera("Logitech BRIO", Some((340, 340)));
 
-        let cameras = merge_by_usb_device([(usb_device.clone(), main.clone()), (usb_device, ir)]);
+        let cameras = merge_by_usb_device([
+            (usb_device.clone(), main.clone(), true),
+            (usb_device, ir, false),
+        ]);
 
         assert_eq!(cameras, vec![main]);
     }
@@ -306,8 +350,8 @@ mod tests {
         let two = camera("Logitech StreamCam", Some((1920, 1080)));
 
         let cameras = merge_by_usb_device([
-            (PathBuf::from("/sys/devices/usb1/1-1"), one.clone()),
-            (PathBuf::from("/sys/devices/usb1/1-2"), two.clone()),
+            (PathBuf::from("/sys/devices/usb1/1-1"), one.clone(), true),
+            (PathBuf::from("/sys/devices/usb1/1-2"), two.clone(), true),
         ]);
 
         assert_eq!(cameras, vec![one, two]);
@@ -331,10 +375,41 @@ mod tests {
         let ir = camera("Logitech BRIO", Some((340, 340)));
 
         let cameras = merge_by_usb_device([
-            (usb_device.clone(), primary_unknown.clone()),
-            (usb_device, ir),
+            (usb_device.clone(), primary_unknown.clone(), true),
+            (usb_device, ir, false),
         ]);
 
         assert_eq!(cameras, vec![primary_unknown]);
+    }
+
+    #[test]
+    fn color_node_wins_over_an_ir_node_that_enumerates_first() {
+        // Reproduces the second #1234 review finding: when both the color
+        // and IR node have unknown resolution, `/dev/videoN` enumeration
+        // order is not a reliable tiebreaker — an IR node such as
+        // `/dev/video10` can sort before its sibling color node
+        // `/dev/video2` (nodes() sorts lexicographically by path, and "1" <
+        // "2"). The IR node here is first-seen and would win under plain
+        // "first-seen wins", but `is_color` must override that.
+        let usb_device = PathBuf::from("/sys/devices/usb1/1-1");
+        let ir_seen_first = camera("video10-ir", None);
+        let color_seen_second = camera("video2-color", None);
+
+        let cameras = merge_by_usb_device([
+            (usb_device.clone(), ir_seen_first, false),
+            (usb_device, color_seen_second.clone(), true),
+        ]);
+
+        assert_eq!(cameras, vec![color_seen_second]);
+    }
+
+    #[test]
+    fn is_monochrome_fourcc_recognizes_known_ir_formats() {
+        for code in [b"GREY", b"Y8  ", b"Y10 ", b"Y12 ", b"Y16 "] {
+            assert!(is_monochrome_fourcc(FourCC::new(code)));
+        }
+        for code in [b"YUYV", b"MJPG", b"NV12"] {
+            assert!(!is_monochrome_fourcc(FourCC::new(code)));
+        }
     }
 }
