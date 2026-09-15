@@ -365,6 +365,42 @@ fn recording_reports_whether_the_claim_is_new() {
     );
 }
 
+/// Callers racing for a missing marker must not all be told they created it:
+/// the rollback trusts that answer, and two "yes"es let one caller's failed
+/// enable withdraw the claim the other still holds.
+#[test]
+fn exactly_one_racer_creates_the_claim() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const RACERS: usize = 8;
+    let dir = TempDir::new("racing-claim");
+    let marker = dir.path("autostart.enabled");
+    let start = Arc::new(Barrier::new(RACERS));
+
+    let racers: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            let marker = marker.clone();
+            thread::spawn(move || {
+                start.wait();
+                record_enablement_at(&marker).expect("claim")
+            })
+        })
+        .collect();
+    let created = racers
+        .into_iter()
+        .map(|racer| racer.join().expect("racer panicked"))
+        .filter(|&created| created)
+        .count();
+
+    assert_eq!(
+        created, 1,
+        "the claim must be created by exactly one caller"
+    );
+    assert!(marker.exists());
+}
+
 /// systemd resolves a unit name to the highest-precedence file that exists, so
 /// a lower entry must never be matched past a higher one naming a different
 /// executable — enabling on the strength of a shadowed entry would start a

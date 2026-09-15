@@ -275,15 +275,25 @@ fn clear_marker_at(marker: &Path) {
 
 /// Record this app's claim on the enablement, reporting whether the claim was
 /// created by this call rather than already held from an earlier reconcile.
+///
+/// Created exclusively, so the answer is decided by the filesystem and not by
+/// a check made a moment earlier: of any number of callers racing for a
+/// missing marker, exactly one is told it made the claim. The rollback in
+/// [`enable_unit_with`] trusts that answer, and a second "yes" there would let
+/// one caller's failure withdraw a claim another caller still holds.
 fn record_enablement_at(path: &Path) -> io::Result<bool> {
-    if path.exists() {
-        return Ok(false);
-    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, b"")?;
-    Ok(true)
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Withdraw the enablement only when this app recorded making it.
