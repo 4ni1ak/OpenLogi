@@ -65,10 +65,17 @@ struct MouseWorkspaceData<'a> {
     glow: Option<(Arc<GlowGeometry>, Hsla)>,
     thumbwheel: bool,
     /// Whether the synthetic no-asset fallback should offer a DPI-toggle
-    /// hotspot — gated on the measured `AdjustableDpi` capability so a mouse
-    /// that never reports it (the M500) doesn't get a hotspot for a button it
-    /// doesn't have (issue #1230). `true` when no capability was measured
-    /// yet, matching `Capabilities::presumed_from_kind`'s optimistic default.
+    /// hotspot — gated on the measured `dpi_button` capability, which reflects
+    /// an actual physical DPI/ModeShift control CID (`0x00c4`/`0x00ed`/
+    /// `0x00fd`) found in the device's control table. `AdjustableDpi`
+    /// (`Capabilities::pointer`) only means the sensor's DPI can be changed;
+    /// it says nothing about whether a physical button exists to do it, so it
+    /// must not be used as a proxy here (issue #1368) — a mouse with
+    /// software-only DPI cycling and `pointer == true` still needs
+    /// `dpi_button == true` to show the hotspot. `false` when no capability
+    /// was measured yet: unlike `pointer`/`buttons`,
+    /// `Capabilities::presumed_from_kind` has no way to guess physical button
+    /// presence, so the fallback stays conservative.
     dpi_toggle: bool,
     editing_app: Option<String>,
     overridden: Option<&'a BTreeMap<ButtonId, Action>>,
@@ -98,7 +105,7 @@ impl<'a> MouseWorkspaceData<'a> {
             dpi_toggle: state
                 .current_record()
                 .and_then(|record| record.capabilities)
-                .is_none_or(|capabilities| capabilities.pointer),
+                .is_some_and(|capabilities| capabilities.dpi_button),
             editing_app: state.editing_app().map(|app| {
                 state
                     .recent_app_name(app)
@@ -120,7 +127,7 @@ impl<'a> MouseWorkspaceData<'a> {
             gesture_maps,
             glow: None,
             thumbwheel: false,
-            dpi_toggle: true,
+            dpi_toggle: false,
             editing_app: None,
             overridden: None,
         }
@@ -1073,7 +1080,7 @@ mod tests {
                 .filter(|hotspot| hotspot.id == MouseControlId::Button(ButtonId::DpiToggle))
                 .count(),
             0,
-            "a mouse with no AdjustableDpi feature must not get a DPI hotspot"
+            "a mouse with no physical DPI button must not get a DPI hotspot"
         );
         assert_eq!(
             with.iter()

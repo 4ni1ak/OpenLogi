@@ -73,10 +73,16 @@ impl Hotspot {
 /// as remappable and we follow the same rule everywhere.
 ///
 /// `dpi_toggle` gates the one control this fallback can actually verify
-/// against a measured capability: HID++ `AdjustableDpi` (`0x2201`/`0x2202`,
-/// [`openlogi_core::device::Capabilities::pointer`]). A device that never
-/// reports it — the M500, for one — has no DPI-cycle button, so offering the
-/// hotspot overclaims a control the mouse doesn't have (issue #1230).
+/// against a measured capability: a divertable physical DPI/ModeShift control
+/// CID (`0x00c4`/`0x00ed`/`0x00fd`) found in the device's `0x1b04` control
+/// table, [`openlogi_core::device::Capabilities::dpi_button`]. This is
+/// deliberately *not* `Capabilities::pointer` (HID++ `AdjustableDpi`,
+/// `0x2201`/`0x2202`): `pointer` only means the sensor's DPI can be adjusted,
+/// which says nothing about whether a physical button exists to do it — a
+/// mouse can have software-only DPI cycling and zero DPI buttons. A device
+/// that never reports a DPI-button CID — the M500, for one — has no
+/// DPI-cycle button, so offering the hotspot overclaims a control the mouse
+/// doesn't have (issue #1230, #1368).
 ///
 /// Back/Forward and the dedicated gesture button stay unconditional: whether
 /// a *specific* unknown-model mouse physically has them isn't derivable from
@@ -174,7 +180,7 @@ mod tests {
             !default_hotspots(false, false)
                 .iter()
                 .any(|hotspot| hotspot.id == MouseControlId::Button(ButtonId::DpiToggle)),
-            "a mouse with no AdjustableDpi feature (e.g. the M500) must not get a DPI hotspot"
+            "a mouse with no physical DPI button (e.g. the M500) must not get a DPI hotspot"
         );
         assert_eq!(
             default_hotspots(false, true)
