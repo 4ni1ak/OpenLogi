@@ -327,6 +327,7 @@ mod tests {
             name: "Suspended Receiver".to_owned(),
             manufacturer: Some("Logitech".to_owned()),
             serial_number: None,
+            is_hidpp_candidate: true,
         };
 
         let Err(error) = backend.open_hidpp(&node).await else {
