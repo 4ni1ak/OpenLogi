@@ -408,6 +408,33 @@ fn variant_display_name_keeps_catalog_when_not_a_superset() {
     );
 }
 
+/// #1366: a terser codename must not truncate a real model-generation word
+/// off a more specific catalog name. "MX Master" is a prefix of "MX Master
+/// 3S" in the word-count sense the #1332 fix checks, but "3S" is not a
+/// recognized variant qualifier (unlike "L"), so it must be kept.
+#[test]
+fn variant_display_name_keeps_a_real_generation_suffix() {
+    assert_eq!(
+        variant_display_name("MX Master 3S", Some("MX Master")),
+        "MX Master 3S"
+    );
+    // "X" is just as much a real model word as "3S" and must survive too.
+    assert_eq!(
+        variant_display_name("MX Master X", Some("MX Master")),
+        "MX Master X"
+    );
+}
+
+/// The original #1332 bug must still be fixed: "L" is a recognized variant
+/// qualifier, so it is still stripped when the codename doesn't carry it.
+#[test]
+fn variant_display_name_still_drops_a_recognized_qualifier() {
+    assert_eq!(
+        variant_display_name("Signature M650 L", Some("Signature M650 Mouse")),
+        "Signature M650"
+    );
+}
+
 #[test]
 fn cleanup_removes_only_legacy_glow_pngs() {
     let root = tempfile::tempdir().expect("create temp dir");

@@ -457,6 +457,14 @@ pub(crate) fn resolve_in_index<'a>(
 /// prefix comparison in [`variant_display_name`] so they don't block it.
 const GENERIC_CODENAME_SUFFIXES: [&str; 3] = ["mouse", "keyboard", "trackball"];
 
+/// Trailing catalog words that are known hand/SKU *qualifiers* rather than
+/// part of the model's own generation name — issue #1332's "Signature M650
+/// **L**" (left-handed). [`variant_display_name`] only strips a trailing
+/// catalog word when it is in this list: an unlisted trailing word (`"3S"`,
+/// `"X"`, `"2S"`, …) is a real part of the model name — e.g. codename "MX
+/// Master" vs. catalog "MX Master 3S" — and must be kept (issue #1366).
+const VARIANT_QUALIFIER_SUFFIXES: [&str; 2] = ["l", "left"];
+
 /// The catalog stores one static `displayName` per depot regardless of
 /// which `extended_model_id` colour/hand variant this physical unit is —
 /// issue #1332: a plain Signature M650 (BLE direct) shares the Signature
@@ -464,12 +472,13 @@ const GENERIC_CODENAME_SUFFIXES: [&str; 3] = ["mouse", "keyboard", "trackball"];
 /// L", is wrong for it. The firmware's own reported name is the one
 /// per-device signal the catalog can't carry.
 ///
-/// Only override the catalog name when it is *exactly* the device's own
-/// name plus extra trailing qualifier word(s) — i.e. the catalog is a
-/// strict superset of the codename. That is the shape a wrong variant
-/// suffix takes; a catalog name that isn't a superset (a genuinely
-/// different or more complete name than a terse codename) is left alone,
-/// so the catalog stays authoritative for the common case.
+/// Only override the catalog name when it is the device's own name plus
+/// extra trailing word(s) that are all recognized variant qualifiers (see
+/// [`VARIANT_QUALIFIER_SUFFIXES`]) — i.e. the catalog is the codename plus a
+/// bare hand/SKU suffix. A trailing word that isn't a recognized qualifier
+/// (a real model-generation word like "3S" or "X") is left alone, so a
+/// terser codename ("MX Master") never truncates a more specific catalog
+/// name ("MX Master 3S").
 fn variant_display_name(catalog_name: &str, codename: Option<&str>) -> String {
     let Some(codename) = codename else {
         return catalog_name.to_string();
@@ -486,7 +495,10 @@ fn variant_display_name(catalog_name: &str, codename: Option<&str>) -> String {
         .iter()
         .zip(catalog_words.iter())
         .all(|(a, b)| a.eq_ignore_ascii_case(b));
-    if is_prefix {
+    let trailing_words_are_qualifiers = catalog_words[codename_words.len()..]
+        .iter()
+        .all(|w| VARIANT_QUALIFIER_SUFFIXES.contains(&w.to_lowercase().as_str()));
+    if is_prefix && trailing_words_are_qualifiers {
         catalog_words[..codename_words.len()].join(" ")
     } else {
         catalog_name.to_string()
