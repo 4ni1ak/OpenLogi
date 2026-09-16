@@ -331,7 +331,24 @@ mod tests {
             &runtime_dir().expect("runtime dir")
         ));
     }
+}
 
+// `is_cargo_target_path` is pure path-string logic with no XDG/home
+// dependency, and it exists specifically to cover Windows (the platform with
+// no packaged dev-bundle mechanism) — unlike the `#[cfg(unix)]` module above,
+// it must compile and run there too.
+#[cfg(test)]
+mod cargo_target_path_tests {
+    use super::is_cargo_target_path;
+
+    // `/`-separated paths only: `std::path::Path` parses separators for the
+    // *compiling* target, so a literal `C:\...` string only splits into
+    // components when this test itself is compiled for Windows — on the
+    // Linux/macOS hosts that actually run `cargo test` (no CI test job
+    // targets Windows, only cross-compiled clippy) it would stay one opaque
+    // component and silently fail this test. `/` is accepted as a separator
+    // on every target Rust supports, Windows included, so it exercises the
+    // same `Path::components()` logic on all three hosts.
     #[test]
     fn cargo_target_debug_and_release_binaries_are_dev() {
         assert!(is_cargo_target_path(std::path::Path::new(
@@ -339,6 +356,9 @@ mod tests {
         )));
         assert!(is_cargo_target_path(std::path::Path::new(
             "/home/dev/openlogi/target/release/openlogi-desktop"
+        )));
+        assert!(is_cargo_target_path(std::path::Path::new(
+            "C:/Users/dev/openlogi/target/debug/openlogi-desktop.exe"
         )));
     }
 
@@ -349,6 +369,9 @@ mod tests {
         )));
         assert!(!is_cargo_target_path(std::path::Path::new(
             "/opt/openlogi/openlogi-desktop"
+        )));
+        assert!(!is_cargo_target_path(std::path::Path::new(
+            "C:/Program Files/OpenLogi/openlogi-desktop.exe"
         )));
         // A stray "target" *file/dir name* that isn't Cargo's own build
         // output (e.g. a user directory literally named "target") must not
