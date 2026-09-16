@@ -19,8 +19,11 @@
 //! shipped in Windows artifacts, because moving it afterwards would strand
 //! every existing user's `config.toml` and the agent's first-run state.
 
-//! Local packaged macOS builds stamped with dev-channel identifiers use the
-//! same layout under an `openlogi-dev` app directory.
+//! An unpackaged dev build uses the same layout under an `openlogi-dev` app
+//! directory instead: a local packaged macOS build stamped with a dev-channel
+//! bundle identifier, or (on any platform, since only macOS has a packaged
+//! dev-bundle mechanism) an executable still sitting in Cargo's own
+//! `target/debug`/`target/release` output.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -54,7 +57,10 @@ pub enum Profile {
 
 impl Profile {
     /// The profile this process runs under: forced by [`crate::env::PROFILE`],
-    /// or detected from the bundle the executable lives in. Memoized — the
+    /// detected on macOS from the bundle the executable lives in, or —
+    /// on every platform, since only macOS has a packaged dev-bundle
+    /// mechanism — detected from the executable still sitting in a Cargo
+    /// `target/debug`/`target/release` output directory. Memoized — the
     /// answer cannot change within a process lifetime.
     #[must_use]
     pub fn current() -> Self {
@@ -92,6 +98,15 @@ impl Profile {
             {
                 return Self::Dev;
             }
+        }
+
+        // Only macOS has a packaged dev-bundle mechanism (`xtask macos
+        // dev-bundle`); without this fallback, an unpackaged dev build on
+        // Windows or Linux silently lands on the production profile and
+        // shares the installed app's config directory, IPC socket, and
+        // single-instance lock.
+        if running_from_cargo_target() {
+            return Self::Dev;
         }
 
         Self::Production
@@ -136,6 +151,28 @@ fn app_dir() -> &'static str {
 #[must_use]
 pub fn is_dev_profile() -> bool {
     Profile::current() == Profile::Dev
+}
+
+/// True when the running executable lives inside a Cargo build output
+/// directory (`target/debug/…` or `target/release/…`) — the layout every
+/// `cargo build`/`cargo run` produces and no installer ever does. Only
+/// Windows and Linux have no packaged dev-bundle mechanism (that is
+/// macOS-only, see `xtask macos dev-bundle`), so without this fallback an
+/// unpackaged dev build on those platforms silently lands on the production
+/// profile and shares the installed app's config directory, IPC socket, and
+/// single-instance lock.
+fn running_from_cargo_target() -> bool {
+    std::env::current_exe().is_ok_and(|exe| is_cargo_target_path(&exe))
+}
+
+fn is_cargo_target_path(exe: &std::path::Path) -> bool {
+    let components: Vec<_> = exe
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    components
+        .windows(2)
+        .any(|pair| pair[0] == "target" && matches!(pair[1], "debug" | "release"))
 }
 
 #[cfg(target_os = "macos")]
@@ -265,19 +302,60 @@ pub fn agent_socket_path_for(profile: Profile) -> Result<PathBuf, PathsError> {
 mod tests {
     use super::*;
 
+    // The test binary itself runs from `target/debug/deps/…`, so
+    // `is_dev_profile()` correctly reports dev here (proven by
+    // `cargo_target_debug_and_release_binaries_are_dev` below) and `app_dir()`
+    // resolves to `DEV_APP_DIR`. Accept either app dir rather than asserting
+    // the production one.
+    fn ends_with_an_openlogi_app_dir(path: &std::path::Path) -> bool {
+        path.ends_with(APP_DIR) || path.ends_with(DEV_APP_DIR)
+    }
+
     #[test]
     fn config_dir_keeps_openlogi_under_xdg_config_home() {
-        assert!(config_dir().expect("config dir").ends_with("openlogi"));
+        assert!(ends_with_an_openlogi_app_dir(
+            &config_dir().expect("config dir")
+        ));
     }
 
     #[test]
     fn data_dir_keeps_openlogi_under_xdg_data_home() {
-        assert!(data_dir().expect("data dir").ends_with("openlogi"));
+        assert!(ends_with_an_openlogi_app_dir(
+            &data_dir().expect("data dir")
+        ));
     }
 
     #[test]
     fn runtime_dir_keeps_openlogi_suffix() {
-        assert!(runtime_dir().expect("runtime dir").ends_with("openlogi"));
+        assert!(ends_with_an_openlogi_app_dir(
+            &runtime_dir().expect("runtime dir")
+        ));
+    }
+
+    #[test]
+    fn cargo_target_debug_and_release_binaries_are_dev() {
+        assert!(is_cargo_target_path(std::path::Path::new(
+            "/home/dev/openlogi/target/debug/openlogi-desktop"
+        )));
+        assert!(is_cargo_target_path(std::path::Path::new(
+            "/home/dev/openlogi/target/release/openlogi-desktop"
+        )));
+    }
+
+    #[test]
+    fn an_installed_binary_is_not_mistaken_for_a_cargo_target_build() {
+        assert!(!is_cargo_target_path(std::path::Path::new(
+            "/usr/bin/openlogi-desktop"
+        )));
+        assert!(!is_cargo_target_path(std::path::Path::new(
+            "/opt/openlogi/openlogi-desktop"
+        )));
+        // A stray "target" *file/dir name* that isn't Cargo's own build
+        // output (e.g. a user directory literally named "target") must not
+        // be mistaken for one — only "target/debug" or "target/release".
+        assert!(!is_cargo_target_path(std::path::Path::new(
+            "/home/user/target/openlogi-desktop"
+        )));
     }
 
     #[test]
