@@ -47,6 +47,9 @@ pub enum ButtonId {
     /// Keyboard "Screen Capture" control (CID `0x010a`) — F7 on the Signature
     /// series.
     KeyScreenCapture,
+    /// Keyboard "Calculator" control (CID `0x000a`, `AL_Calculator`) — one of
+    /// the four keys above the numpad on the MX Keys S.
+    KeyCalculator,
     /// Keyboard "Mute Microphone" control (CID `0x011c`) — F8 on the Signature
     /// series.
     KeyMicMute,
@@ -103,11 +106,12 @@ impl ButtonId {
     /// [`ButtonId::ALL`]: that array seeds mouse defaults and the mouse
     /// popover trigger list, while keyboard keys stay native unless the user
     /// binds them (an unbound key is never diverted).
-    pub const KEYBOARD_KEYS: [ButtonId; 9] = [
+    pub const KEYBOARD_KEYS: [ButtonId; 10] = [
         ButtonId::KeySearch,
         ButtonId::KeyDictation,
         ButtonId::KeyEmoji,
         ButtonId::KeyScreenCapture,
+        ButtonId::KeyCalculator,
         ButtonId::KeyMicMute,
         ButtonId::KeyPlayPause,
         ButtonId::KeyMute,
@@ -182,6 +186,7 @@ impl ButtonId {
             ButtonId::KeyDictation => "Dictation Key",
             ButtonId::KeyEmoji => "Emoji Key",
             ButtonId::KeyScreenCapture => "Screen Capture Key",
+            ButtonId::KeyCalculator => "Calculator Key",
             ButtonId::KeyMicMute => "Mic Mute Key",
             ButtonId::KeyPlayPause => "Play/Pause Key",
             ButtonId::KeyMute => "Mute Key",
@@ -211,6 +216,7 @@ impl ButtonId {
             ButtonId::KeyDictation => "keyboard.dictation_key",
             ButtonId::KeyEmoji => "keyboard.emoji_key",
             ButtonId::KeyScreenCapture => "keyboard.screen_capture_key",
+            ButtonId::KeyCalculator => "keyboard.calculator_key",
             ButtonId::KeyMicMute => "keyboard.mic_mute_key",
             ButtonId::KeyPlayPause => "keyboard.play_pause_key",
             ButtonId::KeyMute => "keyboard.mute_key",

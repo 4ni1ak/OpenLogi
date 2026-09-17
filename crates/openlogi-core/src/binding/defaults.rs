@@ -78,6 +78,7 @@ pub fn default_binding(button: ButtonId) -> Action {
         | ButtonId::KeyDictation
         | ButtonId::KeyEmoji
         | ButtonId::KeyScreenCapture
+        | ButtonId::KeyCalculator
         | ButtonId::KeyMicMute
         | ButtonId::KeyPlayPause
         | ButtonId::KeyMute

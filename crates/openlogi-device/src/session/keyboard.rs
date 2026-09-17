@@ -47,11 +47,13 @@ use crate::reprog_controls::{self, RawControlEvent, ReprogControlsV4};
 /// `(0x1b04 control ID, ButtonId)` pairs. CID values match Logitech's control
 /// catalog (cross-checked against Solaar's `special_keys.py`); the F-row
 /// positions are the Signature-series layout.
-pub const KEYBOARD_KEY_CIDS: [(u16, ButtonId); 9] = [
+pub const KEYBOARD_KEY_CIDS: [(u16, ButtonId); 10] = [
     (0x00d4, ButtonId::KeySearch),
     (0x0103, ButtonId::KeyDictation),
     (0x0108, ButtonId::KeyEmoji),
     (0x010a, ButtonId::KeyScreenCapture),
+    // Cross-checked against Solaar's special_keys.py CONTROL.Calculator.
+    (0x000a, ButtonId::KeyCalculator),
     (0x011c, ButtonId::KeyMicMute),
     (0x00e5, ButtonId::KeyPlayPause),
     (0x00e7, ButtonId::KeyMute),
@@ -433,6 +435,14 @@ mod tests {
                 CapturedInput::ButtonUp(ButtonId::KeySearch),
                 CapturedInput::ButtonUp(ButtonId::KeyDictation),
             ]
+        );
+    }
+
+    #[test]
+    fn calculator_cid_maps_to_its_button_id() {
+        assert!(
+            KEYBOARD_KEY_CIDS.contains(&(0x000a, ButtonId::KeyCalculator)),
+            "MX Keys S's Calculator control (0x000a) must be divertable"
         );
     }
 }
