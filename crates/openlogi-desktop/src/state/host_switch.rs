@@ -22,14 +22,22 @@ pub struct HostSwitchCandidate {
 impl AppState {
     /// Keyboards the active device could follow on host switch, in device
     /// gallery order. Empty when the active device isn't a persistent
-    /// pointing device (only mice/trackballs send Easy-Switch-following host
-    /// keys anywhere).
+    /// pointing device that measured `ChangeHost` support (HID++
+    /// `0x1814`/`0x1815`), and each candidate keyboard is further filtered to
+    /// ones that measured an armable host-switch control in their `0x1b04`
+    /// control table — gating on kind alone would let an unsupported
+    /// pairing be toggled on with no way for the agent to ever act on it.
     #[must_use]
     pub fn host_switch_candidates(&self) -> Vec<HostSwitchCandidate> {
         let Some(target_key) = self
             .current_record()
             .filter(|record| matches!(record.kind, DeviceKind::Mouse | DeviceKind::Trackball))
             .filter(|record| record.is_persistent())
+            .filter(|record| {
+                record
+                    .capabilities
+                    .is_some_and(|caps| caps.host_switch_target)
+            })
             .map(|record| record.config_key.clone())
         else {
             return Vec::new();
@@ -37,6 +45,11 @@ impl AppState {
         self.devices()
             .iter()
             .filter(|record| record.kind == DeviceKind::Keyboard && record.is_persistent())
+            .filter(|record| {
+                record
+                    .capabilities
+                    .is_some_and(|caps| caps.host_switch_source)
+            })
             .map(|record| HostSwitchCandidate {
                 config_key: record.config_key.clone(),
                 display_name: record.display_name.clone(),
@@ -85,7 +98,12 @@ mod tests {
     use super::AppState;
     use crate::services::assets::AssetResolver;
 
-    fn direct_device(unit_id: [u8; 4], kind: DeviceKind, name: &str) -> DeviceInventory {
+    fn direct_device(
+        unit_id: [u8; 4],
+        kind: DeviceKind,
+        name: &str,
+        supports_host_switch: bool,
+    ) -> DeviceInventory {
         DeviceInventory {
             receiver: ReceiverInfo {
                 name: name.to_string(),
@@ -108,18 +126,33 @@ mod tests {
                     model_ids: [0xb034, 0, 0],
                     extended_model_id: 2,
                 }),
-                capabilities: Some(Capabilities::presumed_from_kind(kind)),
+                capabilities: Some(Capabilities {
+                    host_switch_target: supports_host_switch,
+                    host_switch_source: supports_host_switch,
+                    ..Capabilities::presumed_from_kind(kind)
+                }),
             }],
         }
     }
 
     /// A state with one persistent mouse (the active device) and one
-    /// persistent keyboard, so a host-switch link can be formed between them.
+    /// persistent keyboard, both measuring host-switch support, so a
+    /// host-switch link can be formed between them.
     fn state_with_a_mouse_and_a_keyboard() -> AppState {
         let cache = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mouse = direct_device([0x01, 0x02, 0x03, 0x04], DeviceKind::Mouse, "MX Master 3S");
-        let keyboard = direct_device([0x05, 0x06, 0x07, 0x08], DeviceKind::Keyboard, "MX Keys S");
+        let mouse = direct_device(
+            [0x01, 0x02, 0x03, 0x04],
+            DeviceKind::Mouse,
+            "MX Master 3S",
+            true,
+        );
+        let keyboard = direct_device(
+            [0x05, 0x06, 0x07, 0x08],
+            DeviceKind::Keyboard,
+            "MX Keys S",
+            true,
+        );
         AppState::with_runtime(
             Config::ephemeral(),
             &[mouse, keyboard],
@@ -158,5 +191,58 @@ mod tests {
 
         state.set_host_switch_follow(&keyboard_key, false);
         assert!(!state.host_switch_candidates()[0].following);
+    }
+
+    #[test]
+    fn a_mouse_without_change_host_support_lists_no_candidates() {
+        let cache = AssetResolver::new();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mouse = direct_device([0x01, 0x02, 0x03, 0x04], DeviceKind::Mouse, "M185", false);
+        let keyboard = direct_device(
+            [0x05, 0x06, 0x07, 0x08],
+            DeviceKind::Keyboard,
+            "MX Keys S",
+            true,
+        );
+        let state = AppState::with_runtime(
+            Config::ephemeral(),
+            &[mouse, keyboard],
+            &[],
+            &cache,
+            &[],
+            ConfigPersistence::MemoryOnly,
+            commands,
+        );
+
+        assert!(state.host_switch_candidates().is_empty());
+    }
+
+    #[test]
+    fn a_keyboard_without_an_armable_host_switch_control_is_not_a_candidate() {
+        let cache = AssetResolver::new();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mouse = direct_device(
+            [0x01, 0x02, 0x03, 0x04],
+            DeviceKind::Mouse,
+            "MX Master 3S",
+            true,
+        );
+        let keyboard = direct_device(
+            [0x05, 0x06, 0x07, 0x08],
+            DeviceKind::Keyboard,
+            "K120",
+            false,
+        );
+        let state = AppState::with_runtime(
+            Config::ephemeral(),
+            &[mouse, keyboard],
+            &[],
+            &cache,
+            &[],
+            ConfigPersistence::MemoryOnly,
+            commands,
+        );
+
+        assert!(state.host_switch_candidates().is_empty());
     }
 }
