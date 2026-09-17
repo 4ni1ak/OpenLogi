@@ -146,20 +146,29 @@ fn own_euid() -> libc::uid_t {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
-    use interprocess::local_socket::{GenericNamespaced, ToNsName};
+    use interprocess::local_socket::{GenericFilePath, ToFsName};
 
     use super::*;
 
-    /// A throwaway namespaced socket name, unique per test run so parallel
+    /// A throwaway filesystem-path socket, unique per test run so parallel
     /// tests and a real running agent never collide.
+    ///
+    /// `GenericNamespaced` (Linux's abstract socket namespace) has no macOS
+    /// equivalent — `to_ns_name` fails there — so this uses the same
+    /// `GenericFilePath` scheme [`endpoint_name`] uses in production, under
+    /// the OS temp directory rather than the real config path.
     fn unique_test_name() -> interprocess::local_socket::Name<'static> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("the clock reads after the epoch")
             .as_nanos();
-        format!("openlogi-ipc-test-{}-{nanos}.sock", std::process::id())
-            .to_ns_name::<GenericNamespaced>()
-            .expect("a valid namespaced socket name")
+        std::env::temp_dir()
+            .join(format!(
+                "openlogi-ipc-test-{}-{nanos}.sock",
+                std::process::id()
+            ))
+            .to_fs_name::<GenericFilePath>()
+            .expect("a valid filesystem socket path")
     }
 
     /// The common case this check exists to leave working: the real GUI
