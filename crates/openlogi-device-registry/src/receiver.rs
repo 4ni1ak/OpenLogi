@@ -127,6 +127,14 @@ mod tests {
     }
 
     #[test]
+    fn mk270_mk295_nano_receiver_is_nano_over_unifying_protocol() {
+        let receiver = find_receiver(LOGITECH_VENDOR_ID, 0xc534).expect("c534 receiver");
+
+        assert_eq!(receiver.brand, ReceiverBrand::Nano);
+        assert_eq!(receiver.protocol, ReceiverProtocol::Unifying);
+    }
+
+    #[test]
     fn lookup_requires_the_matching_vendor() {
         assert!(find_receiver(0xffff, 0xc54d).is_none());
     }
