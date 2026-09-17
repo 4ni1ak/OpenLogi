@@ -9,6 +9,57 @@ use openlogi_core::device::{
 use openlogi_core::hid::DeviceRoute;
 
 #[gpui::test]
+fn config_error_folder_button_opens_from_the_active_window(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, Modifiers};
+    use gpui_component::Root;
+
+    use super::{AppView, menu};
+    use crate::services::{assets::AssetResolver, i18n::LOCALE_LOCK};
+    use crate::state::{AppState, ConfigPersistence, Sources};
+
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::ui::theme::register_builtin_themes(cx);
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let resolver = AssetResolver::new();
+        let state = cx.new(|_| {
+            AppState::new(Sources {
+                persistence: ConfigPersistence::ReadOnly("invalid config".into()),
+                ..Sources::in_memory(
+                    openlogi_core::config::Config::ephemeral(),
+                    &resolver,
+                    commands,
+                )
+            })
+        });
+        AppState::set_global(state, cx);
+        menu::install(cx);
+    });
+    let (_, visual) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| AppView::new(window, cx));
+        Root::new(view, window, cx)
+    });
+    visual.update(|window, cx| {
+        window.activate_window();
+        window.draw(cx).clear(cx);
+        assert_eq!(cx.active_window(), Some(window.window_handle()));
+    });
+    let button = visual.debug_bounds("open-config-folder").unwrap();
+    assert_eq!(visual.opened_url(), None);
+
+    visual.simulate_click(button.center(), Modifiers::default());
+
+    let path = openlogi_core::paths::config_dir().unwrap();
+    let expected_url = menu::file_url(&path).unwrap();
+    assert_eq!(
+        visual.opened_url(),
+        Some(expected_url),
+        "the config-error button must open the folder while its window handles the click"
+    );
+}
+
+#[gpui::test]
 fn main_window_renders_profile_confirmation_dialogs(cx: &mut gpui::TestAppContext) {
     use gpui::{AppContext as _, InteractiveElement as _, ParentElement as _, div};
     use gpui_component::{Root, WindowExt as _};
