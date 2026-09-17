@@ -373,7 +373,15 @@ async fn run_capture_session_on(
     // reply, which proves delivery and resets the count). A transport/setup
     // error proves neither delivery nor silence, so it restarts immediately.
     // Exiting lets the manager re-arm on a fresh channel.
-    let root = RootFeature::new(Arc::clone(&chan), device_index, 0);
+    // `new_secondary`, not `new`: this channel may be inventory-owned (shared
+    // per PR #522), and inventory's own probing resolves features through
+    // `getFeature` too. Sharing the primary software id would put this call
+    // and inventory's own probe traffic on the same correlation key, so a
+    // concurrent probe and session setup queue behind each other on the wire
+    // — occasionally past either side's own timeout, read by inventory as a
+    // dead channel to retire and by capture as a session that ended
+    // unexpectedly.
+    let root = RootFeature::new_secondary(Arc::clone(&chan), device_index, 0);
     let wireless = root
         .get_feature(WirelessDeviceStatusFeature::ID)
         .await
@@ -715,7 +723,14 @@ async fn arm_controls(
     shared: &SharedChannel,
     registry: Option<&ChannelRegistry>,
 ) -> Result<ArmedControls, CaptureSessionFailure> {
-    let device = Device::new(Arc::clone(chan), slot)
+    // `new_secondary`, not `new`: `chan` may be inventory-owned (shared per
+    // PR #522), and inventory's own probing resolves the device's version and
+    // features the same way. Sharing the primary software id would put this
+    // arming pass's `getFeature` calls (reprog controls, thumbwheel) on the
+    // same correlation key as a concurrent inventory probe, and the two
+    // requests would queue behind each other on the wire — occasionally past
+    // either side's own timeout.
+    let device = Device::new_secondary(Arc::clone(chan), slot)
         .await
         .map_err(|_| GestureError::DeviceUnreachable(slot))?;
     let mut armed = ArmedControls::default();
