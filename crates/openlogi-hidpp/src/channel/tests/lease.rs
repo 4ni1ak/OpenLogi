@@ -99,7 +99,7 @@ fn a_secondary_leased_sw_id_does_not_queue_behind_the_primary_ids_in_flight_requ
         channel.set_sw_id_policy(leased_policy_with_secondary(
             1,
             Some(2),
-            record_sw_id_release,
+            discard_sw_id_release,
         ));
 
         let header = |software_id: u8| v20::MessageHeader {
@@ -140,6 +140,13 @@ fn a_secondary_leased_sw_id_does_not_queue_behind_the_primary_ids_in_flight_requ
 fn record_sw_id_release(id: u8) {
     RELEASED_SW_IDS.lock().unwrap().push(id);
 }
+
+/// A no-op release callback for tests that only care about queuing behavior:
+/// the shared `RELEASED_SW_IDS`/[`record_sw_id_release`] used by
+/// [`replacing_and_dropping_leased_policies_releases_each_exactly_once`]
+/// races with it under parallel test execution (the channel's drop at the
+/// end of an async test body would append to that same static).
+fn discard_sw_id_release(_id: u8) {}
 
 fn record_ordered_sw_id_release(_id: u8) {
     ORDERING_RELEASE_AFTER_RAW_DROP.store(
