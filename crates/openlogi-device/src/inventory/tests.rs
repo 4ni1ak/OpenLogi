@@ -1145,7 +1145,14 @@ impl crate::backend::HidBackend for SlowOpenBackend {
 /// BLE-direct devices measured 10-15s each to open, fully serialized, because
 /// `prepare_nodes` opened one node at a time. Three nodes that each take
 /// `DELAY` to open must finish in about one `DELAY`, not three.
-#[tokio::test]
+///
+/// Uses paused virtual time instead of a wall-clock ceiling: `SlowOpenBackend`
+/// sleeps via `tokio::time::sleep`, so with time paused a serialized open
+/// would need the runtime to auto-advance past three delays before this task
+/// can resume, while a concurrent one only needs one — proving the property
+/// directly rather than measuring scheduler latency, which a loaded CI
+/// runner can blow through even when every open genuinely ran concurrently.
+#[tokio::test(start_paused = true)]
 async fn opening_multiple_nodes_does_not_serialize_a_slow_connection_handshake() {
     const DELAY: Duration = Duration::from_millis(150);
 
@@ -1157,8 +1164,10 @@ async fn opening_multiple_nodes_does_not_serialize_a_slow_connection_handshake()
         scripted_node_info("slow-c"),
     ];
 
-    let start = Instant::now();
-    let prepared = enumerator.prepare_nodes(&*backend, candidates).await;
+    let start = tokio::time::Instant::now();
+    let prepared = tokio::time::timeout(DELAY * 2, enumerator.prepare_nodes(&*backend, candidates))
+        .await
+        .expect("three concurrent opens must resolve within two delays of virtual time");
     let elapsed = start.elapsed();
 
     assert_eq!(
@@ -1168,7 +1177,7 @@ async fn opening_multiple_nodes_does_not_serialize_a_slow_connection_handshake()
     );
     assert!(
         elapsed < DELAY * 2,
-        "opening three {DELAY:?}-latency nodes took {elapsed:?} — they were serialized"
+        "opening three {DELAY:?}-latency nodes advanced virtual time by {elapsed:?} — they were serialized"
     );
 }
 
@@ -1221,6 +1230,29 @@ async fn successful_channel_open_resets_eviction_but_not_inventory_grace() {
 
     assert!(!first_incomplete_probe.evict_channel);
     assert!(first_incomplete_probe.inventory.is_none());
+}
+
+/// A backend can report the same node twice in one enumeration pass (a
+/// duplicate hotplug event, a receiver re-listing a slot). The cache stays
+/// empty for every occurrence of a not-yet-cached node until the concurrent
+/// opens finish, so without deduplicating `to_open` the duplicate would be
+/// opened a second time and end up live through two channels — the exact
+/// split-delivery state `ChannelCache` exists to prevent.
+#[tokio::test]
+async fn a_duplicate_candidate_opens_only_one_channel() {
+    let info = scripted_node_info("duplicated");
+    let backend = ScriptedBackend::new(vec![(info.clone(), ScriptedOpen::UnresponsiveHidpp)]);
+    let mut enumerator = Enumerator::with_backend(backend.clone());
+
+    let prepared = enumerator
+        .prepare_nodes(backend.as_ref(), vec![info.clone(), info])
+        .await;
+
+    assert_eq!(
+        prepared.active.len(),
+        1,
+        "a duplicate candidate must only ever open one live channel"
+    );
 }
 
 /// A node that opens but does not speak HID++ is simply not ours. It must not

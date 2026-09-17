@@ -673,6 +673,7 @@ impl Enumerator {
         let mut open_failures = Vec::new();
         let mut retiring = Vec::new();
         let mut to_open = Vec::new();
+        let mut queued_to_open = HashSet::new();
         for info in candidates {
             let node = info.id.clone();
             seen_nodes.insert(node.clone());
@@ -690,6 +691,15 @@ impl Enumerator {
                     Arc::clone(&open.channel),
                     open.events.as_ref().map(ChannelEventSubscriptions::handle),
                 ));
+                continue;
+            }
+            // A backend can report the same node twice in one pass; the cache
+            // stays empty for every occurrence until the concurrent opens
+            // below finish and fold their results back in, so without this
+            // check a duplicate would queue here again and end up open
+            // through two live channels — the exact split-delivery state
+            // `ChannelCache` exists to prevent.
+            if !queued_to_open.insert(node) {
                 continue;
             }
             to_open.push(info);
