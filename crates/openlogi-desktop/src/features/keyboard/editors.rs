@@ -15,7 +15,8 @@
 )]
 
 use gpui::{
-    App, Entity, FontWeight, IntoElement, ParentElement, RenderOnce, Styled, Window, div, px, svg,
+    App, Entity, FontWeight, IntoElement, ParentElement, RenderOnce,
+    StatefulInteractiveElement as _, Styled, Window, div, px, svg,
 };
 use gpui_component::{
     Icon, IconName, Sizable as _,
@@ -268,6 +269,7 @@ impl RenderOnce for WorkflowStepRow {
         let view_remove = self.view;
 
         MenuRow::new(("wf-step", self.idx))
+            .aria_label(type_label)
             .child(
                 h_flex()
                     .w_full()

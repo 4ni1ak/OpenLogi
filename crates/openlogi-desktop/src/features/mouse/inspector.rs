@@ -376,6 +376,7 @@ fn gesture_directions(
                     MenuRow::new(("inspector-direction", index))
                         .selected(selected)
                         .role(Role::Button)
+                        .aria_label(tr!(direction.translation_key()))
                         .child(
                             h_flex()
                                 .min_w_0()
@@ -489,6 +490,7 @@ fn thumbwheel_inspector(
                             MenuRow::new(("inspector-thumbwheel", index))
                                 .selected(selected)
                                 .role(Role::Button)
+                                .aria_label(tr!(preset.translation_key()))
                                 .child(
                                     h_flex()
                                         .items_center()

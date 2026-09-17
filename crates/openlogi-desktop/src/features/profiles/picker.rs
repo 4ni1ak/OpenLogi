@@ -295,6 +295,7 @@ fn application_row(
     div().h(px(APP_ROW_H)).child(
         MenuRow::new(format!("{id_base}:catalog-app:{}", choice.app))
             .role(Role::MenuItem)
+            .aria_label(choice.name.clone())
             .child(
                 h_flex()
                     .min_w_0()
