@@ -576,9 +576,11 @@ async fn handle(
                 }
                 Err(error) => {
                     let _ = update_tx.send(GuiUpdate::ConfigReloadResult(Err(ConfigReloadError {
-                        message: format!(
-                            "saved, but the agent could not be reached to apply it: {error}"
-                        ),
+                        message: tr!(
+                            "device.config_saved_agent_unreachable",
+                            error => error.to_string()
+                        )
+                        .to_string(),
                     })));
                     return Err(());
                 }
@@ -710,8 +712,7 @@ fn reply_disconnected(update_tx: &mpsc::UnboundedSender<GuiUpdate>, cmd: Command
         // so rather than let the window imply the change took effect.
         Command::ReloadConfig => {
             let _ = update_tx.send(GuiUpdate::ConfigReloadResult(Err(ConfigReloadError {
-                message: "saved, but the agent is not running, so it has not been applied yet"
-                    .to_string(),
+                message: tr!("device.config_saved_agent_not_running").to_string(),
             })));
         }
         _ => {}
@@ -762,6 +763,23 @@ mod tests {
             .expect("the next newer generation is still accepted");
         assert!(!next.camera_active);
         assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn a_disconnected_reload_reply_uses_the_localized_catalog_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        reply_disconnected(&tx, Command::ReloadConfig);
+
+        let update = rx.try_recv().expect("reload reply is sent");
+        let GuiUpdate::ConfigReloadResult(Err(error)) = update else {
+            panic!("expected a config reload error");
+        };
+        assert_eq!(
+            error.message,
+            tr!("device.config_saved_agent_not_running").to_string(),
+            "the message must resolve through the locale catalog, not a hardcoded literal"
+        );
     }
 
     #[test]
