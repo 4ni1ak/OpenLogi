@@ -34,9 +34,10 @@ pub enum Action {
     /// Middle mouse button (wheel click).
     MiddleClick,
     /// Mouse "back" side button (extra button 4). Synthesizes the real mouse
-    /// button event, which browsers and most apps interpret as "navigate back"
-    /// natively — unlike [`Action::BrowserBack`], which sends ⌘[ and is ignored
-    /// by many apps.
+    /// button event, which the Chromium/Firefox-family browsers interpret as
+    /// "navigate back" — but on macOS, Finder and Safari both ignore it.
+    /// [`Action::BrowserBack`]'s ⌘[ is honoured by Finder, Safari, Chrome and
+    /// Firefox alike.
     MouseBack,
     /// Mouse "forward" side button (extra button 5). Native counterpart to
     /// [`Action::MouseBack`]; see [`Action::BrowserForward`] for the ⌘] form.
@@ -66,9 +67,11 @@ pub enum Action {
     Save,
 
     // ── Browser / Navigation ──────────────────────────────────────────────────
-    /// Navigate backward in browser history.
+    /// Navigate backward via ⌘[ / Ctrl+[ — despite the name, this is honoured
+    /// by Finder as well as Safari, Chrome and Firefox on macOS, unlike
+    /// [`Action::MouseBack`]'s native button event.
     BrowserBack,
-    /// Navigate forward in browser history.
+    /// Navigate forward via ⌘] / Ctrl+] — see [`Action::BrowserBack`].
     BrowserForward,
     /// Open a new tab (⌘T / Ctrl+T).
     NewTab,
