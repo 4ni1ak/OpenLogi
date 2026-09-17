@@ -32,7 +32,7 @@ impl Feature for WirelessDeviceStatusFeature {}
 impl WirelessDeviceStatusFeature {
     /// [`CreatableFeature::new`], for a second, distinct in-process consumer
     /// of a channel another consumer already holds open (see
-    /// [`crate::feature::FeatureEndpoint::new_secondary`]).
+    /// `FeatureEndpoint::new_secondary` on other features).
     ///
     /// This feature only listens for broadcasts — it has no `FeatureEndpoint`
     /// and sends no outgoing requests, so there is no software id to stamp
