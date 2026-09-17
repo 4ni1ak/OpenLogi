@@ -1104,6 +1104,74 @@ fn live_cached_channel_survives_a_transient_enumeration_gap() {
     assert_eq!(retained, std::collections::HashSet::from([1, 2]));
 }
 
+/// A backend whose `open_hidpp` sleeps for a fixed delay before failing,
+/// standing in for a slow BLE-direct connection handshake.
+struct SlowOpenBackend {
+    delay: Duration,
+}
+
+#[hidpp::async_trait]
+impl crate::backend::HidBackend for SlowOpenBackend {
+    async fn enumerate(&self) -> Result<Vec<NodeInfo>, crate::backend::BackendError> {
+        Ok(Vec::new())
+    }
+
+    async fn enumerate_hidpp(&self) -> Result<Vec<NodeInfo>, crate::backend::BackendError> {
+        Ok(Vec::new())
+    }
+
+    async fn open_hidpp(
+        &self,
+        _node: &NodeInfo,
+    ) -> Result<Option<Arc<hidpp::channel::HidppChannel>>, crate::backend::BackendError> {
+        tokio::time::sleep(self.delay).await;
+        Err(crate::backend::BackendError::Disconnected)
+    }
+
+    async fn open_raw_writer(
+        &self,
+        _node: &NodeInfo,
+    ) -> Result<Box<dyn crate::backend::RawWriter>, crate::backend::BackendError> {
+        Err(crate::backend::BackendError::Backend(
+            "slow-open test backend has no raw writer".into(),
+        ))
+    }
+
+    fn watch(&self) -> Result<crate::backend::HotplugStream, crate::backend::BackendError> {
+        Ok(Box::new(futures_lite::stream::empty()))
+    }
+}
+
+/// BLE-direct devices measured 10-15s each to open, fully serialized, because
+/// `prepare_nodes` opened one node at a time. Three nodes that each take
+/// `DELAY` to open must finish in about one `DELAY`, not three.
+#[tokio::test]
+async fn opening_multiple_nodes_does_not_serialize_a_slow_connection_handshake() {
+    const DELAY: Duration = Duration::from_millis(150);
+
+    let backend = Arc::new(SlowOpenBackend { delay: DELAY });
+    let mut enumerator = Enumerator::with_backend(backend.clone());
+    let candidates = vec![
+        scripted_node_info("slow-a"),
+        scripted_node_info("slow-b"),
+        scripted_node_info("slow-c"),
+    ];
+
+    let start = Instant::now();
+    let prepared = enumerator.prepare_nodes(&*backend, candidates).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        prepared.open_failures.len(),
+        3,
+        "every node's open must still be attempted and reported"
+    );
+    assert!(
+        elapsed < DELAY * 2,
+        "opening three {DELAY:?}-latency nodes took {elapsed:?} — they were serialized"
+    );
+}
+
 /// A node the backend cannot open is a *failure*, not a disconnect: the tick
 /// must report itself unhealthy so the one-shot retry runs its budget and the
 /// ledger keeps replaying that node's last-good snapshot.
