@@ -8,6 +8,7 @@
 //! `VIDIOC_ENUM_FMT` yields any capture format, which only the capture node
 //! does.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -64,7 +65,25 @@ pub(crate) fn nodes() -> Vec<Node> {
         .collect();
 
     nodes.sort_by(|a, b| a.path.cmp(&b.path));
+    dedupe_by_physical_device(nodes)
+}
+
+/// Keep only the first node per physical USB device.
+///
+/// A UVC camera with an IR sensor (Windows Hello) exposes it as its own
+/// capture-capable node alongside the main sensor's — both pass
+/// [`is_capture_node`], so without this the same physical camera showed up
+/// twice (e.g. the Brio's RGB + IR nodes). Nodes are already sorted by path,
+/// so the one kept per `(vendor_id, product_id, serial_number)` is the
+/// lowest-numbered `/dev/videoN`. Two serial-less units of the same model
+/// collapse into one entry — the same ambiguity `Camera::config_key` already
+/// accepts for settings persistence, since USB gives no stronger identity.
+fn dedupe_by_physical_device(nodes: Vec<Node>) -> Vec<Node> {
+    let mut seen = HashSet::new();
     nodes
+        .into_iter()
+        .filter(|node| seen.insert((node.vendor_id, node.product_id, node.serial_number.clone())))
+        .collect()
 }
 
 /// Resolve a [`Camera::unique_id`] back to the `/dev/video*` node it names.
@@ -212,4 +231,56 @@ fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
         .map(|text| text.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Node, dedupe_by_physical_device};
+
+    fn node(path: &str, vendor_id: u16, product_id: u16, serial: Option<&str>) -> Node {
+        Node {
+            path: path.into(),
+            name: path.to_string(),
+            vendor_id,
+            product_id,
+            serial_number: serial.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_second_capture_node_on_the_same_physical_device_is_dropped() {
+        // The Brio's RGB sensor and IR (Windows Hello) sensor both pass
+        // `is_capture_node` but share one USB identity.
+        let nodes = vec![
+            node("/dev/video0", 0x046d, 0x0893, Some("ABC123")),
+            node("/dev/video2", 0x046d, 0x0893, Some("ABC123")),
+        ];
+
+        let deduped = dedupe_by_physical_device(nodes);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].path.to_str(), Some("/dev/video0"));
+    }
+
+    #[test]
+    fn distinct_physical_devices_are_kept() {
+        let nodes = vec![
+            node("/dev/video0", 0x046d, 0x0893, Some("ABC123")),
+            node("/dev/video2", 0x046d, 0x0894, Some("XYZ789")),
+        ];
+
+        assert_eq!(dedupe_by_physical_device(nodes).len(), 2);
+    }
+
+    #[test]
+    fn two_serial_less_units_of_the_same_model_still_collapse() {
+        // Matches the same ambiguity `Camera::config_key` already accepts —
+        // USB gives no stronger identity without a serial.
+        let nodes = vec![
+            node("/dev/video0", 0x046d, 0x0893, None),
+            node("/dev/video2", 0x046d, 0x0893, None),
+        ];
+
+        assert_eq!(dedupe_by_physical_device(nodes).len(), 1);
+    }
 }
