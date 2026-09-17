@@ -103,12 +103,18 @@ pub(super) fn action_library(
                     &power_user.type_text,
                     pal,
                 ))
-                .child(text_action_editor(
-                    slot,
-                    PowerUserKind::RunAppleScript,
-                    &power_user.applescript,
-                    pal,
-                ))
+                // RunAppleScript has no execution path outside macOS
+                // (`openlogi-inject`'s Linux/Windows backends only log a
+                // warning and do nothing) — hide the editor there instead of
+                // letting a binding be saved that silently never fires.
+                .when(cfg!(target_os = "macos"), |library| {
+                    library.child(text_action_editor(
+                        slot,
+                        PowerUserKind::RunAppleScript,
+                        &power_user.applescript,
+                        pal,
+                    ))
+                })
                 .child(text_action_editor(
                     slot,
                     PowerUserKind::RunShellCommand,
