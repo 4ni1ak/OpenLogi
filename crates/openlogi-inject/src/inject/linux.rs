@@ -136,9 +136,21 @@ fn dispatch_native(action: &Action, native: NativeAction) {
     match native {
         // GNOME's overlay key toggles the Activities overview on a bare tap;
         // no other tested desktop binds Super alone the same way (KDE opens
-        // KRunner), so this only fires under GNOME.
-        NativeAction::MissionControl | NativeAction::AppExpose => {
+        // KRunner), so this only fires under GNOME. Activities shows every
+        // window across every app, not just the frontmost app's — that is
+        // MissionControl's contract, not AppExpose's, so AppExpose must not
+        // share this arm without its own promised single-app scope.
+        NativeAction::MissionControl => {
             gnome_key_or_skip(action, &[], KeyCode::KEY_LEFTMETA);
+        }
+        // No tested desktop has a stock single-app window-exposé binding
+        // (GNOME's Activities and KDE's Present Windows both show every
+        // app), so this always skips rather than substitute the wrong scope.
+        NativeAction::AppExpose => {
+            tracing::debug!(
+                action = action.label(),
+                "no Linux equivalent — action skipped"
+            );
         }
         // GNOME's default "Show desktop" keybinding.
         NativeAction::ShowDesktop => {
@@ -177,10 +189,17 @@ fn gnome_key_or_skip(action: &Action, mods: &[KeyCode], key: KeyCode) {
 }
 
 fn is_gnome() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .unwrap_or_default()
-        .to_lowercase()
-        .contains("gnome")
+    desktop_is_gnome(std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+}
+
+/// The pure half of [`is_gnome`], taking the desktop string directly instead
+/// of reading it from the process environment — so tests can drive it
+/// without `std::env::set_var`, which cannot be scoped to just this test:
+/// the process environment is process-wide, and a private test-only mutex
+/// only serializes callers that take it, not every other reader (including
+/// `is_gnome` itself, called from unrelated code running concurrently).
+fn desktop_is_gnome(current_desktop: impl AsRef<str>) -> bool {
+    current_desktop.as_ref().to_lowercase().contains("gnome")
 }
 
 /// Synthesise one scroll tick in direction `(dx, dy)`. Unit direction
@@ -768,19 +787,8 @@ mod tests {
         }
     }
 
-    /// Env-var tests share process state; serialize them so a stray leftover
-    /// value from one can't leak into another.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    #[expect(
-        unsafe_code,
-        reason = "std::env::set_var/remove_var are unsafe since Rust 2024; ENV_LOCK serializes access"
-    )]
     fn gnome_detection_matches_on_current_desktop_case_insensitively() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (value, expected) in [
             ("GNOME", true),
             ("ubuntu:GNOME", true),
@@ -788,16 +796,11 @@ mod tests {
             ("KDE", false),
             ("", false),
         ] {
-            // SAFETY: guarded by ENV_LOCK against concurrent env access from
-            // other tests in this process.
-            unsafe { std::env::set_var("XDG_CURRENT_DESKTOP", value) };
-            assert_eq!(super::is_gnome(), expected, "XDG_CURRENT_DESKTOP={value:?}");
+            assert_eq!(
+                super::desktop_is_gnome(value),
+                expected,
+                "XDG_CURRENT_DESKTOP={value:?}"
+            );
         }
-        // SAFETY: same guard as above.
-        unsafe { std::env::remove_var("XDG_CURRENT_DESKTOP") };
-        assert!(
-            !super::is_gnome(),
-            "unset XDG_CURRENT_DESKTOP must not match"
-        );
     }
 }
