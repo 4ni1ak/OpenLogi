@@ -1090,6 +1090,10 @@ fn thread_main(
                     CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
                 ) {
                     tap_disabled.store(true, Ordering::Release);
+                    // The gap while the tap is disabled can drop button-up
+                    // events this resolver never sees, so a cached
+                    // attribution from before the gap must not survive it.
+                    senderless_button_resolver.borrow_mut().cancel_all();
                 }
                 callback_activity.enter(callback_signals.now_millis());
                 let disposition = run_tap_callback(

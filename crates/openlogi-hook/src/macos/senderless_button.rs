@@ -55,6 +55,7 @@ unsafe extern "C" {
     fn CFGetTypeID(value: CFTypeRef) -> usize;
     fn CFNumberGetTypeID() -> usize;
     fn CFNumberGetValue(number: CFTypeRef, number_type: i32, value: *mut c_void) -> bool;
+    fn CFStringGetTypeID() -> usize;
 }
 
 /// Long-lived manager used only for rare sender-less button transitions.
@@ -151,6 +152,15 @@ impl SenderlessButtonResolver {
         }
     }
 
+    /// Drop every cached attribution. The OS tap being disabled and
+    /// re-enabled (`TapDisabledByTimeout`/`TapDisabledByUserInput`) can drop
+    /// button-up events without this resolver ever seeing them, so a cached
+    /// source would otherwise outlive the physical hold it was attributed to
+    /// and later mis-attribute an unrelated button's release.
+    pub(super) fn cancel_all(&mut self) {
+        self.held_sources.clear();
+    }
+
     pub(super) fn resolve(
         &mut self,
         button_number: i64,
@@ -167,7 +177,29 @@ impl SenderlessButtonResolver {
             return self.held_sources.remove(&button_number);
         }
         let candidates = self.manager.as_ref()?.pressed_devices(button_number);
-        let source = unique_pressed_logitech(&candidates)?;
+        self.resolve_press(button_number, &candidates)
+    }
+
+    /// The new-press half of [`Self::resolve`], taking already-read
+    /// candidates directly so it can be exercised without a live
+    /// `IOHIDManager` — see the tests module.
+    fn resolve_press(
+        &mut self,
+        button_number: i64,
+        candidates: &[ButtonCandidate],
+    ) -> Option<EventDevice> {
+        let Some(source) = unique_pressed_logitech(candidates) else {
+            // An ambiguous new press (e.g. a second mouse pressing the same
+            // button number while a prior press is still held) invalidates
+            // any stale cache entry for this button: nothing proves a later
+            // release belongs to the device that earned the cached
+            // attribution rather than to this new, unattributable press.
+            // Without this, that release would wrongly end the cached
+            // device's hold instead of passing through unattributed like its
+            // own down did.
+            self.held_sources.remove(&button_number);
+            return None;
+        };
         self.held_sources.insert(button_number, source.clone());
         Some(source)
     }
@@ -196,7 +228,7 @@ fn candidate_for_button(device: IOHIDDeviceRef, usage: u32) -> Option<ButtonCand
         device: EventDevice {
             vendor_id: property_u32(device, "VendorID"),
             product_id: property_u32(device, "ProductID"),
-            product_name: None,
+            product_name: device_string(device, "Product"),
         },
         pressed,
     })
@@ -245,6 +277,27 @@ fn current_value(device: IOHIDDeviceRef, element: IOHIDElementRef) -> Option<isi
 
 fn property_u32(device: IOHIDDeviceRef, key: &str) -> Option<u32> {
     device_number(device, key).and_then(|value| u32::try_from(value).ok())
+}
+
+/// Read a `CFString`-typed HID device property, e.g. `"Product"` — the same
+/// key [`crate::EventDevice::is_trackpad_like`] matches on. Without this, a
+/// candidate built here always carries `product_name: None`, so a Logitech
+/// touchpad exposing a mouse HID interface would pass the trackpad check by
+/// omission and become remappable through `is_logitech()` alone.
+fn device_string(device: IOHIDDeviceRef, key: &str) -> Option<String> {
+    let key = CFString::new(key);
+    // SAFETY: `device` is live and `key` is a valid CFString for this call.
+    let property = unsafe { IOHIDDeviceGetProperty(device, key.as_concrete_TypeRef()) };
+    // SAFETY: Core Foundation type-id queries accept any non-null CF object.
+    if property.is_null() || unsafe { CFGetTypeID(property) != CFStringGetTypeID() } {
+        return None;
+    }
+    // SAFETY: `IOHIDDeviceGetProperty` follows the "get" rule (no retain
+    // transferred to the caller) and the type-id check above proves
+    // `property` is a CFString; `wrap_under_get_rule` borrows it just long
+    // enough to copy the text out, matching `device_number`'s treatment of
+    // the same API's CFNumber results.
+    Some(unsafe { CFString::wrap_under_get_rule(property.cast()) }.to_string())
 }
 
 fn device_number(device: IOHIDDeviceRef, key: &str) -> Option<u64> {
