@@ -144,15 +144,19 @@ fn dispatch_native(action: &Action, native: NativeAction) {
     let ctrl = KeyCode::KEY_LEFTCTRL;
     let alt = KeyCode::KEY_LEFTALT;
     match native {
-        // No universal Linux equivalent; the compositor shortcut varies.
-        NativeAction::MissionControl
-        | NativeAction::AppExpose
-        | NativeAction::ShowDesktop
-        | NativeAction::LaunchpadShow => {
-            tracing::debug!(
-                action = action.label(),
-                "no Linux equivalent — action skipped"
-            );
+        // GNOME's overlay key toggles the Activities overview on a bare tap;
+        // no other tested desktop binds Super alone the same way (KDE opens
+        // KRunner), so this only fires under GNOME.
+        NativeAction::MissionControl | NativeAction::AppExpose => {
+            gnome_key_or_skip(action, &[], KeyCode::KEY_LEFTMETA);
+        }
+        // GNOME's default "Show desktop" keybinding.
+        NativeAction::ShowDesktop => {
+            gnome_key_or_skip(action, &[KeyCode::KEY_LEFTMETA], KeyCode::KEY_D);
+        }
+        // GNOME's default "Show Applications" keybinding.
+        NativeAction::LaunchpadShow => {
+            gnome_key_or_skip(action, &[KeyCode::KEY_LEFTMETA], KeyCode::KEY_A);
         }
         // Ctrl+Alt+←/→ is the default in GNOME and KDE.
         NativeAction::PreviousDesktop => press_key(&[ctrl, alt], KeyCode::KEY_LEFT),
@@ -167,6 +171,26 @@ fn dispatch_native(action: &Action, native: NativeAction) {
         // logind Suspend() via the system bus.
         NativeAction::Sleep => sleep_system(),
     }
+}
+
+/// Press `mods`+`key` under GNOME; log the existing "no Linux equivalent"
+/// skip everywhere else, since Super-based bindings vary by desktop.
+fn gnome_key_or_skip(action: &Action, mods: &[KeyCode], key: KeyCode) {
+    if is_gnome() {
+        press_key(mods, key);
+    } else {
+        tracing::debug!(
+            action = action.label(),
+            "no Linux equivalent — action skipped"
+        );
+    }
+}
+
+fn is_gnome() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("gnome")
 }
 
 fn dispatch_script(script: Script<'_>) {
@@ -788,5 +812,38 @@ mod tests {
                 "{shortcut:?} table entry has no Linux keycode mapping"
             );
         }
+    }
+
+    /// Env-var tests share process state; serialize them so a stray leftover
+    /// value from one can't leak into another.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "std::env::set_var/remove_var are unsafe since Rust 2024; ENV_LOCK serializes access"
+    )]
+    fn gnome_detection_matches_on_current_desktop_case_insensitively() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (value, expected) in [
+            ("GNOME", true),
+            ("ubuntu:GNOME", true),
+            ("gnome-classic", true),
+            ("KDE", false),
+            ("", false),
+        ] {
+            // SAFETY: guarded by ENV_LOCK against concurrent env access from
+            // other tests in this process.
+            unsafe { std::env::set_var("XDG_CURRENT_DESKTOP", value) };
+            assert_eq!(super::is_gnome(), expected, "XDG_CURRENT_DESKTOP={value:?}");
+        }
+        // SAFETY: same guard as above.
+        unsafe { std::env::remove_var("XDG_CURRENT_DESKTOP") };
+        assert!(
+            !super::is_gnome(),
+            "unset XDG_CURRENT_DESKTOP must not match"
+        );
     }
 }
