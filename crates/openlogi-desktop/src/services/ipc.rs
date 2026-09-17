@@ -767,19 +767,39 @@ mod tests {
 
     #[test]
     fn a_disconnected_reload_reply_uses_the_localized_catalog_message() {
+        // Comparing against `tr!` under the same (English) locale the process
+        // already started in would pass even for a hardcoded English literal
+        // that happened to match — it doesn't prove the message actually goes
+        // through the locale catalog. Switch to a non-English locale and
+        // confirm the message changes with it, and that it still resolves to
+        // that locale's exact catalog text.
+        let _locale = crate::services::i18n::LOCALE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
+        rust_i18n::set_locale("en");
+        let english = tr!("device.config_saved_agent_not_running").to_string();
+
+        rust_i18n::set_locale("de");
         reply_disconnected(&tx, Command::ReloadConfig);
+        rust_i18n::set_locale("en");
 
         let update = rx.try_recv().expect("reload reply is sent");
         let GuiUpdate::ConfigReloadResult(Err(error)) = update else {
             panic!("expected a config reload error");
         };
+        assert_ne!(
+            error.message, english,
+            "the message must change with the active locale, not stay hardcoded"
+        );
+        rust_i18n::set_locale("de");
         assert_eq!(
             error.message,
             tr!("device.config_saved_agent_not_running").to_string(),
-            "the message must resolve through the locale catalog, not a hardcoded literal"
+            "the message must resolve through the locale catalog active when it was built"
         );
+        rust_i18n::set_locale("en");
     }
 
     #[test]
