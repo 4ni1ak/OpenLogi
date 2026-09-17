@@ -154,13 +154,14 @@ pub fn is_dev_profile() -> bool {
 }
 
 /// True when the running executable lives inside a Cargo build output
-/// directory (`target/debug/…` or `target/release/…`) — the layout every
-/// `cargo build`/`cargo run` produces and no installer ever does. Only
-/// Windows and Linux have no packaged dev-bundle mechanism (that is
-/// macOS-only, see `xtask macos dev-bundle`), so without this fallback an
-/// unpackaged dev build on those platforms silently lands on the production
-/// profile and shares the installed app's config directory, IPC socket, and
-/// single-instance lock.
+/// directory (`target/debug/…`, `target/release/…`, or a `--target
+/// <triple>` cross-compile's `target/<triple>/debug/…` /
+/// `target/<triple>/release/…`) — the layout every `cargo build`/`cargo run`
+/// produces and no installer ever does. Only Windows and Linux have no
+/// packaged dev-bundle mechanism (that is macOS-only, see `xtask macos
+/// dev-bundle`), so without this fallback an unpackaged dev build on those
+/// platforms silently lands on the production profile and shares the
+/// installed app's config directory, IPC socket, and single-instance lock.
 fn running_from_cargo_target() -> bool {
     std::env::current_exe().is_ok_and(|exe| is_cargo_target_path(&exe))
 }
@@ -173,6 +174,9 @@ fn is_cargo_target_path(exe: &std::path::Path) -> bool {
     components
         .windows(2)
         .any(|pair| pair[0] == "target" && matches!(pair[1], "debug" | "release"))
+        || components
+            .windows(3)
+            .any(|triple| triple[0] == "target" && matches!(triple[2], "debug" | "release"))
 }
 
 #[cfg(target_os = "macos")]
@@ -359,6 +363,19 @@ mod cargo_target_path_tests {
         )));
         assert!(is_cargo_target_path(std::path::Path::new(
             "C:/Users/dev/openlogi/target/debug/openlogi-desktop.exe"
+        )));
+    }
+
+    // `cargo build --target <triple>` (used for cross-compiled clippy checks
+    // in this repo, e.g. `x86_64-pc-windows-gnu`) nests an extra
+    // target-triple directory between `target/` and `debug`/`release`.
+    #[test]
+    fn cross_compiled_target_triple_binaries_are_dev() {
+        assert!(is_cargo_target_path(std::path::Path::new(
+            "/home/dev/openlogi/target/x86_64-pc-windows-gnu/debug/openlogi-desktop.exe"
+        )));
+        assert!(is_cargo_target_path(std::path::Path::new(
+            "/home/dev/openlogi/target/aarch64-unknown-linux-musl/release/openlogi-agent"
         )));
     }
 
