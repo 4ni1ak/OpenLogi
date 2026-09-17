@@ -2,18 +2,21 @@
 
 use tracing::debug;
 
-use openlogi_core::device::DeviceKind;
-
 use crate::state::devices::DeviceRecord;
 
 use super::AppState;
 
 impl AppState {
-    /// Whether the active device is a keyboard the Fn-lock toggle applies to.
+    /// Whether the active device reports Fn-lock support (HID++ `0x40a2` or
+    /// `0x40a3` in its feature table). Gating on the measured/last-known
+    /// capability rather than [`openlogi_core::device::DeviceKind`] keeps the
+    /// toggle from showing — and persisting a state the hardware never
+    /// applies — on a keyboard that doesn't expose either feature.
     #[must_use]
     pub fn current_device_supports_fn_lock(&self) -> bool {
         self.current_record()
-            .is_some_and(|record| record.kind == DeviceKind::Keyboard)
+            .and_then(|record| record.capabilities)
+            .is_some_and(|capabilities| capabilities.fn_lock)
     }
 
     /// The active keyboard's persisted Fn-lock state. `false` when unset —
@@ -28,10 +31,11 @@ impl AppState {
 
     /// Set the active keyboard's Fn-lock state, persist it, and reload the
     /// agent so it writes HID++ `0x40a3`. No-op when no device is selected,
-    /// the active device isn't a keyboard, or it has no persistent config key.
+    /// the active device doesn't support Fn-lock, or it has no persistent
+    /// config key.
     pub fn commit_fn_lock(&mut self, fn_lock: bool) {
         if !self.current_device_supports_fn_lock() {
-            debug!("active device is not a keyboard — Fn-lock change ignored");
+            debug!("active device does not support Fn-lock — change ignored");
             return;
         }
         let Some(key) = self
@@ -82,7 +86,10 @@ mod tests {
                     model_ids: [0xb378, 0, 0],
                     extended_model_id: 1,
                 }),
-                capabilities: Some(Capabilities::presumed_from_kind(DeviceKind::Keyboard)),
+                capabilities: Some(Capabilities {
+                    fn_lock: true,
+                    ..Capabilities::presumed_from_kind(DeviceKind::Keyboard)
+                }),
             }],
         }
     }
@@ -111,6 +118,31 @@ mod tests {
         assert!(state.current_fn_lock());
 
         state.commit_fn_lock(false);
+        assert!(!state.current_fn_lock());
+    }
+
+    #[test]
+    fn a_keyboard_without_fn_lock_capability_does_not_support_the_toggle() {
+        let mut inventory = direct_keyboard();
+        inventory.paired[0].capabilities =
+            Some(Capabilities::presumed_from_kind(DeviceKind::Keyboard));
+        let cache = AssetResolver::new();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = AppState::with_runtime(
+            Config::ephemeral(),
+            &[inventory],
+            &[],
+            &cache,
+            &[],
+            ConfigPersistence::MemoryOnly,
+            commands,
+        );
+
+        assert!(!state.current_device_supports_fn_lock());
+
+        // A write attempt on an unsupported keyboard must not persist —
+        // otherwise the UI would report a state the hardware never applies.
+        state.commit_fn_lock(true);
         assert!(!state.current_fn_lock());
     }
 }
