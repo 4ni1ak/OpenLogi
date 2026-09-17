@@ -150,13 +150,10 @@ pub struct AgentSnapshot {
 /// The application the agent currently resolves per-app profiles against, and
 /// the ones it recently saw in front.
 ///
-/// `recent` is here because a client cannot produce these identifiers itself.
-/// They come from four incompatible namespaces — macOS bundle ids, X11
-/// `WM_CLASS`, Wayland `app_id`, Windows executable paths — and only the agent
-/// holds the one that its matcher will actually compare. Enumerating installed
-/// applications in the GUI would produce plausible strings that miss. A client
-/// offering "make a profile for…" therefore picks from this list rather than
-/// from the host.
+/// `recent` carries identifiers defined by [`ForegroundApp::id`] that the agent
+/// observed in front. These are the exact keys the matcher compares, so a client
+/// can create a profile without guessing an installed application's runtime
+/// identifier.
 ///
 /// It also answers the case [`Self::current`] cannot: while a client's own
 /// window is in front, *it* is the foreground application, so the app the user
