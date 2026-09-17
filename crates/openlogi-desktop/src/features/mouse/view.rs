@@ -134,6 +134,10 @@ pub struct MouseModelView {
     action_search: Entity<InputState>,
     pub(super) custom_shortcut_input: Entity<InputState>,
     pub(super) custom_application_input: Entity<InputState>,
+    /// Whether the last "Add" attempt on the corresponding custom editor
+    /// failed to parse, so its caption can show an inline error.
+    pub(super) custom_shortcut_invalid: bool,
+    pub(super) custom_application_invalid: bool,
     _state_obs: Subscription,
 }
 
@@ -152,10 +156,27 @@ impl MouseModelView {
             InputState::new(window, cx)
                 .placeholder(tr!("action_ring.shortcut_e_g_cmd_plus_shift_plus_p"))
         });
+        cx.subscribe(&custom_shortcut_input, |view, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                view.custom_shortcut_invalid = false;
+                cx.notify();
+            }
+        })
+        .detach();
         let custom_application_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(tr!("action_ring.application_folder_path_or_url"))
         });
+        cx.subscribe(
+            &custom_application_input,
+            |view, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    view.custom_application_invalid = false;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         let state = AppState::global(cx);
         let state_obs = cx.subscribe(&state, |_view, _, event: &StateEvent, cx| {
             let relevant = match event {
@@ -183,8 +204,26 @@ impl MouseModelView {
             action_search,
             custom_shortcut_input,
             custom_application_input,
+            custom_shortcut_invalid: false,
+            custom_application_invalid: false,
             _state_obs: state_obs,
         }
+    }
+
+    /// Clear both custom-action drafts (text and any invalid state) — called
+    /// whenever the picker opens for a new target, so a shortcut or
+    /// application typed for one button doesn't reappear for another.
+    pub(super) fn clear_custom_action_drafts(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.custom_shortcut_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.custom_application_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.custom_shortcut_invalid = false;
+        self.custom_application_invalid = false;
     }
 
     /// Set (or clear, with `None`) the activated gesture direction. Callers must
@@ -1096,6 +1135,37 @@ mod tests {
             view.select(MouseControlId::Button(ButtonId::Forward));
 
             assert!(!view.action_picker_open);
+        });
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn clearing_custom_action_drafts_resets_text_and_invalid_state(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        install_app_state(cx);
+        let (view, cx) = cx.add_window_view(MouseModelView::new);
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.custom_shortcut_input
+                    .update(cx, |input, cx| input.set_value("Cmd+K", window, cx));
+                view.custom_application_input
+                    .update(cx, |input, cx| input.set_value("/bin/true", window, cx));
+                view.custom_shortcut_invalid = true;
+                view.custom_application_invalid = true;
+
+                view.clear_custom_action_drafts(window, cx);
+            });
+        });
+
+        view.update(cx, |view, cx| {
+            assert_eq!(view.custom_shortcut_input.read(cx).value(), "");
+            assert_eq!(view.custom_application_input.read(cx).value(), "");
+            assert!(!view.custom_shortcut_invalid);
+            assert!(!view.custom_application_invalid);
         });
         drop(view);
         cx.update(|window, _| window.remove_window());

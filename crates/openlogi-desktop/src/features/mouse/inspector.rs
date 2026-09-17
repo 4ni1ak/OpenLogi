@@ -656,6 +656,9 @@ fn selection_card(
                 search.update(cx, |search, cx| search.set_value("", window, cx));
             }
             toggle.update(cx, |view, cx| {
+                if opening {
+                    view.clear_custom_action_drafts(window, cx);
+                }
                 view.toggle_action_picker();
                 cx.notify();
             });
@@ -673,11 +676,13 @@ fn action_library(
 ) -> impl IntoElement {
     let query = action_search.read(cx).value();
     let rows = action_rows_matching(id_prefix, current, &query, on_pick, pal);
-    let (shortcut_input, application_input) = {
-        let view = view.read(cx);
+    let (shortcut_input, application_input, shortcut_invalid, application_invalid) = {
+        let view_ref = view.read(cx);
         (
-            view.custom_shortcut_input.clone(),
-            view.custom_application_input.clone(),
+            view_ref.custom_shortcut_input.clone(),
+            view_ref.custom_application_input.clone(),
+            view_ref.custom_shortcut_invalid,
+            view_ref.custom_application_invalid,
         )
     };
     v_flex()
@@ -686,12 +691,16 @@ fn action_library(
         .child(custom_shortcut_editor(
             id_prefix,
             &shortcut_input,
+            shortcut_invalid,
+            view,
             on_pick,
             pal,
         ))
         .child(custom_application_editor(
             id_prefix,
             &application_input,
+            application_invalid,
+            view,
             on_pick,
             pal,
         ))
@@ -719,11 +728,14 @@ fn action_library(
 fn custom_shortcut_editor(
     id_prefix: &'static str,
     input: &Entity<InputState>,
+    invalid: bool,
+    view: &Entity<MouseModelView>,
     on_pick: &PickFn,
     pal: Palette,
 ) -> impl IntoElement {
     let submit_input = input.clone();
     let on_pick = on_pick.clone();
+    let view = view.clone();
     v_flex()
         .gap_1()
         .child(editor_section(tr!("action_ring.custom_shortcut"), pal))
@@ -742,13 +754,24 @@ fn custom_shortcut_editor(
                         .label(tr!("common.add"))
                         .on_click(move |_, window, cx| {
                             let shortcut = submit_input.read(cx).value().to_string();
-                            if let Ok(combo) = shortcut.parse::<openlogi_core::binding::KeyCombo>()
-                            {
-                                (on_pick)(Action::CustomShortcut(combo), window, cx);
+                            match shortcut.parse::<openlogi_core::binding::KeyCombo>() {
+                                Ok(combo) => (on_pick)(Action::CustomShortcut(combo), window, cx),
+                                Err(_) => view.update(cx, |view, cx| {
+                                    view.custom_shortcut_invalid = true;
+                                    cx.notify();
+                                }),
                             }
                         }),
                 ),
         )
+        .when(invalid, |editor| {
+            editor.child(
+                div()
+                    .text_caption()
+                    .text_color(rgb(0x00ef_4444))
+                    .child(tr!("action_ring.custom_action_invalid_input")),
+            )
+        })
 }
 
 /// A single-field "Open Application or Folder" editor, matching the Action
@@ -756,11 +779,14 @@ fn custom_shortcut_editor(
 fn custom_application_editor(
     id_prefix: &'static str,
     input: &Entity<InputState>,
+    invalid: bool,
+    view: &Entity<MouseModelView>,
     on_pick: &PickFn,
     pal: Palette,
 ) -> impl IntoElement {
     let submit_input = input.clone();
     let on_pick = on_pick.clone();
+    let view = view.clone();
     v_flex()
         .gap_1()
         .child(editor_section(
@@ -782,14 +808,26 @@ fn custom_application_editor(
                         .label(tr!("common.add"))
                         .on_click(move |_, window, cx| {
                             let path = submit_input.read(cx).value().to_string();
-                            if let Ok(target) =
-                                openlogi_core::binding::ApplicationTarget::new(path, "")
-                            {
-                                (on_pick)(Action::OpenApplication(target), window, cx);
+                            match openlogi_core::binding::ApplicationTarget::new(path, "") {
+                                Ok(target) => {
+                                    (on_pick)(Action::OpenApplication(target), window, cx);
+                                }
+                                Err(_) => view.update(cx, |view, cx| {
+                                    view.custom_application_invalid = true;
+                                    cx.notify();
+                                }),
                             }
                         }),
                 ),
         )
+        .when(invalid, |editor| {
+            editor.child(
+                div()
+                    .text_caption()
+                    .text_color(rgb(0x00ef_4444))
+                    .child(tr!("action_ring.custom_action_invalid_input")),
+            )
+        })
 }
 
 fn gesture_action(
