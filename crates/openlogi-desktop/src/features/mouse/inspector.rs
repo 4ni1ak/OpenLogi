@@ -232,6 +232,7 @@ fn button_inspector(
                 "inspector-action",
                 Some(&action),
                 picker.search,
+                picker.view,
                 &on_pick,
                 pal,
                 cx,
@@ -285,6 +286,7 @@ fn inherited_gesture_inspector(
                 "inspector-gesture-override",
                 None,
                 picker.search,
+                picker.view,
                 &on_pick,
                 pal,
                 cx,
@@ -348,6 +350,7 @@ fn gesture_inspector(
                 "inspector-gesture-action",
                 Some(&current),
                 picker.search,
+                picker.view,
                 &on_pick,
                 pal,
                 cx,
@@ -663,15 +666,35 @@ fn action_library(
     id_prefix: &'static str,
     current: Option<&Action>,
     action_search: &Entity<InputState>,
+    view: &Entity<MouseModelView>,
     on_pick: &PickFn,
     pal: Palette,
     cx: &Context<MouseModelView>,
 ) -> impl IntoElement {
     let query = action_search.read(cx).value();
     let rows = action_rows_matching(id_prefix, current, &query, on_pick, pal);
+    let (shortcut_input, application_input) = {
+        let view = view.read(cx);
+        (
+            view.custom_shortcut_input.clone(),
+            view.custom_application_input.clone(),
+        )
+    };
     v_flex()
         .gap_2()
         .pt_1()
+        .child(custom_shortcut_editor(
+            id_prefix,
+            &shortcut_input,
+            on_pick,
+            pal,
+        ))
+        .child(custom_application_editor(
+            id_prefix,
+            &application_input,
+            on_pick,
+            pal,
+        ))
         .child(editor_section(tr!("actions.actions"), pal))
         .child(control_input(action_search).cleanable(true))
         .child(
@@ -687,6 +710,85 @@ fn action_library(
                     )
                 })
                 .children(rows),
+        )
+}
+
+/// A single-field "Custom Shortcut" editor, matching the Action Ring editor's
+/// `shortcut_editor` (`features/action_ring/editor.rs`) so the same custom
+/// action is reachable from the plain per-button picker, not just the ring.
+fn custom_shortcut_editor(
+    id_prefix: &'static str,
+    input: &Entity<InputState>,
+    on_pick: &PickFn,
+    pal: Palette,
+) -> impl IntoElement {
+    let submit_input = input.clone();
+    let on_pick = on_pick.clone();
+    v_flex()
+        .gap_1()
+        .child(editor_section(tr!("action_ring.custom_shortcut"), pal))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(control_input(input).cleanable(true)),
+                )
+                .child(
+                    Button::new(format!("{id_prefix}-custom-shortcut-add"))
+                        .compact()
+                        .label(tr!("common.add"))
+                        .on_click(move |_, window, cx| {
+                            let shortcut = submit_input.read(cx).value().to_string();
+                            if let Ok(combo) = shortcut.parse::<openlogi_core::binding::KeyCombo>()
+                            {
+                                (on_pick)(Action::CustomShortcut(combo), window, cx);
+                            }
+                        }),
+                ),
+        )
+}
+
+/// A single-field "Open Application or Folder" editor, matching the Action
+/// Ring editor's `path_editor`.
+fn custom_application_editor(
+    id_prefix: &'static str,
+    input: &Entity<InputState>,
+    on_pick: &PickFn,
+    pal: Palette,
+) -> impl IntoElement {
+    let submit_input = input.clone();
+    let on_pick = on_pick.clone();
+    v_flex()
+        .gap_1()
+        .child(editor_section(
+            tr!("action_ring.open_application_or_folder"),
+            pal,
+        ))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(control_input(input).cleanable(true)),
+                )
+                .child(
+                    Button::new(format!("{id_prefix}-custom-application-add"))
+                        .compact()
+                        .label(tr!("common.add"))
+                        .on_click(move |_, window, cx| {
+                            let path = submit_input.read(cx).value().to_string();
+                            if let Ok(target) =
+                                openlogi_core::binding::ApplicationTarget::new(path, "")
+                            {
+                                (on_pick)(Action::OpenApplication(target), window, cx);
+                            }
+                        }),
+                ),
         )
 }
 

@@ -132,6 +132,8 @@ pub struct MouseModelView {
     gesture_active_dir: Option<GestureDirection>,
     action_picker_open: bool,
     action_search: Entity<InputState>,
+    pub(super) custom_shortcut_input: Entity<InputState>,
+    pub(super) custom_application_input: Entity<InputState>,
     _state_obs: Subscription,
 }
 
@@ -146,6 +148,14 @@ impl MouseModelView {
             }
         })
         .detach();
+        let custom_shortcut_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(tr!("action_ring.shortcut_e_g_cmd_plus_shift_plus_p"))
+        });
+        let custom_application_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(tr!("action_ring.application_folder_path_or_url"))
+        });
         let state = AppState::global(cx);
         let state_obs = cx.subscribe(&state, |_view, _, event: &StateEvent, cx| {
             let relevant = match event {
@@ -171,6 +181,8 @@ impl MouseModelView {
             gesture_active_dir: None,
             action_picker_open: false,
             action_search,
+            custom_shortcut_input,
+            custom_application_input,
             _state_obs: state_obs,
         }
     }
@@ -232,14 +244,34 @@ fn set_control_hovered(
     });
 }
 
-impl Render for MouseModelView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl MouseModelView {
+    /// Re-stamp every action-picker input's placeholder after a language
+    /// switch, split out of `render` to keep it under clippy's line budget.
+    fn localize_action_picker_inputs(&self, window: &mut Window, cx: &mut Context<Self>) {
         crate::ui::components::localize_placeholder(
             &self.action_search,
             tr!("actions.search_actions"),
             window,
             cx,
         );
+        crate::ui::components::localize_placeholder(
+            &self.custom_shortcut_input,
+            tr!("action_ring.shortcut_e_g_cmd_plus_shift_plus_p"),
+            window,
+            cx,
+        );
+        crate::ui::components::localize_placeholder(
+            &self.custom_application_input,
+            tr!("action_ring.application_folder_path_or_url"),
+            window,
+            cx,
+        );
+    }
+}
+
+impl Render for MouseModelView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.localize_action_picker_inputs(window, cx);
         let (empty_bindings, empty_gesture_maps) = (BTreeMap::new(), BTreeMap::new());
         let MouseWorkspaceData {
             device_key,
