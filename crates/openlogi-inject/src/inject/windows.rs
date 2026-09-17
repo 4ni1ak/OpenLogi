@@ -164,32 +164,60 @@ fn lock_workstation() {
     }
 }
 
+/// Serializes the enable-suspend-disable sequence in [`sleep_system`] so two
+/// concurrent Sleep requests cannot interleave their privilege toggles (e.g.
+/// one disabling the shared process-wide privilege while the other's
+/// `SetSuspendState` call still needs it enabled).
+static SLEEP_LOCK: Mutex<()> = Mutex::new(());
+
 /// Suspend the system via `SetSuspendState`. Unlike `LockWorkStation`, this
 /// needs the `SeShutdownPrivilege` privilege enabled on the process token
 /// first — every process has the privilege available but disabled by
-/// default, per the standard Win32 shutdown-privilege dance.
+/// default, per the standard Win32 shutdown-privilege dance. The privilege is
+/// disabled again afterward (success or failure): it is a process-wide
+/// attribute of the token, not scoped to this call, so leaving it enabled
+/// would grant every later line of code in this long-running agent process
+/// authority it never asked for.
 ///
 /// `bHibernate = FALSE` requests sleep (S3), not hibernation, but Windows may
 /// still hibernate anyway under Hybrid Sleep — the same caveat applies to the
 /// Start menu's own Sleep button, so it isn't treated as a failure here.
 fn sleep_system() {
-    if !enable_shutdown_privilege() {
+    let _guard = SLEEP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let Some(token) = open_process_token() else {
+        tracing::warn!("could not open process token — Sleep skipped");
+        return;
+    };
+    if !adjust_shutdown_privilege(token, SE_PRIVILEGE_ENABLED) {
         tracing::warn!("could not enable SeShutdownPrivilege — Sleep skipped");
+        // SAFETY: `token` was successfully opened by `open_process_token`.
+        unsafe {
+            CloseHandle(token);
+        }
         return;
     }
+
     // SAFETY: no pointers involved; `bforce = false` and
     // `bwakeupeventsdisabled = false` request a normal, wake-capable suspend.
     if !unsafe { SetSuspendState(false, false, false) } {
         tracing::warn!("SetSuspendState failed");
     }
+
+    if !adjust_shutdown_privilege(token, 0) {
+        tracing::warn!("could not disable SeShutdownPrivilege after Sleep");
+    }
+    // SAFETY: `token` was successfully opened by `open_process_token`.
+    unsafe {
+        CloseHandle(token);
+    }
 }
 
-/// Enable `SeShutdownPrivilege` on the current process token, following the
-/// standard Win32 pattern: open the token for query+adjust, look up the
-/// privilege's LUID, then flip it on. `false` on any step's failure.
-fn enable_shutdown_privilege() -> bool {
-    let privilege_name: Vec<u16> = "SeShutdownPrivilege\0".encode_utf16().collect();
-
+/// Open the current process token for privilege query+adjust. `None` on
+/// failure.
+fn open_process_token() -> Option<HANDLE> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no closing;
     // `token` is a valid out-pointer for `OpenProcessToken` to fill in.
@@ -200,9 +228,15 @@ fn enable_shutdown_privilege() -> bool {
             &raw mut token,
         )
     };
-    if opened == 0 {
-        return false;
-    }
+    (opened != 0).then_some(token)
+}
+
+/// Set `SeShutdownPrivilege`'s attributes on `token` — `SE_PRIVILEGE_ENABLED`
+/// to enable it, `0` to disable it — following the standard Win32 pattern:
+/// look up the privilege's LUID, then apply `attributes`. `false` on any
+/// step's failure. Does not close `token`; the caller owns its lifetime.
+fn adjust_shutdown_privilege(token: HANDLE, attributes: u32) -> bool {
+    let privilege_name: Vec<u16> = "SeShutdownPrivilege\0".encode_utf16().collect();
 
     let mut luid = LUID {
         LowPart: 0,
@@ -213,10 +247,6 @@ fn enable_shutdown_privilege() -> bool {
     let looked_up =
         unsafe { LookupPrivilegeValueW(std::ptr::null(), privilege_name.as_ptr(), &raw mut luid) };
     if looked_up == 0 {
-        // SAFETY: `token` was successfully opened above.
-        unsafe {
-            CloseHandle(token);
-        }
         return false;
     }
 
@@ -224,12 +254,12 @@ fn enable_shutdown_privilege() -> bool {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
+            Attributes: attributes,
         }],
     };
-    // SAFETY: `token` is a valid, adjustable handle; `privileges` describes
-    // exactly one entry, matching `PrivilegeCount`; the remaining pointers
-    // are documented as optional and null here.
+    // SAFETY: `token` is a valid, adjustable handle owned by the caller;
+    // `privileges` describes exactly one entry, matching `PrivilegeCount`;
+    // the remaining pointers are documented as optional and null here.
     let adjusted = unsafe {
         AdjustTokenPrivileges(
             token,
@@ -240,16 +270,12 @@ fn enable_shutdown_privilege() -> bool {
             std::ptr::null_mut(),
         )
     };
-    // `AdjustTokenPrivileges` returns nonzero even when it silently enabled
-    // none of the requested privileges — `GetLastError` is the only way to
-    // tell, per its own documentation. Read it immediately: any further call,
-    // including `CloseHandle` below, can overwrite the thread's last error.
-    let fully_enabled = std::io::Error::last_os_error().raw_os_error() == Some(0);
-    // SAFETY: `token` was successfully opened above.
-    unsafe {
-        CloseHandle(token);
-    }
-    adjusted != 0 && fully_enabled
+    // `AdjustTokenPrivileges` returns nonzero even when it silently applied
+    // none of the requested changes — `GetLastError` is the only way to
+    // tell, per its own documentation. Read it immediately: any further call
+    // can overwrite the thread's last error.
+    let fully_applied = std::io::Error::last_os_error().raw_os_error() == Some(0);
+    adjusted != 0 && fully_applied
 }
 
 fn dispatch_media(key: MediaKey) {
