@@ -133,8 +133,9 @@ fn dispatch_native(native: NativeAction) {
         NativeAction::NextDesktop => next_desktop(),
         NativeAction::ShowDesktop => show_desktop(),
         NativeAction::LaunchpadShow => launchpad(),
-        // Lock screen = Cmd+Ctrl+Q (kVK_ANSI_Q = 0x0C)
-        NativeAction::LockScreen => post_key(0x0C, cmd | ctrl),
+        // Lock screen = Cmd+Ctrl+Q, matched by character rather than key
+        // position — see `post_key_for_char`.
+        NativeAction::LockScreen => post_key_for_char('q', cmd | ctrl),
         // Screenshot = Cmd+Shift+3 (kVK_ANSI_3 = 0x14)
         NativeAction::Screenshot => post_key(0x14, cmd | shift),
         // Capture region to clipboard = Cmd+Shift+Ctrl+4 (kVK_ANSI_4 = 0x15)
@@ -279,6 +280,34 @@ fn post_unicode(text: &str) {
             continue;
         };
         let s = ch.to_string();
+        ev.set_string(&s);
+        ev.post(CGEventTapLocation::HID);
+    }
+}
+
+/// Post a key-down + key-up pair identified by the character it must
+/// produce, with `flags` set, rather than a positional virtual keycode.
+///
+/// Some macOS shortcuts (Lock Screen's Ctrl+Cmd+Q) are matched by the
+/// resolved character, not the physical key position — unlike, say,
+/// Screenshot's Cmd+Shift+3, which macOS binds to the digit row's physical
+/// position regardless of layout. A hardcoded ANSI/QWERTY virtual keycode
+/// for the former produces the wrong character on other layouts (AZERTY's
+/// `kVK_ANSI_Q` position types `A`; see #1430). Keycode 0 is a placeholder,
+/// like [`post_unicode`]'s: `CGEventKeyboardSetUnicodeString` overrides the
+/// character macOS resolves for the event, independent of the active layout.
+fn post_key_for_char(ch: char, flags: CGEventFlags) {
+    let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        tracing::warn!("CGEventSource::new failed for post_key_for_char");
+        return;
+    };
+    let s = ch.to_string();
+    for down in [true, false] {
+        let Ok(ev) = CGEvent::new_keyboard_event(src.clone(), 0, down) else {
+            tracing::warn!("CGEvent::new_keyboard_event failed in post_key_for_char");
+            continue;
+        };
+        ev.set_flags(flags);
         ev.set_string(&s);
         ev.post(CGEventTapLocation::HID);
     }
