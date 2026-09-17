@@ -373,10 +373,15 @@ fn gesture_directions(
                     let selected = direction == active;
                     let action = gesture_action(gesture_map, button, direction);
                     let view = view.clone();
+                    let aria_label = format!(
+                        "{}: {}",
+                        tr!(direction.translation_key()),
+                        localized_action_label(&action)
+                    );
                     MenuRow::new(("inspector-direction", index))
                         .selected(selected)
                         .role(Role::Button)
-                        .aria_label(tr!(direction.translation_key()))
+                        .aria_label(aria_label)
                         .child(
                             h_flex()
                                 .min_w_0()
