@@ -387,7 +387,9 @@ async fn run_capture_session_on(
         .await
         .ok()
         .flatten()
-        .map(|info| WirelessDeviceStatusFeature::new(Arc::clone(&chan), device_index, info.index));
+        .map(|info| {
+            WirelessDeviceStatusFeature::new_secondary(Arc::clone(&chan), device_index, info.index)
+        });
     log_capture_active(device_index, &armed, wireless.is_some());
     let stop = monitor_capture(
         CaptureMonitor {
@@ -765,7 +767,11 @@ async fn arm_controls_into(
         .await
         .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?
     {
-        let rc = ReprogControlsV4::new(Arc::clone(chan), slot, info.index);
+        // `new_secondary`, matching `device`'s own construction above: this
+        // control-table walk (`getCount`/`getCidInfo`) must not share a
+        // correlation key with a concurrent inventory probe on the same
+        // shared channel — see #1128.
+        let rc = ReprogControlsV4::new_secondary(Arc::clone(chan), slot, info.index);
         let controls = enumerate_controls(&rc).await?;
         // Register an accessor before the first divert, so a failure on any
         // divert (including the first) can become a restore capability.
@@ -831,7 +837,8 @@ async fn arm_controls_into(
             .await
             .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?
     {
-        let tw = Thumbwheel::new(Arc::clone(chan), slot, info.index);
+        // `new_secondary`, same reasoning as the reprog-controls walk above.
+        let tw = Thumbwheel::new_secondary(Arc::clone(chan), slot, info.index);
         // Consume the getInfo error here, before the next await: Hidpp20Error
         // isn't Send, so holding it across an await would make this future
         // (spawned on tokio) non-Send.
