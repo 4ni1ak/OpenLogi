@@ -136,12 +136,19 @@ fn dispatch_native(native: NativeAction) {
         // Lock screen = Cmd+Ctrl+Q, matched by character rather than key
         // position — see `post_key_for_char`.
         NativeAction::LockScreen => post_key_for_char('q', cmd | ctrl),
-        // Screenshot = Cmd+Shift+3, Capture region to clipboard =
-        // Cmd+Shift+Ctrl+4 — matched by character rather than key position,
-        // same reasoning as `LockScreen` above: `kVK_ANSI_3`/`kVK_ANSI_4`
-        // only type '3'/'4' on a US-QWERTY layout (#1242).
-        NativeAction::Screenshot => post_key_for_char('3', cmd | shift),
-        NativeAction::CaptureRegion => post_key_for_char('4', cmd | shift | ctrl),
+        // Screenshot = Cmd+Shift+3 (kVK_ANSI_3 = 0x14). Unlike LockScreen,
+        // this is a physical digit-row binding: both shortcuts already hold
+        // Shift, and a digit row's physical position produces the same digit
+        // under Shift on AZERTY as on ANSI/QWERTY (only the unshifted
+        // character differs). Matching by character instead risks the
+        // opposite failure on layouts where posting keycode 0 with a Unicode
+        // override doesn't reach the OS's symbolic-hotkey handler at all —
+        // reverted per review on #1464; #1242 needs real diagnostic evidence
+        // (the reporter's own CGEventTap trace, as LockScreen's #1430 had),
+        // not a same-shape guess.
+        NativeAction::Screenshot => post_key(0x14, cmd | shift),
+        // Capture region to clipboard = Cmd+Shift+Ctrl+4 (kVK_ANSI_4 = 0x15)
+        NativeAction::CaptureRegion => post_key(0x15, cmd | shift | ctrl),
         // Sleep has no CGEvent equivalent (the WindowServer ignores a
         // synthesised power key), so ask powermanagement directly. `pmset
         // sleepnow` works for the console user without privileges.
@@ -290,12 +297,16 @@ fn post_unicode(text: &str) {
 /// Post a key-down + key-up pair identified by the character it must
 /// produce, with `flags` set, rather than a positional virtual keycode.
 ///
-/// macOS's Lock Screen (Ctrl+Cmd+Q) and screenshot shortcuts (Cmd+Shift+3,
-/// Cmd+Shift+Ctrl+4) are all matched by the resolved character, not the
-/// physical key position — a hardcoded ANSI/QWERTY virtual keycode produces
-/// the wrong character on other layouts (AZERTY's `kVK_ANSI_Q` position types
-/// `A`, and its digit row is shifted a key over from ANSI's; see #1430 and
-/// #1242). Keycode 0 is a placeholder,
+/// Some macOS shortcuts (Lock Screen's Ctrl+Cmd+Q) are matched by the
+/// resolved character, not the physical key position — a hardcoded
+/// ANSI/QWERTY virtual keycode produces the wrong character on other layouts
+/// (AZERTY's `kVK_ANSI_Q` position types `A`; see #1430, confirmed by the
+/// reporter's own CGEventTap trace). The screenshot shortcuts (Cmd+Shift+3,
+/// Cmd+Shift+Ctrl+4) stay on [`post_key`]'s fixed keycode: both already hold
+/// Shift, and a digit row's physical position produces the same digit under
+/// Shift on AZERTY as on ANSI/QWERTY, so this helper is not a safe drop-in
+/// for every shortcut without the same kind of direct evidence. Keycode 0 is
+/// a placeholder,
 /// like [`post_unicode`]'s: `CGEventKeyboardSetUnicodeString` overrides the
 /// character macOS resolves for the event, independent of the active layout.
 fn post_key_for_char(ch: char, flags: CGEventFlags) {
