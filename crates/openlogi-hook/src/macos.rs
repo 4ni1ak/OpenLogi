@@ -6,9 +6,11 @@
 
 mod foreground;
 mod sender;
+mod senderless_button;
 mod translate;
 mod watchdog;
 
+use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -34,6 +36,7 @@ use crate::{
 pub use foreground::ForegroundApplicationObserver;
 use foreground::observe_frontmost_application;
 pub(crate) use foreground::{frontmost_safari_pid, watch_frontmost_application_activations};
+use senderless_button::SenderlessButtonResolver;
 use translate::{translate, translate_key};
 use watchdog::{
     CallbackActivity, LifecycleDecision, LifecycleExitReason, LifecycleObservation,
@@ -314,10 +317,11 @@ fn run_tap_callback(
     cb: &dyn Fn(HookEvent) -> EventDisposition,
     etype: CGEventType,
     event: &CGEvent,
+    resolver: &mut SenderlessButtonResolver,
 ) -> CallbackResult {
     let result = catch_unwind(AssertUnwindSafe(|| {
         // Mouse first, then keyboard; a given event type is one or the other.
-        let hook_event = if let Some(mouse_event) = translate(etype, event) {
+        let hook_event = if let Some(mouse_event) = translate(etype, event, resolver) {
             HookEvent::Mouse(mouse_event)
         } else if let Some(key_event) = translate_key(etype, event) {
             HookEvent::Key(key_event)
@@ -541,6 +545,7 @@ fn thread_main(
     // Latched by the callback when the OS disables the tap, consumed by the
     // run-loop slice that decides whether to re-arm it.
     let tap_disabled = Arc::new(AtomicBool::new(false));
+    let senderless_button_resolver = RefCell::new(SenderlessButtonResolver::new());
 
     let tap_result = {
         let callback_signals = Arc::clone(&signals);
@@ -557,9 +562,18 @@ fn thread_main(
                     CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
                 ) {
                     tap_disabled.store(true, Ordering::Release);
+                    // The gap while the tap is disabled can drop button-up
+                    // events this resolver never sees, so a cached
+                    // attribution from before the gap must not survive it.
+                    senderless_button_resolver.borrow_mut().cancel_all();
                 }
                 callback_activity.enter(callback_signals.now_millis());
-                let disposition = run_tap_callback(cb.as_ref(), etype, event);
+                let disposition = run_tap_callback(
+                    cb.as_ref(),
+                    etype,
+                    event,
+                    &mut senderless_button_resolver.borrow_mut(),
+                );
                 callback_activity.exit();
                 disposition
             },
@@ -716,12 +730,14 @@ mod tests {
         let source = CGEventSource::new(CGEventSourceStateID::Private)
             .expect("CGEventSourceCreate must succeed");
         let event = CGEvent::new(source).expect("CGEventCreate must succeed");
+        let mut resolver = SenderlessButtonResolver::unavailable();
 
         assert!(matches!(
             run_tap_callback(
                 &|_| EventDisposition::Suppress,
                 CGEventType::MouseMoved,
-                &event
+                &event,
+                &mut resolver,
             ),
             CallbackResult::Drop
         ));
@@ -729,7 +745,8 @@ mod tests {
             run_tap_callback(
                 &|_| panic!("test callback panic"),
                 CGEventType::MouseMoved,
-                &event
+                &event,
+                &mut resolver,
             ),
             CallbackResult::Keep
         ));
