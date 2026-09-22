@@ -1,10 +1,10 @@
 //! Updates settings page.
 
 use super::{
-    App, AppState, Button, Disableable, Entity, FontWeight, IconName, InteractiveElement as _,
-    ParentElement, RELEASES_URL, SettingField, SettingGroup, SettingItem, SettingPage, Sizable,
-    StatefulInteractiveElement as _, Styled, Tag, UpdateStatus, Updater, div, h_flex, img, px,
-    v_flex,
+    App, AppState, Button, ButtonVariants, Disableable, Entity, FontWeight, IconName,
+    InteractiveElement as _, ParentElement, RELEASES_URL, SettingField, SettingGroup, SettingItem,
+    SettingPage, Sizable, StatefulInteractiveElement as _, Styled, Tag, UpdateStatus, Updater, div,
+    h_flex, img, px, v_flex,
 };
 use crate::platform::installation::{HomebrewCask, Installation, InstallationSource, LinuxPackage};
 use crate::ui::theme::Typography as _;
@@ -344,17 +344,24 @@ fn release_link(cx: &App) -> Link {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use std::{cell::Cell, rc::Rc};
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use gpui::{
         AppContext as _, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ScrollDelta,
         ScrollWheelEvent, TestAppContext, VisualTestContext, point,
     };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use openlogi_core::config::{Config, UiScale};
 
     use super::*;
-    use crate::services::{assets::AssetResolver, i18n::LOCALE_LOCK};
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    use crate::services::assets::AssetResolver;
+    use crate::services::i18n::LOCALE_LOCK;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use crate::state::Sources;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use crate::windows::settings::{SettingsPage, SettingsView};
 
     #[test]
@@ -401,6 +408,11 @@ mod tests {
         rust_i18n::set_locale("en");
     }
 
+    // Exercises the managed-updates page, which only renders where
+    // `IN_APP_UPDATES` is true (macOS, Windows) — on Linux `updates_page`
+    // always returns `unmanaged_updates_page`, and `update-source-link`
+    // never renders.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[gpui::test]
     fn installation_completion_refreshes_open_settings(cx: &mut TestAppContext) {
         let _locale = LOCALE_LOCK.lock().unwrap();
@@ -477,6 +489,7 @@ mod tests {
         rust_i18n::set_locale("en");
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn assert_source_geometry(visual: &mut VisualTestContext) {
         let value = visual.debug_bounds("installation-source-value").unwrap();
         let link = visual.debug_bounds("update-source-link").unwrap();
@@ -518,6 +531,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn assert_release_link_activation(visual: &mut VisualTestContext) {
         let link = visual.debug_bounds("update-source-link").unwrap();
         assert_eq!(visual.opened_url(), None);
