@@ -343,7 +343,7 @@ mod tests {
 // it must compile and run there too.
 #[cfg(test)]
 mod cargo_target_path_tests {
-    use super::is_cargo_target_path;
+    use super::{Profile, agent_socket_path_for, config_dir_for, is_cargo_target_path};
 
     // `/`-separated paths only: `std::path::Path` parses separators for the
     // *compiling* target, so a literal `C:\...` string only splits into
