@@ -484,6 +484,36 @@ fn m650_index() -> Index {
     index_of("signature_m650", m650_l_depot_entry())
 }
 
+#[test]
+fn cached_m650_assets_keep_each_devices_firmware_name() {
+    let root = tempfile::tempdir().expect("create asset root");
+    let depot = root.path().join("signature_m650");
+    std::fs::create_dir_all(&depot).unwrap();
+    std::fs::write(
+        depot.join("metadata.json"),
+        r#"{"images":[{"key":"device_image","origin":{"width":100,"height":200}}]}"#,
+    )
+    .unwrap();
+    std::fs::write(depot.join("front.png"), png_header(100, 200)).unwrap();
+    let resolver = resolver_over(&[root.path()], Some(m650_index()));
+    let model = m650_plain_model();
+
+    // Resolve without a firmware name first, then reuse the same cached
+    // artwork for both names. Neither a cache hit nor a previous device may
+    // decide the next device's display name.
+    for (codename, expected) in [
+        (None, "Signature M650 L"),
+        (Some("Signature M650 Mouse"), "Signature M650"),
+        (Some("Signature M650 L"), "Signature M650 L"),
+        (Some("Signature M650 Mouse"), "Signature M650"),
+    ] {
+        let asset = resolver.resolve(&model, codename).expect("resolve M650");
+        assert_eq!(asset.display_name, expected);
+        assert_eq!(asset.image_path, depot.join("front.png"));
+    }
+    assert_eq!(resolver.resolved.borrow().len(), 1, "artwork stays shared");
+}
+
 /// #1332: a plain Signature M650 shares the M650 *L* depot's `modelId`
 /// (`2b02a`), so `resolve_in_index` matches it by pid regardless of
 /// variant. Without the firmware's own name, the GUI would show "Signature

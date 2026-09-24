@@ -565,7 +565,7 @@ const GENERIC_CODENAME_SUFFIXES: [&str; 3] = ["mouse", "keyboard", "trackball"];
 
 /// Trailing catalog words that are known hand/SKU *qualifiers* rather than
 /// part of the model's own generation name — issue #1332's "Signature M650
-/// **L**" (left-handed). [`variant_display_name`] only strips a trailing
+/// **L**" (large). [`variant_display_name`] only strips a trailing
 /// catalog word when it is in this list: an unlisted trailing word (`"3S"`,
 /// `"X"`, `"2S"`, …) is a real part of the model name — e.g. codename "MX
 /// Master" vs. catalog "MX Master 3S" — and must be kept (issue #1366).
