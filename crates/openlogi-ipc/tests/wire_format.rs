@@ -40,9 +40,9 @@ use openlogi_core::device::{
 };
 use openlogi_core::hid::{
     BacklightMode, BacklightState, BacklightStatus, Click, DeviceRoute, Dpi, DpiCapabilities,
-    DpiInfo, HidppFeatureErrorKind, HidppOperation, LightCommand, PasskeyMethod, ReceiverSelector,
-    ScrollReportingTarget, ScrollWheelMode, SmartShiftAutoDisengage, SmartShiftMode,
-    SmartShiftStatus, SmartShiftThreshold, TunableTorque, WriteError,
+    DpiInfo, FnLockState, HidppFeatureErrorKind, HidppOperation, LightCommand, PasskeyMethod,
+    ReceiverSelector, ScrollReportingTarget, ScrollWheelMode, SmartShiftAutoDisengage,
+    SmartShiftMode, SmartShiftStatus, SmartShiftThreshold, TunableTorque, WriteError,
 };
 use openlogi_ipc::{
     ActionRingCommandError, ActionRingInvocation, ActionRingPresentation, AgentRequest,
@@ -102,7 +102,7 @@ fn representative_smartshift_status() -> SmartShiftStatus {
 /// that makes that visible in the same diff.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 31);
+    assert_eq!(PROTOCOL_VERSION, 32);
 }
 
 #[test]
@@ -229,6 +229,25 @@ fn semantic_read_requests() {
         },
         "1b0008463030444341464501",
     );
+    assert_wire(
+        &AgentRequest::ReadFnLock {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+        },
+        "1c0008463030444341464501",
+    );
+    assert_wire(
+        &AgentRequest::SetFnLock {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+            fn_lock: true,
+        },
+        "1d000846303044434146450101",
+    );
 }
 
 /// The agent identity is frozen: a helper from any build has to be able to
@@ -279,7 +298,9 @@ fn action_ring_types() {
     );
     assert_wire(&ActionRingCommandError::SessionNotFound, "00");
     assert_wire(&ActionRingCommandError::SlotEmpty, "01");
+    assert_wire(&HidppOperation::WriteFnLock, "0c");
     assert_wire(&HidppOperation::PlayHaptic, "0e");
+    assert_wire(&HidppOperation::ReadFnLock, "0f");
 }
 
 #[test]
@@ -439,12 +460,13 @@ fn device_inventory() {
                 haptic_feedback: true,
                 haptic_panel: true,
                 dpi_gestures: true,
+                fn_lock: false,
             }),
         }],
     }];
     assert_wire(
         &inventory,
-        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b000010150020001030106323134304c5a0102030400010100fb34b0fb8240000b01010100000101010101",
+        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b000010150020001030106323134304c5a0102030400010100fb34b0fb8240000b0101010000010101010100",
     );
 }
 
@@ -577,6 +599,12 @@ fn semantic_read_payloads() {
         nb_levels: 8,
     });
     assert_wire(&backlight, "000101020408");
+
+    let fn_lock: Result<FnLockState, WriteError> = Ok(FnLockState {
+        fn_lock: true,
+        default_fn_lock: false,
+    });
+    assert_wire(&fn_lock, "000100");
 }
 
 #[test]

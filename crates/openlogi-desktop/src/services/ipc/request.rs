@@ -18,7 +18,8 @@ use std::future::Future;
 
 use openlogi_core::config::Lighting;
 use openlogi_core::hid::{
-    DeviceRoute, Dpi, DpiInfo, LightCommand, ReceiverSelector, SmartShiftStatus, WriteError,
+    DeviceRoute, Dpi, DpiInfo, FnLockState, LightCommand, ReceiverSelector, SmartShiftStatus,
+    WriteError,
 };
 use openlogi_ipc::{AgentClient, ConfigReloadError, PairingCommandError, PairingFailure};
 use tarpc::client::RpcError;
@@ -138,6 +139,31 @@ impl Request for SetLighting {
 
     fn deliver(self, outcome: Result<Self::Answer, Unavailable>, _: &UpdateSender) {
         log_rejection("lighting", outcome);
+    }
+}
+
+/// Write keyboard Fn-lock now, answered as [`GuiUpdate::FnLockWritten`] with
+/// the state the keyboard echoes back.
+pub struct SetFnLock {
+    pub route: DeviceRoute,
+    pub fn_lock: bool,
+    pub key: DeviceKey,
+}
+
+impl Request for SetFnLock {
+    type Answer = Result<FnLockState, WriteError>;
+
+    async fn call(&self, client: &AgentClient) -> Result<Self::Answer, RpcError> {
+        client
+            .set_fn_lock(context::current(), self.route.clone(), self.fn_lock)
+            .await
+    }
+
+    fn deliver(self, outcome: Result<Self::Answer, Unavailable>, updates: &UpdateSender) {
+        let _ = updates.send(GuiUpdate::FnLockWritten {
+            key: self.key,
+            result: or_unavailable(outcome),
+        });
     }
 }
 
@@ -263,6 +289,26 @@ impl Request for ReadSmartShift {
     async fn call(&self, client: &AgentClient) -> Result<Self::Answer, RpcError> {
         client
             .read_smartshift(context::current(), self.route.clone())
+            .await
+    }
+
+    fn deliver(self, outcome: Result<Self::Answer, Unavailable>, _: &UpdateSender) {
+        let _ = self.reply.send(or_unavailable(outcome));
+    }
+}
+
+/// Read a keyboard's Fn-lock state; the answer goes back over `reply`.
+pub struct ReadFnLock {
+    pub route: DeviceRoute,
+    pub reply: oneshot::Sender<Result<FnLockState, WriteError>>,
+}
+
+impl Request for ReadFnLock {
+    type Answer = Result<FnLockState, WriteError>;
+
+    async fn call(&self, client: &AgentClient) -> Result<Self::Answer, RpcError> {
+        client
+            .read_fn_lock(context::current(), self.route.clone())
             .await
     }
 
@@ -447,8 +493,10 @@ commands! {
     SetLight,
     SetLightManualPower,
     SetSmartShift,
+    SetFnLock,
     ReadDpi,
     ReadSmartShift,
+    ReadFnLock,
     ReloadConfig,
     RequestAccessibilityPrompt,
     StartPairing,
