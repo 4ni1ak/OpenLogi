@@ -65,15 +65,29 @@ impl AppState {
             .map(|key| self.config.dpi_presets(key))
             .unwrap_or_default()
     }
-    /// The active device's known DPI, falling back to [`DEFAULT_DPI`] until its
-    /// capability read completes. Used to seed the pointer editor on a device switch.
+    /// The active device's known DPI: the live capability read once it
+    /// completes, else the persisted config value, else [`DEFAULT_DPI`] for a
+    /// device with neither yet. Used to seed the pointer editor on a device
+    /// switch — without the config fallback, a device with a real configured
+    /// DPI briefly (or, if the read never completes, indefinitely) showed the
+    /// unrelated hardcoded default instead of the value the user actually set.
     #[must_use]
     pub(crate) fn dpi_for_current(&self) -> Dpi {
-        self.current_record()
-            .and_then(|record| self.pointer.reads.dpi_load(&record.device_key()))
+        let Some(record) = self.current_record() else {
+            return DEFAULT_DPI;
+        };
+        self.pointer
+            .reads
+            .dpi_load(&record.device_key())
             .and_then(|status| match status {
                 DpiLoad::Ready(info) => Some(info.current),
                 _ => None,
+            })
+            .or_else(|| {
+                record
+                    .persistent_config_key()
+                    .and_then(|key| self.config.devices.get(key))
+                    .and_then(|device| device.effective_dpi(&record.route_key))
             })
             .unwrap_or(DEFAULT_DPI)
     }
