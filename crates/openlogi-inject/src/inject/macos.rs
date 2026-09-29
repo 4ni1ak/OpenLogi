@@ -315,7 +315,8 @@ pub(super) fn type_text(text: &str) {
 /// Press a key chord described by a `KeyCombo` modifier bitmask + virtual
 /// keycode. Used by the workflow sequencer's `PressKey` step.
 pub(super) fn press_combo(combo: &KeyCombo) {
-    let Some(vk) = key_for(combo.key(), combo.has_command()) else {
+    // Super is Command on macOS, so it selects a layout's Command layer too.
+    let Some(vk) = key_for(combo.key(), combo.has_command() || combo.has_super()) else {
         tracing::warn!(
             usage = combo.key().code(),
             "shortcut usage has no macOS mapping"
@@ -426,7 +427,7 @@ fn held_modifier_flags(modifiers: HeldModifiers) -> CGEventFlags {
 
 fn combo_flags(combo: &KeyCombo) -> CGEventFlags {
     let mut flags = CGEventFlags::CGEventFlagNull;
-    if combo.has_command() {
+    if combo.has_command() || combo.has_super() {
         flags |= CGEventFlags::CGEventFlagCommand;
     }
     if combo.has_shift() {

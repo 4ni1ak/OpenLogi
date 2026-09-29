@@ -10,7 +10,8 @@ const MOD_COMMAND: u8 = 1 << 0;
 const MOD_SHIFT: u8 = 1 << 1;
 const MOD_CONTROL: u8 = 1 << 2;
 const MOD_OPTION: u8 = 1 << 3;
-const ALL_MODIFIERS: u8 = MOD_COMMAND | MOD_SHIFT | MOD_CONTROL | MOD_OPTION;
+const MOD_SUPER: u8 = 1 << 4;
+const ALL_MODIFIERS: u8 = MOD_COMMAND | MOD_SHIFT | MOD_CONTROL | MOD_OPTION | MOD_SUPER;
 
 /// USB HID keyboard usage supported by custom shortcuts.
 ///
@@ -193,7 +194,8 @@ impl KeyCombo {
         self.key
     }
 
-    /// Whether the chord includes Command/Meta (the cross-platform primary modifier).
+    /// Whether the chord includes Command, the cross-platform primary modifier:
+    /// Command on macOS, Control on Linux and Windows.
     #[must_use]
     pub const fn has_command(&self) -> bool {
         self.modifiers & MOD_COMMAND != 0
@@ -217,12 +219,23 @@ impl KeyCombo {
         self.modifiers & MOD_OPTION != 0
     }
 
+    /// Whether the chord includes the logo key, written `Super`, `Win`, or
+    /// `Meta`: Command on macOS, the Windows key, `KEY_LEFTMETA` on Linux.
+    /// Unlike [`Self::has_command`], it never becomes Control.
+    #[must_use]
+    pub const fn has_super(&self) -> bool {
+        self.modifiers & MOD_SUPER != 0
+    }
+
     /// Canonical user-facing chord label.
     #[must_use]
     pub fn rendered_label(&self) -> String {
         let mut parts = Vec::new();
         if self.has_command() {
             parts.push("Cmd".to_string());
+        }
+        if self.has_super() {
+            parts.push("Super".to_string());
         }
         if self.has_control() {
             parts.push("Ctrl".to_string());
@@ -292,7 +305,8 @@ impl FromStr for KeyCombo {
 
 fn parse_modifier(token: &str) -> Option<u8> {
     match token.to_ascii_lowercase().as_str() {
-        "cmd" | "command" | "meta" | "win" => Some(MOD_COMMAND),
+        "cmd" | "command" => Some(MOD_COMMAND),
+        "super" | "win" | "meta" => Some(MOD_SUPER),
         "shift" => Some(MOD_SHIFT),
         "ctrl" | "control" => Some(MOD_CONTROL),
         "alt" | "option" => Some(MOD_OPTION),
@@ -365,6 +379,31 @@ mod tests {
         for fixed in ["F5", "Left", "Enter", "Escape", "Tab"] {
             assert_eq!(key(fixed).ascii_char(), None, "{fixed}");
         }
+    }
+
+    #[test]
+    fn parses_super_as_its_own_modifier() {
+        let combo = "Super+End"
+            .parse::<KeyCombo>()
+            .expect("valid shortcut failed");
+        assert!(combo.has_super());
+        assert!(!combo.has_command());
+        assert_eq!(combo.key().code(), 0x4d);
+        assert_eq!(combo.rendered_label(), "Super+End");
+
+        // `Win` and `Meta` name the same logo key (#893), not Command.
+        for token in ["Win", "Meta"] {
+            let combo = format!("{token}+L")
+                .parse::<KeyCombo>()
+                .expect("valid shortcut failed");
+            assert!(combo.has_super(), "{token}");
+            assert!(!combo.has_command(), "{token}");
+        }
+
+        let combo = "Super+Shift+Right"
+            .parse::<KeyCombo>()
+            .expect("valid shortcut failed");
+        assert_eq!(combo.rendered_label(), "Super+Shift+Right");
     }
 
     #[test]
