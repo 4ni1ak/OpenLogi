@@ -5,6 +5,7 @@
 )]
 
 mod foreground;
+mod grant;
 pub(crate) mod pointer;
 mod sender;
 mod translate;
@@ -35,6 +36,7 @@ use crate::{
 pub use foreground::ForegroundApplicationObserver;
 use foreground::observe_frontmost_application;
 pub(crate) use foreground::{frontmost_safari_pid, watch_frontmost_application_activations};
+use grant::{ProbeCue, can_filter_events};
 use translate::{translate, translate_key};
 use watchdog::{
     CALLBACK_POLL_INTERVAL, CallbackActivity, CallbackWatchdog, LIFECYCLE_POLL_INTERVAL,
@@ -67,23 +69,6 @@ unsafe extern "C" {
     // expose the state read used to budget re-arms.
     fn CGEventTapEnable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
     fn CGEventTapIsEnabled(tap: core_foundation::mach_port::CFMachPortRef) -> bool;
-}
-
-/// Can this process create an *active* (event-filtering) tap right now?
-///
-/// The probe mirrors the real tap's location, placement and options — that is
-/// the capability being tested — but subscribes to `kCGEventNull`, an event
-/// type nothing ever posts, so it cannot gate a single real event during the
-/// microseconds it exists. Dropping it invalidates the port.
-fn can_filter_events() -> bool {
-    CGEventTap::new(
-        CGEventTapLocation::HID,
-        CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::Default,
-        vec![CGEventType::Null],
-        |_proxy: CGEventTapProxy, _etype: CGEventType, _event: &CGEvent| CallbackResult::Keep,
-    )
-    .is_ok()
 }
 
 const FREEZE_HAZARD_EXIT_CODE: i32 = 78;
@@ -183,8 +168,8 @@ impl HookBackend for Backend {
     /// had been revoked, would keep re-arming a tap macOS no longer lets it
     /// service, and would wedge clicks machine-wide until reboot (#674). Only
     /// creating a filtering tap tracks the live grant, so both are consulted: the
-    /// trust read short-circuits the probe for a process that was never granted,
-    /// which keeps a denied agent from asking `WindowServer` twice a second.
+    /// trust read short-circuits the probe for a process that was never granted.
+    /// While the tap is live, [`ProbeCue`] decides when this runs at all.
     fn has_accessibility() -> bool {
         // SAFETY: takes no arguments and only reads the current trust state — the
         // non-prompting counterpart of `AXIsProcessTrustedWithOptions`.
@@ -516,10 +501,16 @@ fn spawn_lifecycle_watchdog(
 
 /// Service the tap until it has to be released: an explicit stop, a stopped run
 /// loop, a revoked permission, or a tap the OS will not keep enabled.
-fn service_tap(tap: &CGEventTap<'_>, signals: &WatchdogSignals, tap_disabled: &AtomicBool) {
+fn service_tap(
+    tap: &CGEventTap<'_>,
+    signals: &WatchdogSignals,
+    tap_disabled: &AtomicBool,
+    probe: &ProbeCue,
+) {
     // Service the tap in short slices instead of an unbounded
-    // `run_current()`. Between slices we re-check that we may still filter
-    // events: an active tap at the HID location that outlives its permission
+    // `run_current()`. Between slices, when the grant watch cues it, we
+    // re-check that we may still filter events: an active tap at the HID
+    // location that outlives its permission
     // wedges the *entire* system input stream — mouse and keyboard alike —
     // until reboot. If the user revokes access while we're live, tear the tap
     // down right here, on the tap's own thread, so input is restored even
@@ -552,9 +543,10 @@ fn service_tap(tap: &CGEventTap<'_>, signals: &WatchdogSignals, tap_disabled: &A
         // tap servicing. Publish that so the lifecycle watchdog judges it
         // against `TAP_PROBE_BUDGET`: around a sleep transition these calls
         // have been measured at ~1.6 s, and charging them to the 1.5 s stall
-        // budget force-exited a perfectly healthy agent (#952).
+        // budget force-exited a perfectly healthy agent (#952). The capability
+        // probe itself runs only when the cue says the grant may have changed.
         signals.set_phase(TapPhase::Probing);
-        if !Backend::has_accessibility() {
+        if probe.take() && !Backend::has_accessibility() {
             warn!(
                 "Accessibility revoked while the event tap was live — \
                  disabling the tap to avoid wedging system input"
@@ -680,7 +672,10 @@ fn thread_main(
         return;
     }
 
-    service_tap(&tap, &signals, &tap_disabled);
+    // Armed on the tap thread and dropped with it, so the grant watch's
+    // observers go away when the tap does.
+    let probe = ProbeCue::arm();
+    service_tap(&tap, &signals, &tap_disabled, &probe);
 
     // Detach the tap from the event stream synchronously before unwinding,
     // so input recovers immediately rather than whenever CF happens to

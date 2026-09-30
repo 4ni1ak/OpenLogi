@@ -29,6 +29,7 @@ ctrlc = "3"
 # CGEventTap stays on core-graphics/core-foundation (the freeze-hazard run-loop
 # machinery). The frontmost-app read uses objc2 (NSWorkspace) so no raw `objc`.
 [target.'cfg(target_os = "macos")'.dependencies]
+axwatch = { workspace = true }
 block2 = { workspace = true }
 core-graphics = { workspace = true }
 core-foundation = { workspace = true }

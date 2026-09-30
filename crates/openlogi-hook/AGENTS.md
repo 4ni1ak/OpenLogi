@@ -20,6 +20,14 @@ crate's own load-bearing behavior.
   (`CGEventTapCreate` → NULL when the grant is gone); keep both, in that order — the
   trust read is the cheap short-circuit, the probe is the truth. Never probe with
   `ListenOnly`: that asks about Input Monitoring, a different grant.
+- The live tap probes on cue, not every slice. `grant::ProbeCue` owns an `axwatch`
+  watch — the `com.apple.accessibility.api` distributed notification plus tccd's
+  `com.apple.tcc.access.changed` Darwin notification, the only one that fires when the
+  row is *removed* — and a `PROBE_HEARTBEAT` backstop; each probe is a WindowServer
+  round trip that stalls for seconds around a sleep transition (#952). Keep the
+  heartbeat: the notifications are freshness, not a completeness proof, and the probe
+  stays the authority. Delivery needs the agent's main-thread `NSApplication` loop,
+  which `run_app_loop` starts once the core arms.
 - Re-enabling the tap each slice is idempotent and recovers a disable the OS never
   reported. Charge `RearmBudget` from both `TapDisabledBy*` and
   `CGEventTapIsEnabled`: a tap the system keeps disabling must be let go instead of

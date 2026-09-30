@@ -56,7 +56,12 @@ in-tree FFI for it. Likewise, installed-application discovery and icon
 rendering for per-app profiles live in the external
 [`appcatalog`](https://crates.io/crates/appcatalog) crate (`NSWorkspace` +
 `NSBitmapImageRep` there, not here); `openlogi-desktop/src/platform/app_icon.rs`
-only wraps its PNG bytes into a `gpui::Image`.
+only wraps its PNG bytes into a `gpui::Image`. The privacy-grant change
+notifications — the `com.apple.accessibility.api` distributed notification and
+tccd's `com.apple.tcc.access.changed` Darwin notification — are observed by the
+external [`axwatch`](https://crates.io/crates/axwatch) crate
+(`CFNotificationCenter` there, not here); `openlogi-hook`'s `grant::ProbeCue`
+and `openlogi-agent-core`'s grant watchers only consume its wakes.
 
 The rest of `openlogi-desktop/src/platform/` (`updater.rs`, on `gpui_updater`)
 carries **no** ObjC FFI — don't add any. Neither do `openlogi-core`'s

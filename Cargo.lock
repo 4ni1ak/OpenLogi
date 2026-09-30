@@ -632,6 +632,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "axwatch"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c875b8dd9b4f1745127e7af2c829093f2e5cbe3e98875535cbfcd92aca84e306"
+dependencies = [
+ "objc2-application-services",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "az"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5563,6 +5573,7 @@ dependencies = [
 name = "openlogi-agent-core"
 version = "0.8.9"
 dependencies = [
+ "axwatch",
  "futures-lite",
  "openlogi-core",
  "openlogi-fixture",
@@ -5811,6 +5822,7 @@ dependencies = [
 name = "openlogi-hook"
 version = "0.8.9"
 dependencies = [
+ "axwatch",
  "block2 0.6.2",
  "core-foundation 0.10.0",
  "core-graphics 0.25.0",
