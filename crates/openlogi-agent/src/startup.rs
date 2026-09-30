@@ -271,6 +271,10 @@ pub(crate) fn spawn_state_watchers(
         .chain(stream::iter([WatcherEvent::Lost(source)]))
         .boxed()
     }
+    /// The longest a privacy grant goes unread when macOS posts no
+    /// notification for it. Every edit measured so far posts one, so this
+    /// bounds a lost notification, not the status latency clients see.
+    const GRANT_HEARTBEAT: Duration = Duration::from_secs(5);
     let inventory = watchers::inventory::spawn_with_hardware(
         shared.hardware(),
         shared.channel_registry.clone(),
@@ -304,12 +308,12 @@ pub(crate) fn spawn_state_watchers(
         .chain(stream::iter([WatcherEvent::Lost(Watcher::Pointer)]))
         .boxed(),
         tagged(
-            watchers::accessibility::spawn(Duration::from_millis(1200)),
+            watchers::accessibility::spawn(GRANT_HEARTBEAT),
             Watcher::Accessibility,
             WatcherEvent::Accessibility,
         ),
         tagged(
-            watchers::input_monitoring::spawn(Duration::from_millis(1200)),
+            watchers::input_monitoring::spawn(GRANT_HEARTBEAT),
             Watcher::InputMonitoring,
             WatcherEvent::InputMonitoring,
         ),
