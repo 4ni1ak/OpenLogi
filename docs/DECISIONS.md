@@ -4,6 +4,34 @@ Durable "why we did it this way" records that are not obvious from the code.
 Add a dated entry when a non-obvious architectural or dependency decision is
 made or revisited.
 
+## 2026-09: Grant probes run on notification, with a heartbeat backstop
+
+The hook re-checked the Accessibility grant between every 500 ms run-loop
+slice — `AXIsProcessTrusted` plus a throwaway `CGEventTapCreate` — and the
+agent polled both privacy grants every 1.2 s for the GUI. Each probe is a
+WindowServer round trip that takes seconds around a sleep transition, which is
+where the probe-budget work (#952, #1282) came from. macOS posts two
+undocumented notifications when the list is edited, and the
+[`axwatch`](https://crates.io/crates/axwatch) crate observes both. Measured
+against tccd's event log on macOS 26: adding a row, switching it off and
+switching it on post both; removing the row posts only the Darwin one.
+
+- **Probe on cue.** `grant::ProbeCue` raises a flag from the watch's handler,
+  and the tap thread probes only on a raised flag; the two agent-core grant
+  watchers read on the same wakes. Detection latency for an announced edit is
+  unchanged (one slice); an unannounced one is bounded by the heartbeat.
+- **Keep the heartbeat and the probe.** The notifications are undocumented, and
+  a missing run loop, a code-signing rule or a future macOS can swallow them;
+  the reconciled probe remains the authority, at 5 s instead of 500 ms. A watch
+  that cannot start falls back to the old cadence with a warning, never
+  silently.
+- **Rejected: `AXIsProcessTrusted` alone on wake.** It stays `true` after the
+  row is removed — the very edit only the Darwin notification announces — so
+  the read cannot replace the probe.
+- **Not changed: `TAP_PROBE_BUDGET`.** Rarer probes make a collision with a
+  sleep transition rarer, not impossible; shrinking the budget waits for a
+  measured revoke→teardown on hardware.
+
 ## 2026-09: A crash respawn re-arms by login session, not by exit code
 
 With `launch_at_login` off, the macOS dormancy gate read every launchd start as
