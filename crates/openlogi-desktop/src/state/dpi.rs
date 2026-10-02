@@ -76,20 +76,12 @@ impl AppState {
         let Some(record) = self.current_record() else {
             return DEFAULT_DPI;
         };
-        self.pointer
-            .reads
-            .dpi_load(&record.device_key())
-            .and_then(|status| match status {
-                DpiLoad::Ready(info) => Some(info.current),
-                _ => None,
-            })
-            .or_else(|| {
-                record
-                    .persistent_config_key()
-                    .and_then(|key| self.config.devices.get(key))
-                    .and_then(|device| device.effective_dpi(&record.route_key))
-            })
-            .unwrap_or(DEFAULT_DPI)
+        let live = self.pointer.reads.dpi_load(&record.device_key());
+        let configured = record
+            .persistent_config_key()
+            .and_then(|key| self.config.devices.get(key))
+            .and_then(|device| device.effective_dpi(&record.route_key));
+        resolve_dpi(live, configured)
     }
     /// Seed the active panel from the latest query. Query flights fence
     /// disconnected routes; this selected-device check prevents an old
@@ -173,4 +165,18 @@ impl AppState {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+/// [`AppState::dpi_for_current`]'s decision, as a pure function of the two
+/// facts it resolves between: the live capability read and the persisted
+/// config value. The live read always wins once it lands — the point of
+/// reading it at all is to show the sensor's real value, not the user's
+/// request, which a firmware that clamps or rejects it may not have honored.
+#[must_use]
+pub(super) fn resolve_dpi(live: Option<&DpiLoad>, configured: Option<Dpi>) -> Dpi {
+    let from_live = live.and_then(|status| match status {
+        DpiLoad::Ready(info) => Some(info.current),
+        _ => None,
+    });
+    from_live.or(configured).unwrap_or(DEFAULT_DPI)
 }
