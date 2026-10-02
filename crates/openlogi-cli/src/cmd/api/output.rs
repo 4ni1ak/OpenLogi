@@ -12,6 +12,8 @@ use crate::agent::CallFailure;
 pub(super) struct ApiError {
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistence: Option<&'static str>,
 }
 
 impl ApiError {
@@ -19,7 +21,13 @@ impl ApiError {
         Self {
             code,
             message: message.into(),
+            persistence: None,
         }
+    }
+
+    pub(super) fn after_write(mut self, persistence: &'static str) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 }
 

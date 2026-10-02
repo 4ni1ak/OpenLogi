@@ -16,8 +16,7 @@ pub mod snapshot;
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Versioned JSON automation through the running agent (no hardware fallback).
-    #[command(subcommand)]
-    Api(api::ApiCommand),
+    Api(api::ApiArgs),
     /// List connected Logitech HID++ devices.
     List(list::ListArgs),
     /// Read or persistently set the keyboard backlight (HID++ 0x1982).

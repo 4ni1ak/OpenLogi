@@ -14,6 +14,8 @@ use openlogi_ipc::{AgentRequest, AgentResponse, AgentStatus, ForegroundApps, Inv
 
 use super::*;
 
+mod persistence;
+
 type Step = Box<dyn FnOnce(AgentRequest) -> AgentResponse + Send>;
 
 fn snapshot() -> AgentSnapshot {
@@ -64,6 +66,15 @@ fn route() -> DeviceRoute {
 }
 
 async fn run_script(snapshot: AgentSnapshot, command: ApiCommand, steps: Vec<Step>) -> Value {
+    run_script_at(snapshot, command, steps, None).await
+}
+
+async fn run_script_at(
+    snapshot: AgentSnapshot,
+    command: ApiCommand,
+    steps: Vec<Step>,
+    path: Option<&Path>,
+) -> Value {
     let mut queue: VecDeque<Step> = VecDeque::new();
     queue.push_back(Box::new(move |request| {
         assert!(matches!(request, AgentRequest::Snapshot {}));
@@ -80,7 +91,7 @@ async fn run_script(snapshot: AgentSnapshot, command: ApiCommand, steps: Vec<Ste
         },
         pending(),
     );
-    let result = envelope(execute(&client, command).await);
+    let result = envelope(execute(&client, command, path).await);
     assert!(
         queue.lock().unwrap().is_empty(),
         "expected RPC was not sent"

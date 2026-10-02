@@ -2,11 +2,12 @@
 
 use std::io::{self, Write as _};
 use std::num::NonZeroU8;
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
-use openlogi_core::hid::{Dpi, SmartShiftMode, WriteError};
+use openlogi_core::hid::{DeviceRoute, Dpi, SmartShiftMode, WriteError};
 use openlogi_ipc::{AgentClient, AgentSnapshot};
 use serde_json::{Value, json};
 use tarpc::context;
@@ -14,16 +15,29 @@ use tarpc::context;
 use crate::agent;
 
 mod output;
+mod persistence;
 use output::{ApiError, devices, envelope, inventory_health, select_device};
+use persistence::Save;
 
-/// Machine-readable commands. Writes affect live hardware, never saved configuration.
+/// Options shared by the JSON automation commands.
+#[derive(Debug, Args)]
+pub struct ApiArgs {
+    /// Save an explicit setting change and ask the agent to reload configuration.
+    #[arg(long, global = true)]
+    save: bool,
+    /// The operation to execute.
+    #[command(subcommand)]
+    command: ApiCommand,
+}
+
+/// Machine-readable commands. Writes affect live hardware; saving is opt-in.
 #[derive(Debug, Subcommand)]
 pub enum ApiCommand {
     /// Read agent health without enumerating hardware in this process.
     Status,
     /// List agent-known devices, opaque IDs, battery and measured capabilities.
     Devices,
-    /// Read DPI, or set it immediately without saving configuration.
+    /// Read DPI, or set it immediately (add --save to persist).
     Dpi {
         /// Exact opaque ID returned by `api devices`; names are not accepted.
         #[arg(long)]
@@ -32,9 +46,9 @@ pub enum ApiCommand {
         #[arg(long)]
         set: Option<u16>,
     },
-    /// Read SmartShift, or change selected fields immediately without saving.
+    /// Read SmartShift, or change selected fields (add --save to persist).
     Smartshift(SmartshiftArgs),
-    /// Read Fn lock, or set it immediately without saving configuration.
+    /// Read Fn lock, or set it immediately (add --save to persist).
     FnLock {
         /// Exact opaque ID returned by `api devices`.
         #[arg(long)]
@@ -87,9 +101,18 @@ pub enum Switch {
 }
 
 /// Emit one JSON envelope and a matching process status, including runtime failures.
-pub async fn run(command: ApiCommand) -> Result<ExitCode> {
+pub async fn run(args: ApiArgs) -> Result<ExitCode> {
     let result = match agent::connect().await {
-        Ok(client) => execute(&client, command).await,
+        Ok(client) => {
+            let path = args
+                .save
+                .then(openlogi_core::paths::config_path)
+                .transpose();
+            match path {
+                Ok(path) => execute(&client, args.command, path.as_deref()).await,
+                Err(error) => Err(ApiError::new("config_error", error.to_string())),
+            }
+        }
         Err(error) => Err(ApiError::from(error)),
     };
     let success = result.is_ok();
@@ -103,11 +126,18 @@ pub async fn run(command: ApiCommand) -> Result<ExitCode> {
     })
 }
 
-async fn execute(client: &AgentClient, command: ApiCommand) -> Result<Value, ApiError> {
+async fn execute(
+    client: &AgentClient,
+    command: ApiCommand,
+    path: Option<&Path>,
+) -> Result<Value, ApiError> {
     // Preserve typed transport failures for the JSON boundary; the human-facing
     // agent::snapshot helper intentionally turns them into prose.
     let snapshot = agent::call(client.snapshot(context::current())).await?;
-    match command {
+    let mut save = path
+        .map(|path| Save::prepare(path, &snapshot, &command))
+        .transpose()?;
+    let mut result = match command {
         ApiCommand::Status => Ok(json!({
             "agent_version": snapshot.status.agent_version,
             "inventory": inventory_health(snapshot.status.inventory),
@@ -121,13 +151,24 @@ async fn execute(client: &AgentClient, command: ApiCommand) -> Result<Value, Api
             "inventory": inventory_health(snapshot.status.inventory),
             "devices": devices(&snapshot),
         })),
-        ApiCommand::Dpi { device, set } => dpi(client, &snapshot, &device, set).await,
-        ApiCommand::Smartshift(args) => smartshift(client, &snapshot, &args).await,
+        ApiCommand::Dpi { device, set } => {
+            dpi(
+                client,
+                select_device(&snapshot, &device)?,
+                set,
+                save.as_mut(),
+            )
+            .await
+        }
+        ApiCommand::Smartshift(args) => smartshift(client, &snapshot, &args, save.as_mut()).await,
         ApiCommand::FnLock { device, set } => {
             let route = select_device(&snapshot, &device)?;
             let state = match set {
                 Some(set) => {
                     let requested = matches!(set, Switch::On);
+                    if let Some(save) = save.as_mut() {
+                        save.fn_lock(requested);
+                    }
                     let observed =
                         agent::call(client.set_fn_lock(context::current(), route, requested))
                             .await??;
@@ -150,16 +191,21 @@ async fn execute(client: &AgentClient, command: ApiCommand) -> Result<Value, Api
                 "default_fn_lock": state.default_fn_lock,
             }))
         }
+    }?;
+    if let Some(save) = save {
+        save.commit(client).await?;
+        result["persistence"] = json!("saved");
     }
+    Ok(result)
 }
 
 async fn dpi(
     client: &AgentClient,
-    snapshot: &AgentSnapshot,
-    device: &str,
+    route: DeviceRoute,
     set: Option<u16>,
+    save: Option<&mut Save>,
 ) -> Result<Value, ApiError> {
-    let route = select_device(snapshot, device)?;
+    let device = route.to_string();
     let mut info = agent::call(client.read_dpi(context::current(), route.clone())).await??;
     if let Some(value) = set {
         let requested = Dpi::from(value);
@@ -168,6 +214,9 @@ async fn dpi(
                 "invalid_value",
                 "DPI is not in the device-reported supported values",
             ));
+        }
+        if let Some(save) = save {
+            save.dpi(requested);
         }
         agent::call(client.set_dpi(context::current(), route.clone(), requested)).await??;
         info = agent::call(client.read_dpi(context::current(), route)).await??;
@@ -190,6 +239,7 @@ async fn smartshift(
     client: &AgentClient,
     snapshot: &AgentSnapshot,
     args: &SmartshiftArgs,
+    save: Option<&mut Save>,
 ) -> Result<Value, ApiError> {
     let route = select_device(snapshot, &args.device)?;
     let mut state =
@@ -200,6 +250,9 @@ async fn smartshift(
         }
         if let Some(auto_disengage) = args.auto_disengage {
             state.auto_disengage = auto_disengage.into();
+        }
+        if let Some(save) = save {
+            save.smartshift(state)?;
         }
         agent::call(client.set_smartshift(context::current(), route.clone(), state)).await??;
         let observed = agent::call(client.read_smartshift(context::current(), route)).await??;

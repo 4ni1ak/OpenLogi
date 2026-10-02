@@ -30,6 +30,7 @@ openlogi api devices
 # Copy an exact, non-null id from api devices; quote it as one argument.
 openlogi api dpi --device "$DEVICE_ID"
 openlogi api dpi --device "$DEVICE_ID" --set 1200
+openlogi api dpi --device "$DEVICE_ID" --set 1200 --save
 openlogi api smartshift --device "$DEVICE_ID"
 openlogi api smartshift --device "$DEVICE_ID" --mode free
 openlogi api smartshift --device "$DEVICE_ID" --mode ratchet --auto-disengage 255
@@ -88,13 +89,36 @@ Not every readable setting has an inventory flag; a setting read can return
 descriptor and null battery. Cameras are not part of this agent inventory API.
 The response excludes pairing passkeys, application history, and model serials.
 
-### Immediate control, not saved preferences
+### Immediate control and saved preferences
 
-All three setting commands read only unless a setting flag is supplied. Writes
-return `persistence: "not_saved"`: they **do not modify `config.toml`** or request
-a config reload. Saved preferences may be reapplied on reconnect, wake, or later
-configuration changes; device firmware may itself retain some values. Use the
-desktop app for saved preferences. There is no `--save` or profile-switch API yet.
+All three setting commands read only unless a setting flag is supplied. Without
+`--save`, writes return `persistence: "not_saved"`: they do not modify
+`config.toml` or request a config reload. Saved preferences may be reapplied on
+reconnect, wake, or later configuration changes; firmware may retain some values.
+
+Add `--save` to an explicit DPI, SmartShift, or Fn-lock change to save the verified
+setting and request an agent config reload. Success returns `persistence: "saved"`.
+The device must have a probed physical identity. Existing legacy configuration
+entries are respected; CLI route IDs are never used directly as config keys.
+Saving edits only the selected setting, preserving unrelated preferences and
+comments. A per-link override of that setting is refused with `link_override`
+rather than silently saving a default that the override would supersede.
+There is no profile-switch API yet.
+
+Hardware writes, file persistence, and reload are separate steps, not an atomic
+transaction. The config revision is checked under a writer lock; concurrent edits
+are not overwritten. A lock conflict is reported immediately, without waiting.
+The persistent `config.toml.lock` sidecar must not be deleted while writers run.
+External editors that do not honor this lock can still race with a save.
+
+If saving fails after verified hardware readback, the JSON error includes
+`persistence: "not_saved"` with `config_conflict`, `config_busy`, or
+`config_save_failed`. The live hardware has already changed; no rollback or
+automatic retry is attempted. If saving succeeds but reload fails, the error
+includes `persistence: "saved"`: `config_reload_failed` means rejection;
+`config_reload_unknown` means timeout/disconnection with an unknown reload
+outcome. Neither is reported as success. Other errors occur before persistence;
+hardware outcomes after a failed write/readback may still be uncertain.
 
 DPI must be in the device-reported supported list; values are never silently
 rounded. SmartShift preserves unspecified fields, including wheel torque.
@@ -102,6 +126,8 @@ rounded. SmartShift preserves unspecified fields, including wheel torque.
 ratchet, and 0 is rejected. `--mode ratchet` alone does not disable automatic
 release: use `--auto-disengage 255` as well. Fn lock `on` means bare function keys
 send F1–F12; `off` means the printed media functions.
+With `--save`, SmartShift must use the configuration-supported range 8–255;
+this also validates a threshold retained from the device when only mode changes.
 
 DPI and SmartShift are read back after writes; Fn lock returns the firmware
 echo. Reads and writes are not a transaction against simultaneous GUI changes.
@@ -111,7 +137,9 @@ be uncertain: read the setting again rather than blindly retrying the write.
 Stable error codes: `agent_unavailable`, `handshake_failed`, `version_mismatch`,
 `timeout`, `disconnected`, `inventory_not_ready`, `device_not_found`,
 `device_offline`, `ambiguous_device`, `unsupported_feature`, `invalid_value`,
-`readback_mismatch`, and `device_error`. A protocol mismatch requires matching
+`readback_mismatch`, `device_error`, `identity_unavailable`, `link_override`,
+`config_error`, `config_conflict`, `config_busy`, `config_save_failed`,
+`config_reload_failed`, and `config_reload_unknown`. A protocol mismatch requires matching
 OpenLogi CLI and agent builds; it never triggers direct-hardware fallback.
 
 ## Asset synchronization
