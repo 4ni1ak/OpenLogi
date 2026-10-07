@@ -326,6 +326,11 @@ pub(crate) async fn open_ring(
             display_id: None,
             window_background: WindowBackgroundAppearance::Transparent,
             app_id: Some("openlogi-action-ring".to_string()),
+            // See the host's own `window_decorations` above: an anchored
+            // popup has no titlebar to decorate either way, but requesting
+            // client-side directly skips the fallback-from-server-side log
+            // some compositors (KWin) emit on every request otherwise.
+            window_decorations: Some(gpui::WindowDecorations::Client),
             ..WindowOptions::default()
         },
         (None, Some(placement)) => placement.window_options(),
@@ -480,6 +485,12 @@ async fn linux_wayland_ring_host(
             display_id: None,
             window_background: WindowBackgroundAppearance::Transparent,
             app_id: Some("openlogi-action-ring-host".to_string()),
+            // `None` requests server-side decorations; a layer-shell surface
+            // never gets any (it has no titlebar to begin with), but some
+            // compositors (KWin) still log a fallback-to-client-side notice
+            // for every request they can't honor. Ask for client-side
+            // directly so the invisible host never does.
+            window_decorations: Some(gpui::WindowDecorations::Client),
             ..WindowOptions::default()
         };
         cx.open_window(options, |_, cx| {
