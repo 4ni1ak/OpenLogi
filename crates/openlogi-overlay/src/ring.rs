@@ -7,9 +7,14 @@
 use gpui::{
     AppContext as _, Bounds, Context, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels,
     Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div,
     prelude::FluentBuilder as _, px, svg,
 };
+// Only the Linux/Wayland layer-shell host and its (cfg(test)-only) unit
+// tests build cursor points by hand; every other platform goes through
+// `platform::RingPlacement`, which returns bounds already built.
+#[cfg(any(not(target_os = "windows"), test))]
+use gpui::point;
 use openlogi_core::binding::{Action, ActionRingSlot};
 use openlogi_ipc::ActionRingInvocation;
 use openlogi_ui::action_icons::RING_CANCEL_ICON;
