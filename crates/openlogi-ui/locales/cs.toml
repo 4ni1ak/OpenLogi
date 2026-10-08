@@ -443,7 +443,7 @@ view_changelog = "Zobrazit přehled změn"
 update_connection_policy = "OpenLogi se připojuje kvůli kontrole aktualizací jen při povolených automatických kontrolách nebo po zvolení možnosti Zkontrolovat aktualizace."
 stable_channel = "Stabilní kanál"
 check_for_updates_consent_title = "Kontrolovat aktualizace?"
-update_consent_description = "OpenLogi může při každém spuštění jednou zkontrolovat novou verzi na GitHubu. Aktualizace nestahuje automaticky a neodesílá telemetrii. Volbu můžete změnit v nastavení."
+update_consent_description = "OpenLogi může při každém spuštění jednou zkontrolovat novou verzi na %{host}. Aktualizace nestahuje automaticky a neodesílá telemetrii. Volbu můžete změnit v nastavení."
 
 [assets]
 assets = "Podklady"
