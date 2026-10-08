@@ -25,27 +25,63 @@ const MANIFEST_URL: &str = match option_env!("OPENLOGI_UPDATE_MANIFEST_URL") {
     None => "https://updates.openlogi.org/channels/stable/latest.json",
 };
 
-/// The host update checks ask for a new version, parsed from [`MANIFEST_URL`]
-/// rather than hardcoded — so the consent dialog names where the traffic
-/// actually goes even on a build with `OPENLOGI_UPDATE_MANIFEST_URL` set to an
-/// alternate mirror, instead of always claiming `updates.openlogi.org`.
-#[must_use]
-pub(crate) fn manifest_host() -> &'static str {
-    MANIFEST_URL
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or(MANIFEST_URL)
+/// Host of the compiled update manifest URL, without credentials or path data.
+pub(crate) fn manifest_host() -> Result<String, url::ParseError> {
+    manifest_host_from_url(MANIFEST_URL)
+}
+
+fn manifest_host_from_url(manifest_url: &str) -> Result<String, url::ParseError> {
+    let url = url::Url::parse(manifest_url)?;
+    url.host_str()
+        .map(str::to_owned)
+        .ok_or(url::ParseError::EmptyHost)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::manifest_host;
+    use super::manifest_host_from_url;
 
     #[test]
-    fn manifest_host_is_the_bare_domain() {
-        // The default MANIFEST_URL compiled into a non-release build.
-        assert_eq!(manifest_host(), "updates.openlogi.org");
+    fn manifest_host_excludes_credentials_paths_and_queries() {
+        for (manifest_url, host) in [
+            (
+                "https://updates.openlogi.org/channels/stable/latest.json",
+                "updates.openlogi.org",
+            ),
+            (
+                "https://mirror.example.org/channels/stable/latest.json",
+                "mirror.example.org",
+            ),
+            (
+                "https://user:secret@mirror.example.org:8443/latest.json?token=private#fragment",
+                "mirror.example.org",
+            ),
+            (
+                "https://mirror.example.org?token=private#fragment",
+                "mirror.example.org",
+            ),
+            ("https://[2001:db8::1]:8443/latest.json", "[2001:db8::1]"),
+        ] {
+            assert_eq!(manifest_host_from_url(manifest_url).unwrap(), host);
+        }
+    }
+
+    #[test]
+    fn manifest_host_rejects_invalid_or_hostless_urls() {
+        assert_eq!(
+            manifest_host_from_url("not a URL").unwrap_err(),
+            url::ParseError::RelativeUrlWithoutBase
+        );
+        for manifest_url in [
+            "https://",
+            "file:///latest.json",
+            "mailto:updates@example.org",
+        ] {
+            assert_eq!(
+                manifest_host_from_url(manifest_url).unwrap_err(),
+                url::ParseError::EmptyHost
+            );
+        }
     }
 }
 
