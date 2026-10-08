@@ -204,7 +204,7 @@ Settings use plain TOML; saves preserve symlinked config files. See
 
 ## Developing
 
-See [DEVELOPMENT.md](docs/DEVELOPMENT.md)
+See [DEVELOPMENT.md](docs/DEVELOPMENT.md), including [macOS input-hook safety](docs/DEVELOPMENT.md#macos-input-hook-safety).
 
 ## Acknowledgments
 
