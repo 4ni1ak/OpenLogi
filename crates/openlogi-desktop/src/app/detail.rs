@@ -764,12 +764,8 @@ fn configuration_card(pal: Palette, cx: &mut Context<AppView>) -> impl IntoEleme
         .child(
             DescriptionList::new()
                 .columns(1)
-                // 118px fit the English labels but not several other locales'
-                // longer compound words ("Tastenzuweisungen",
-                // "Gestenzuweisungen", "DPI-Voreinstellung" in German) — the
-                // label wrapped mid-word, stranding one or two characters on
-                // their own line (#1576).
-                .label_width(px(160.))
+                // Keep long translated labels intact as the interface scale increases.
+                .label_width(rems(12.))
                 .bordered(false)
                 .child(DescriptionItem::new(tr!("profiles.active_profile")).value(app_profile))
                 .child(
