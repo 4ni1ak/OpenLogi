@@ -259,13 +259,22 @@ impl Api {
         // record. Use that record, never an arbitrary other monitor's UUID.
         let single_display = displays.len() == 1;
         let mut selected = None;
+        // #1086: several reports of "Space switch unconfirmed" came from
+        // multi-display setups with "Displays have separate Spaces" off
+        // (the default) — a configuration this match was never observed
+        // against. Log every candidate's identifier so a debug run from an
+        // affected setup can show what WindowServer actually reports there,
+        // rather than guessing at the private SPI's undocumented shape.
+        let mut seen = Vec::new();
         for value in displays {
             let display = dictionary(value)?;
             let identifier = get(&display, "Display Identifier")?
                 .downcast::<CFString>()
                 .ok()?;
             let name = identifier.to_string();
-            if name != uuid && !(single_display && name == "Main") {
+            let matched = name == uuid || (single_display && name == "Main");
+            seen.push((name.clone(), matched));
+            if !matched {
                 continue;
             }
             if selected.is_some() {
@@ -291,6 +300,14 @@ impl Api {
                 current,
                 ordered,
             });
+        }
+        if selected.is_none() {
+            tracing::debug!(
+                uuid,
+                single_display,
+                candidates = ?seen,
+                "Space state: no display matched the cursor's UUID"
+            );
         }
         selected
     }
