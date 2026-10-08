@@ -764,7 +764,8 @@ fn configuration_card(pal: Palette, cx: &mut Context<AppView>) -> impl IntoEleme
         .child(
             DescriptionList::new()
                 .columns(1)
-                .label_width(px(118.))
+                // Keep long translated labels intact as the interface scale increases.
+                .label_width(rems(12.))
                 .bordered(false)
                 .child(DescriptionItem::new(tr!("profiles.active_profile")).value(app_profile))
                 .child(
