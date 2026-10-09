@@ -243,9 +243,10 @@ impl HookBackend for Backend {
             .collect()
     }
 
-    /// Read the frontmost application via `NSWorkspace`: its bundle identifier
-    /// (the profile-matching key) and its localized name (for the UI). Returns
-    /// `None` when no app is frontmost or it has no bundle identifier.
+    /// Read the frontmost application via `NSWorkspace`. Use its bundle
+    /// identifier for profile matching, or its executable path when no bundle
+    /// identifier is available. Use its localized name for the UI. Return `None`
+    /// when no app is frontmost or neither identifier is available.
     ///
     /// `NSWorkspace` is `AnyThread`, so this is sound on the watcher thread. The
     /// reads return owned `Retained` values (no leak by construction), but the

@@ -202,11 +202,11 @@ pub struct DeviceConfig {
     /// button is a [`Binding::Single`] of its former `Click`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub disabled_gestures: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
-    /// Per-application binding overlays (P1.4). Keyed by bundle identifier
-    /// (e.g. `"com.microsoft.VSCode"` on macOS). When the foreground app's
-    /// id matches a key here, those bindings take precedence; anything not
-    /// listed falls through to `bindings`. Deliberately `Action`-valued (not
-    /// `Binding`): a per-app override replaces the whole button with one
+    /// Per-application binding overlays (P1.4). Keyed by the application
+    /// identifier defined by [`ForegroundApp::id`](crate::app::ForegroundApp::id).
+    /// When the foreground app's id matches a key here, these bindings take
+    /// precedence. Other buttons use `bindings`. Deliberately `Action`-valued
+    /// (not `Binding`): a per-app override replaces the whole button with one
     /// action, never a per-direction gesture overlay.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,

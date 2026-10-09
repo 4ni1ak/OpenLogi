@@ -96,14 +96,15 @@ Common device fields are:
   diverted to OpenLogi while the agent runs; an unbound key keeps its firmware
   function, so binding `None` is the same as removing the entry. Naming one
   control under both spellings in the same table is an error, not a merge
-- `per_app_bindings`: sparse action overlays keyed by macOS bundle id, Linux
-  application id, exact lower-cased Windows executable path, or
-  `exe:<filename>.exe`. The Buttons panel edits these under its Profile
-  selector, which offers applications the agent has seen in front — the only
-  identifiers guaranteed to match, since the four platforms name applications
-  differently and a profile authored under one namespace will not match under
-  another. An overlay holds one action per button; gesture-direction maps live
-  in `bindings`
+- `per_app_bindings`: sparse action overlays keyed by macOS bundle id (or the
+  exact executable path for applications without a bundle id), Linux application
+  id, exact lower-cased Windows executable path, or `exe:<filename>.exe`. macOS
+  paths retain their original spelling and case. The Buttons panel edits these
+  under its Profile selector. After bringing an application to the foreground,
+  choose it from Recent applications to use the identifier the agent observed.
+  Identifiers differ between platforms, so a profile authored under one
+  namespace will not match under another. An overlay holds one action per
+  button; gesture-direction maps live in `bindings`
 - `action_ring`: default and complete per-application eight-slot layouts;
   `action_ring.per_app` takes the same selectors as `per_app_bindings`,
   including the Windows `exe:<filename>` fallback
