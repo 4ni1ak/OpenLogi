@@ -262,6 +262,8 @@ The runner sets `RUSTFLAGS=-D warnings` the way CI does. Jobs that need another
 OS are reported as skipped; a skip is not a pass. The full job map (and which
 diff requires which job) is [`.agents/rules/ci.md`](../.agents/rules/ci.md).
 
+For structural searches and guard changes, use the [ast-grep skill](../.agents/skills/ast-grep/SKILL.md). The [guard workflow](../.agents/rules/ci.md#ast-grep-rules) defines placement beside the owner, root discovery, and verification.
+
 ### Pre-push gate
 
 Before pushing, read [the local gate and push checklist](../.agents/rules/ci.md#local-gate-hard-stop-before-push--scale-it-to-the-affected-graph).

@@ -19,7 +19,7 @@
 /packaging/                     @AprilNEA
 /.config/                       @AprilNEA
 /.cargo/                        @AprilNEA
-/.ast-grep/                     @AprilNEA
+**/.ast-grep/                   @AprilNEA
 /.envrc                         @AprilNEA
 /sgconfig.yml                   @AprilNEA
 **/Cargo.toml                   @AprilNEA
