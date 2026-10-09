@@ -55,11 +55,19 @@ pub(super) struct WheelRotation {
 }
 
 impl WheelRotation {
-    /// Decode the signed HID++ increment count. Zero carries no rotation.
-    pub(super) fn from_increments(increments: i16) -> Option<Self> {
+    /// Decode the signed HID++ increment count into a physical direction.
+    /// Zero carries no rotation. `positive_is_forward` is the device's own
+    /// `0x2150 default_dir` polarity (learned once while arming the wheel;
+    /// see [`CapturedInput::ThumbwheelDirection`](super::CapturedInput::ThumbwheelDirection))
+    /// — without it, a device whose firmware reports the opposite convention
+    /// has its physical roll direction swapped regardless of which action
+    /// the user bound to each direction.
+    pub(super) fn from_increments(increments: i16, positive_is_forward: bool) -> Option<Self> {
         let direction = match increments.cmp(&0) {
-            std::cmp::Ordering::Greater => PhysicalDirection::Up,
-            std::cmp::Ordering::Less => PhysicalDirection::Down,
+            std::cmp::Ordering::Greater if positive_is_forward => PhysicalDirection::Up,
+            std::cmp::Ordering::Greater => PhysicalDirection::Down,
+            std::cmp::Ordering::Less if positive_is_forward => PhysicalDirection::Down,
+            std::cmp::Ordering::Less => PhysicalDirection::Up,
             std::cmp::Ordering::Equal => return None,
         };
         Some(Self {

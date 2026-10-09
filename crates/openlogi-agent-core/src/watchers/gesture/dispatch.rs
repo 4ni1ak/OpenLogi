@@ -232,10 +232,20 @@ impl InputDispatcher {
         increments: i16,
         resolution: WheelResolution,
     ) {
-        let Some(rotation) = WheelRotation::from_increments(increments) else {
+        let key = session.device_key();
+        // Fail open (assume the un-inverted convention) until the device's
+        // own polarity has arrived rather than guess the opposite direction
+        // — same philosophy as the Windows native-hook fallback in
+        // `runtime::hook`.
+        let positive_is_forward = self
+            .hook_maps
+            .read()
+            .ok()
+            .and_then(|maps| maps.thumbwheel_positive_is_forward.get(key).copied())
+            .unwrap_or(true);
+        let Some(rotation) = WheelRotation::from_increments(increments, positive_is_forward) else {
             return;
         };
-        let key = session.device_key();
         let button = rotation.button();
         let configuration = WheelConfiguration::for_plan(plan);
         let action = configuration.action(rotation);

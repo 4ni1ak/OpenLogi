@@ -65,14 +65,26 @@ fn an_unreported_resolution_leaves_increments_unscaled() {
 
 #[test]
 fn rotation_separates_direction_and_positive_magnitude() {
-    let up = WheelRotation::from_increments(3).expect("non-zero rotation");
+    let up = WheelRotation::from_increments(3, true).expect("non-zero rotation");
     assert_eq!(up.button(), ButtonId::ThumbwheelScrollUp);
     assert_eq!(up.magnitude, 3);
 
-    let down = WheelRotation::from_increments(-3).expect("non-zero rotation");
+    let down = WheelRotation::from_increments(-3, true).expect("non-zero rotation");
     assert_eq!(down.button(), ButtonId::ThumbwheelScrollDown);
     assert_eq!(down.magnitude, 3);
-    assert_eq!(WheelRotation::from_increments(0), None);
+    assert_eq!(WheelRotation::from_increments(0, true), None);
+}
+
+#[test]
+fn inverted_polarity_swaps_the_physical_direction_not_the_magnitude() {
+    let up = WheelRotation::from_increments(3, false).expect("non-zero rotation");
+    assert_eq!(up.button(), ButtonId::ThumbwheelScrollDown);
+    assert_eq!(up.magnitude, 3);
+
+    let down = WheelRotation::from_increments(-3, false).expect("non-zero rotation");
+    assert_eq!(down.button(), ButtonId::ThumbwheelScrollUp);
+    assert_eq!(down.magnitude, 3);
+    assert_eq!(WheelRotation::from_increments(0, false), None);
 }
 
 #[test]
@@ -166,8 +178,8 @@ fn physical_directions_accumulate_independently() {
     let now = Instant::now();
     let scale = unscaled(ThumbwheelSensitivity::DEFAULT);
     let threshold = ThumbwheelSensitivity::DEFAULT.action_threshold();
-    let up = WheelRotation::from_increments(1).expect("non-zero rotation");
-    let down = WheelRotation::from_increments(-1).expect("non-zero rotation");
+    let up = WheelRotation::from_increments(1, true).expect("non-zero rotation");
+    let down = WheelRotation::from_increments(-1, true).expect("non-zero rotation");
 
     assert_eq!(
         wheel.advance(up, &Action::VolumeUp, scale, now),

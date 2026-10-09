@@ -5,7 +5,7 @@ use super::*;
 
 fn rotation(magnitude: i32) -> WheelRotation {
     let increments = i16::try_from(magnitude).expect("test magnitude fits in i16");
-    WheelRotation::from_increments(increments).expect("non-zero test rotation")
+    WheelRotation::from_increments(increments, true).expect("non-zero test rotation")
 }
 
 fn scale() -> ScrollScale {
