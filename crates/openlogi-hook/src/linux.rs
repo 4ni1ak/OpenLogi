@@ -552,6 +552,9 @@ fn device_thread(
     // Events that will be re-injected at the next SYN_REPORT.
     let mut pending: Vec<evdev::InputEvent> = Vec::new();
     let mut companions = LowResCompanions::default();
+    // Software scroll inversion, read once per report so a hi-res event and its
+    // low-res companion never disagree if the setting flips mid-report.
+    let mut report_inverted: Option<bool> = None;
 
     debug!("hook started on {}", path.display());
 
@@ -576,7 +579,10 @@ fn device_thread(
                 // Flush the report. `emit()` appends its own SYN_REPORT, so the
                 // incoming sync event is dropped rather than re-emitted — pushing
                 // it would send a redundant second SYN_REPORT.
-                companions.release_into(&mut pending, crate::scroll_inversion());
+                let inverted = report_inverted
+                    .take()
+                    .unwrap_or_else(crate::scroll_inversion);
+                companions.release_into(&mut pending, inverted);
                 if !pending.is_empty() {
                     if let Err(e) = virtual_device.emit(&pending) {
                         // The physical device is grabbed, so these pass-through
@@ -611,7 +617,8 @@ fn device_thread(
                 }
                 match disposition {
                     EventDisposition::PassThrough => {
-                        pending.push(invert_wheel(event, crate::scroll_inversion()));
+                        let inverted = *report_inverted.get_or_insert_with(crate::scroll_inversion);
+                        pending.push(invert_wheel(event, inverted));
                     }
                     EventDisposition::Suppress => {}
                 }
