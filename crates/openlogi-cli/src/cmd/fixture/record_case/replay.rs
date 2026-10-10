@@ -1,11 +1,8 @@
 //! Sanitized route derivation and strict production-operation self-replay.
 
 use anyhow::{Result, bail};
-use openlogi_device::replay::{
-    ChannelConnection, NodePresence, OpenOutcome, RawWriterAvailability, ReceiverLinkState,
-    ReceiverSlot, ReceiverSlotState, ReplayBackend, ReplayChannel, ReplayNode, ReplayTopology,
-};
-use openlogi_device::{DeviceRoute, NodeId, NodeInfo};
+use openlogi_device::DeviceRoute;
+use openlogi_device::replay::{ReplayBackend, ReplayTopology};
 use openlogi_fixture::HidCassette;
 use openlogi_hid::recording::{HidCassetteAudit, SanitizedIdentityKind};
 
@@ -71,39 +68,12 @@ fn replay_topology(
     route: &DeviceRoute,
     cassette: &HidCassette,
 ) -> ReplayTopology {
-    let receiver_slots = match route {
-        DeviceRoute::Bolt { slot, .. } | DeviceRoute::Unifying { slot, .. } => {
-            vec![ReceiverSlot {
-                slot: *slot,
-                state: ReceiverSlotState::Paired(ReceiverLinkState::Online),
-            }]
-        }
-        DeviceRoute::Direct { .. } | DeviceRoute::RawHid { .. } => Vec::new(),
-    };
-    ReplayTopology {
-        nodes: vec![ReplayNode {
-            info: NodeInfo {
-                id: NodeId::from("openlogi-sanitized-replay-node".to_string()),
-                vendor_id: target.receiver_vendor_id,
-                product_id: target.receiver_product_id,
-                usage_page: 0xff00,
-                usage_id: 0x0001,
-                name: "OpenLogi sanitized replay node".to_string(),
-                manufacturer: Some("OpenLogi synthetic fixture".to_string()),
-                serial_number: None,
-            },
-            presence: NodePresence::Present,
-            open_outcome: OpenOutcome::Hidpp,
-            channel: Some(cassette.channel.clone()),
-            raw_writer: RawWriterAvailability::Unavailable,
-            receiver_slots,
-        }],
-        channels: vec![ReplayChannel {
-            id: cassette.channel.clone(),
-            connection: ChannelConnection::Connected,
-            report_support: cassette.report_support,
-        }],
-    }
+    ReplayTopology::for_device(
+        route,
+        target.receiver_vendor_id,
+        target.receiver_product_id,
+        cassette,
+    )
 }
 
 fn derive_replay_route(
@@ -164,8 +134,6 @@ fn unique_replacement(audit: &HidCassetteAudit, kind: SanitizedIdentityKind) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use openlogi_core::hid::{
         SmartShiftAutoDisengage, SmartShiftMode, SmartShiftStatus, SmartShiftThreshold,
     };
@@ -522,27 +490,19 @@ mod tests {
         case: &str,
         target: TargetCandidate,
     ) -> Option<(ReplayBackend, DeviceRoute)> {
-        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/devices");
-        match std::fs::symlink_metadata(&corpus) {
-            // Published crates do not contain the repository fixture corpus.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipping {specimen} replay: repository fixture corpus is absent");
-                return None;
-            }
-            result => {
-                result.expect("repository fixture corpus is accessible");
-            }
-        }
-        let path = corpus
-            .join(specimen)
-            .join("cases")
-            .join(format!("{case}.json"));
-        let cassette: HidCassette =
-            serde_json::from_slice(&std::fs::read(path).expect("corpus cassette is present"))
-                .expect("corpus cassette parses");
-        let topology = replay_topology(&target, &target.route, &cassette);
-        let backend =
-            ReplayBackend::new(topology, vec![cassette]).expect("corpus replay topology is valid");
+        let corpus = openlogi_fixture::fs::repository_corpus().expect("valid corpus")?;
+        let fixture = corpus
+            .iter()
+            .find(|fixture| fixture.manifest().id == specimen)
+            .expect("recorded specimen is present");
+        let cassette = fixture
+            .cassettes()
+            .iter()
+            .find(|cassette| cassette.name == case)
+            .expect("recorded case is present");
+        let (backend, route) =
+            ReplayBackend::from_profile(fixture.profile(), cassette).expect("valid replay target");
+        assert_eq!(route, target.route);
         Some((backend, target.route))
     }
 
