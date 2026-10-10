@@ -31,13 +31,13 @@ use tracing::{debug, error, warn};
 
 use crate::{
     CursorPosition, EventDisposition, EventTapInfo, ForegroundApp, HookBackend, HookError,
-    HookEvent, TapLocation,
+    HookEvent, MouseEvent, TapLocation,
 };
 pub use foreground::ForegroundApplicationObserver;
 use foreground::observe_frontmost_application;
 pub(crate) use foreground::{frontmost_safari_pid, watch_frontmost_application_activations};
 use grant::{ProbeCue, can_filter_events};
-use translate::{translate, translate_key};
+use translate::{VERTICAL, translate, translate_key};
 use watchdog::{
     CALLBACK_POLL_INTERVAL, CallbackActivity, CallbackWatchdog, LIFECYCLE_POLL_INTERVAL,
     LifecycleDecision, LifecycleExitReason, LifecycleObservation, LifecycleWatchdog, PowerEpoch,
