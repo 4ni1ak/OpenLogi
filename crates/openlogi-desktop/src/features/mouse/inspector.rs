@@ -450,7 +450,11 @@ fn thumbwheel_inspector(
 
     v_flex()
         .gap_3()
-        .child(inspector_heading(tr!("pointer.thumb_wheel"), Some(status), pal))
+        .child(inspector_heading(
+            tr!("pointer.thumb_wheel"),
+            Some(status),
+            pal,
+        ))
         .child(selection_card(
             "inspector-current-thumbwheel-preset",
             tr!("common.preset"),
