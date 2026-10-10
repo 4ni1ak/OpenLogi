@@ -6,7 +6,7 @@ use std::marker::{PhantomData, PhantomPinned};
 
 use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFAllocatorRef, CFType, CFTypeRef, TCFType as _};
-use core_foundation::dictionary::CFDictionaryRef;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::number::CFNumber;
 use core_foundation::set::{CFSet, CFSetGetValues, CFSetRef};
 use core_foundation::string::{CFString, CFStringRef};
@@ -87,8 +87,18 @@ impl HidManager {
         }
         // SAFETY: `manager` is a non-null +1 CF object owned from here on.
         let owner = unsafe { CFType::wrap_under_create_rule(manager.cast_const().cast()) };
-        // SAFETY: `manager` is live; null matching means all HID devices.
-        unsafe { IOHIDManagerSetDeviceMatching(manager, std::ptr::null()) };
+        let matching = CFDictionary::from_CFType_pairs(&[
+            (
+                CFString::from_static_string("DeviceUsagePage"),
+                CFNumber::from(i64::from(HID_PAGE_GENERIC_DESKTOP)),
+            ),
+            (
+                CFString::from_static_string("DeviceUsage"),
+                CFNumber::from(i64::from(HID_USAGE_MOUSE)),
+            ),
+        ]);
+        // SAFETY: `manager` is live; the manager copies the matching dictionary.
+        unsafe { IOHIDManagerSetDeviceMatching(manager, matching.as_concrete_TypeRef()) };
         // SAFETY: `manager` is live and opened once with documented zero options.
         let result = unsafe { IOHIDManagerOpen(manager, 0) };
         if result != IO_RETURN_SUCCESS {
