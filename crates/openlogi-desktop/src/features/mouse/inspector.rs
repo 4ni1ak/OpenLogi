@@ -360,9 +360,15 @@ fn gesture_directions(
                     let selected = direction == active;
                     let action = gesture_action(gesture_map, button, direction);
                     let view = view.clone();
+                    let aria_label = format!(
+                        "{}: {}",
+                        tr!(direction.translation_key()),
+                        localized_action_label(&action)
+                    );
                     MenuRow::new(("inspector-direction", index))
                         .selected(selected)
                         .role(Role::Button)
+                        .aria_label(aria_label)
                         .child(
                             h_flex()
                                 .min_w_0()
@@ -438,10 +444,7 @@ fn thumbwheel_inspector(
         (Some(_), false) => tr!("profiles.inherited_from_default"),
         (None, _) => tr!("profiles.default_profile"),
     };
-    let current_label = current.map_or_else(
-        || tr!("common.custom"),
-        |preset| tr!(preset.translation_key()),
-    );
+    let current_label = current.map_or_else(|| tr!("common.custom"), |p| tr!(p.translation_key()));
     let current_icon = current.map_or("action-icons/chevrons-right.svg", ThumbwheelPreset::icon);
     let observer = picker.view.clone();
 
@@ -472,6 +475,7 @@ fn thumbwheel_inspector(
                             MenuRow::new(("inspector-thumbwheel", index))
                                 .selected(selected)
                                 .role(Role::Button)
+                                .aria_label(tr!(preset.translation_key()))
                                 .child(
                                     h_flex()
                                         .items_center()
