@@ -166,6 +166,9 @@ fn unique_replacement(audit: &HidCassetteAudit, kind: SanitizedIdentityKind) -> 
 mod tests {
     use std::path::Path;
 
+    use openlogi_core::hid::{
+        SmartShiftAutoDisengage, SmartShiftMode, SmartShiftStatus, SmartShiftThreshold,
+    };
     use openlogi_device::reprog_controls::CidFlags;
     use openlogi_device::write::{FeatureEntry, ReprogControlEntry};
     use openlogi_device::{Dpi, DpiCapabilities, DpiInfo};
@@ -400,6 +403,78 @@ mod tests {
             .expect("control-table cassette consumed");
     }
 
+    #[tokio::test]
+    async fn mx_master_3s_smartshift_read_uses_legacy_feature_without_tunable_torque() {
+        let Some((backend, route)) = mx_master_3s_replay("smartshift-status") else {
+            return;
+        };
+
+        let observed = FixtureOperation::SmartshiftStatus
+            .observe(&backend, &route)
+            .await;
+
+        assert_eq!(
+            observed,
+            SemanticObservation::SmartshiftStatus(Ok(SmartShiftStatus {
+                mode: SmartShiftMode::Ratchet,
+                auto_disengage: SmartShiftAutoDisengage::Threshold(
+                    SmartShiftThreshold::try_new(10).expect("reviewed threshold is valid"),
+                ),
+                tunable_torque: None,
+            }))
+        );
+        backend
+            .require_complete()
+            .expect("legacy SmartShift cassette consumed");
+    }
+
+    #[tokio::test]
+    async fn mx_master_3s_control_read_preserves_gesture_and_virtual_raw_xy_flags() {
+        let Some((backend, route)) = mx_master_3s_replay("reprogrammable-controls") else {
+            return;
+        };
+
+        let observed = FixtureOperation::ReprogrammableControls
+            .observe(&backend, &route)
+            .await;
+        let SemanticObservation::ReprogrammableControls(controls) = observed else {
+            panic!("expected a control-table observation, got {observed:?}");
+        };
+        let controls = controls.expect("recorded control table is readable");
+
+        assert_eq!(controls.len(), 8);
+        for expected in [
+            ReprogControlEntry {
+                cid: 0x00c3,
+                task_id: 0x00a9,
+                flags: CidFlags::MOUSE
+                    | CidFlags::REPROGRAMMABLE
+                    | CidFlags::DIVERTABLE
+                    | CidFlags::RAW_XY
+                    | CidFlags::ANALYTICS_KEY_EVENTS,
+            },
+            ReprogControlEntry {
+                cid: 0x00d7,
+                task_id: 0x00b4,
+                flags: CidFlags::DIVERTABLE
+                    | CidFlags::VIRTUAL_CONTROL
+                    | CidFlags::RAW_XY
+                    | CidFlags::FORCE_RAW_XY,
+            },
+        ] {
+            assert_eq!(
+                controls
+                    .iter()
+                    .find(|control| control.cid == expected.cid)
+                    .copied(),
+                Some(expected)
+            );
+        }
+        backend
+            .require_complete()
+            .expect("control-table cassette consumed");
+    }
+
     fn mx_master_4_replay(case: &str) -> Option<(ReplayBackend, DeviceRoute)> {
         corpus_replay(
             "mx-master-4-001",
@@ -424,6 +499,20 @@ mod tests {
                     product_id: 0xb037,
                 },
                 0xb037,
+            ),
+        )
+    }
+
+    fn mx_master_3s_replay(case: &str) -> Option<(ReplayBackend, DeviceRoute)> {
+        corpus_replay(
+            "mx-master-3s-001",
+            case,
+            target(
+                DeviceRoute::Direct {
+                    vendor_id: 0x046d,
+                    product_id: 0xb034,
+                },
+                0xb034,
             ),
         )
     }
