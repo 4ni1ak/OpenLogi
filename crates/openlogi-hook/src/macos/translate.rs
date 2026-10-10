@@ -27,38 +27,32 @@ fn button_number_to_id(n: i64) -> Option<ButtonId> {
     }
 }
 
-/// Best-effort device identity for a button event's HID sender, including
-/// macOS 27 events whose sender id is zero (the `SenderlessButtonResolver`'s
-/// `IOHIDManager` poll, see that module).
-struct ButtonSource {
-    device: Option<crate::EventDevice>,
-    attribution_invalidated: bool,
-}
-
-fn button_source(
-    event: &CGEvent,
-    button_number: i64,
+/// Build a [`MouseEvent::Button`] with a best-effort identity for its HID
+/// sender, including macOS 27 events whose sender id is zero (the
+/// `SenderlessButtonResolver`'s `IOHIDManager` poll, see that module).
+fn button_event(
+    id: ButtonId,
     pressed: bool,
+    button_number: i64,
+    event: &CGEvent,
     resolver: &mut SenderlessButtonResolver,
-) -> ButtonSource {
+) -> MouseEvent {
     let sender_source = event_sender_id(event)
         .filter(|sender_id| *sender_id != 0)
         .map(|sender_id| sender_device_info(sender_id).event_device);
-    let device = resolver.resolve(button_number, pressed, sender_source);
-    ButtonSource {
-        device,
-        attribution_invalidated: resolver.take_attribution_invalidated(),
-    }
-}
-
-/// Build a [`MouseEvent::Button`] from a resolved [`ButtonSource`] — shared by
-/// every `translate` match arm so the field list lives in one place.
-fn button_event(id: ButtonId, pressed: bool, source: ButtonSource) -> MouseEvent {
+    // Primary clicks are never remapped, so their attribution is not worth an
+    // IOHIDManager poll on the tap thread.
+    let (device, attribution_invalidated) = if id.is_os_hook_button() {
+        let device = resolver.resolve(button_number, pressed, sender_source);
+        (device, resolver.take_attribution_invalidated())
+    } else {
+        (sender_source, false)
+    };
     MouseEvent::Button {
         id,
         pressed,
-        device: source.device,
-        attribution_invalidated: source.attribution_invalidated,
+        device,
+        attribution_invalidated,
     }
 }
 
@@ -129,42 +123,40 @@ pub(super) fn translate(
         return None;
     }
     match etype {
-        CGEventType::LeftMouseDown => Some(button_event(
-            ButtonId::LeftClick,
-            true,
-            button_source(event, 0, true, resolver),
-        )),
-        CGEventType::LeftMouseUp => Some(button_event(
-            ButtonId::LeftClick,
-            false,
-            button_source(event, 0, false, resolver),
-        )),
-        CGEventType::RightMouseDown => Some(button_event(
-            ButtonId::RightClick,
-            true,
-            button_source(event, 1, true, resolver),
-        )),
+        CGEventType::LeftMouseDown => {
+            Some(button_event(ButtonId::LeftClick, true, 0, event, resolver))
+        }
+        CGEventType::LeftMouseUp => {
+            Some(button_event(ButtonId::LeftClick, false, 0, event, resolver))
+        }
+        CGEventType::RightMouseDown => {
+            Some(button_event(ButtonId::RightClick, true, 1, event, resolver))
+        }
         CGEventType::RightMouseUp => Some(button_event(
             ButtonId::RightClick,
             false,
-            button_source(event, 1, false, resolver),
+            1,
+            event,
+            resolver,
         )),
         CGEventType::OtherMouseDown => {
             let n = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-            let id = button_number_to_id(n)?;
             Some(button_event(
-                id,
+                button_number_to_id(n)?,
                 true,
-                button_source(event, n, true, resolver),
+                n,
+                event,
+                resolver,
             ))
         }
         CGEventType::OtherMouseUp => {
             let n = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-            let id = button_number_to_id(n)?;
             Some(button_event(
-                id,
+                button_number_to_id(n)?,
                 false,
-                button_source(event, n, false, resolver),
+                n,
+                event,
+                resolver,
             ))
         }
         CGEventType::ScrollWheel => {
