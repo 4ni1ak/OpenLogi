@@ -14,8 +14,8 @@ use crate::write::smartshift::{
 };
 use crate::write::{HidppFeatureErrorKind, HidppOperation};
 use crate::{
-    BacklightMode, BacklightState, BacklightStatus, SmartShiftAutoDisengage, SmartShiftMode,
-    SmartShiftStatus, SmartShiftThreshold, TunableTorque,
+    BacklightMode, BacklightState, BacklightStatus, FnLockState, SmartShiftAutoDisengage,
+    SmartShiftMode, SmartShiftStatus, SmartShiftThreshold, TunableTorque,
 };
 use hidpp::feature::device_information::DeviceEntityType;
 
@@ -370,6 +370,39 @@ async fn dpi_reads_and_writes_work_on_a_device_with_only_extended_dpi() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn a_dropped_dpi_write_is_retried_once() -> Result<(), WriteError> {
+    // Firmware still drowsy from a link re-establishment can ACK a
+    // `setSensorDpi` yet keep the old value. The read-back catches the
+    // mismatch and a single re-write lands the requested DPI.
+    let state = std::sync::Arc::new(std::sync::Mutex::new(DrowsyDpiState {
+        current: 1000,
+        set_writes: 0,
+    }));
+    let responder_state = std::sync::Arc::clone(&state);
+    let (raw, _handle) = ScriptedRawHidChannel::with_dynamic_responder(move |request| {
+        adjustable_dpi_drowsy_response(request, &responder_state)
+    });
+    let channel = scripted_channel(raw).await;
+    let shared = SharedChannel::new(
+        channel,
+        DeviceRoute::Direct {
+            vendor_id: 0x046d,
+            product_id: 0xb034,
+        },
+    );
+
+    set_dpi_on(&shared, Dpi::new(650)).await?;
+
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.set_writes, 2,
+        "the dropped write must be retried exactly once"
+    );
+    assert_eq!(state.current, 650);
+    Ok(())
+}
+
 #[test]
 fn zone_presence_bits_decode_lsb_first_from_the_page_base() {
     let mut bitfield = [0u8; 14];
@@ -585,6 +618,56 @@ fn extended_dpi_scripted_response(request: &[u8]) -> Option<Vec<u8>> {
     Some(response)
 }
 
+/// Live sensor state for [`adjustable_dpi_drowsy_response`].
+struct DrowsyDpiState {
+    current: u16,
+    set_writes: u8,
+}
+
+/// A `0x2201`-only mouse whose first `setSensorDpi` is ACKed but dropped —
+/// firmware drowsy from a link re-establishment — while the second is honored.
+fn adjustable_dpi_drowsy_response(
+    request: &[u8],
+    state: &std::sync::Mutex<DrowsyDpiState>,
+) -> Option<Vec<u8>> {
+    if request.len() < 7 || !matches!(request[0], 0x10 | 0x11) {
+        return None;
+    }
+    let feature_index = request[2];
+    let function = request[3] >> 4;
+    let mut payload = [0u8; 16];
+    match (feature_index, function) {
+        // Root ping used by Device::new.
+        (0x00, 0x01) => payload[0] = 4,
+        // Root feature lookup: only 0x2201 present.
+        (0x00, 0x00) => {
+            let feature_id = u16::from_be_bytes([request[4], request[5]]);
+            payload[0] = u8::from(feature_id == 0x2201) * 0x04;
+        }
+        // getSensorDpi: the echoed sensor index, then the live value.
+        (0x04, 0x02) => {
+            payload[0] = request[4];
+            payload[1..3].copy_from_slice(&state.lock().unwrap().current.to_be_bytes());
+        }
+        // setSensorDpi: always ACKed, but the first write changes nothing.
+        (0x04, 0x03) => {
+            let mut state = state.lock().unwrap();
+            state.set_writes += 1;
+            if state.set_writes > 1 {
+                state.current = u16::from_be_bytes([request[5], request[6]]);
+            }
+            payload[..3].copy_from_slice(&request[4..7]);
+        }
+        _ => return None,
+    }
+
+    let mut response = vec![0u8; 7];
+    response[0] = 0x10;
+    response[1..4].copy_from_slice(&request[1..4]);
+    response[4..].copy_from_slice(&payload[..3]);
+    Some(response)
+}
+
 /// A keyboard that exposes `0x8081 PerKeyLighting2` and neither `0x8070`
 /// ColorLedEffects nor `0x8080` PerKeyLighting — the shape that had no way to
 /// set a colour at all, since nothing ever drove 0x8081.
@@ -789,4 +872,212 @@ async fn a_channel_failure_aborts_the_dump_instead_of_blaming_the_firmware() {
         !written.iter().any(|report| is_fw_info_for(report, 2)),
         "the dump stops at the failure rather than timing out per entity"
     );
+}
+
+/// A multi-host keyboard: `0x40a3` at index 0x09 and `0x1815 HostsInfo` at
+/// index 0x0a reporting host slot 2 as current. Both fn-inversion echoes
+/// report whatever state the last `set` wrote (shared across the test through
+/// the request the responder sees, since scripted responders are stateless).
+fn multi_host_keyboard_response(request: &[u8]) -> Option<Vec<u8>> {
+    if request.len() < 7 || !matches!(request[0], 0x10 | 0x11) {
+        return None;
+    }
+    let feature_index = request[2];
+    let function = request[3] >> 4;
+    let mut payload = [0u8; 16];
+    match (feature_index, function) {
+        (0x00, 0x01) => payload[0] = 4,
+        (0x00, 0x00) => {
+            let feature_id = u16::from_be_bytes([request[4], request[5]]);
+            payload[0] = match feature_id {
+                0x40a3 => 0x09,
+                0x1815 => 0x0a,
+                _ => 0x00,
+            };
+        }
+        // getFeatureInfo: capabilities, descriptor caps, 3 hosts, current = 2.
+        (0x0a, 0x00) => payload[..4].copy_from_slice(&[0x07, 0x00, 3, 2]),
+        // getGlobalFnInversion(host): inversion ON (media keys first).
+        (0x09, 0x00) => payload[..4].copy_from_slice(&[request[4], 1, 1, 1]),
+        // setGlobalFnInversion(host, state): echo host and the written state.
+        (0x09, 0x01) => payload[..4].copy_from_slice(&[request[4], request[5], 1, 1]),
+        _ => return None,
+    }
+    // Long replies: `getFeatureInfo` and the inversion echoes carry four
+    // payload bytes, one more than a short report holds.
+    let mut response = vec![0u8; 20];
+    response[0] = 0x11;
+    response[1..4].copy_from_slice(&request[1..4]);
+    response[4..].copy_from_slice(&payload);
+    Some(response)
+}
+
+#[tokio::test]
+async fn fn_lock_addresses_the_current_host_slot_read_from_hosts_info() -> Result<(), WriteError> {
+    let (raw, handle) = ScriptedRawHidChannel::with_responder(multi_host_keyboard_response);
+    let channel = scripted_channel(raw).await;
+    let shared = SharedChannel::new(
+        channel,
+        DeviceRoute::Direct {
+            vendor_id: 0x046d,
+            product_id: 0xb378,
+        },
+    );
+
+    // Inversion ON in firmware reads back as Fn-lock off.
+    let state = get_fn_lock_on(&shared).await?;
+    assert_eq!(
+        state,
+        FnLockState {
+            fn_lock: false,
+            default_fn_lock: false,
+        }
+    );
+    let get = handle
+        .written_reports()
+        .into_iter()
+        .find(|report| report[2] == 0x09 && report[3] >> 4 == 0x00)
+        .expect("a getGlobalFnInversion read");
+    // A read addresses the spec's 0xff "current host": every firmware answers
+    // it, and it must not depend on 0x1815 being readable.
+    assert_eq!(get[4], 0xff);
+    assert!(
+        !handle
+            .written_reports()
+            .into_iter()
+            .any(|report| report[2] == 0x0a),
+        "a read never asks 0x1815 which slot is current"
+    );
+
+    let written = set_fn_lock_on(&shared, true).await?;
+    assert!(written.fn_lock);
+
+    let set = handle
+        .written_reports()
+        .into_iter()
+        .find(|report| report[2] == 0x09 && report[3] >> 4 == 0x01)
+        .expect("a setGlobalFnInversion write");
+    // Host slot 2 from 0x1815, not the 0xff "current host" the MX Keys S
+    // firmware ignores; Fn-lock on is inversion OFF (0).
+    assert_eq!(&set[4..6], &[2, 0]);
+    Ok(())
+}
+
+/// The multi-host keyboard whose `0x1815 getFeatureInfo` answers with a HID++
+/// error (`Busy`): the feature is there, the slot is not readable right now.
+fn multi_host_keyboard_with_unreadable_hosts_info(request: &[u8]) -> Option<Vec<u8>> {
+    if request.len() >= 4 && request[2] == 0x0a && request[3] >> 4 == 0x00 {
+        // HID++ 2.0 error frame: feature index 0xff, then the failing
+        // feature index, the function/software id nibble pair, and the code.
+        let mut response = vec![0u8; 20];
+        response[0] = 0x11;
+        response[1] = request[1];
+        response[2] = 0xff;
+        response[3] = request[2];
+        response[4] = request[3];
+        response[5] = 8; // Busy
+        return Some(response);
+    }
+    multi_host_keyboard_response(request)
+}
+
+#[tokio::test]
+async fn fn_lock_write_does_not_guess_the_host_when_hosts_info_is_unreadable() {
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder(multi_host_keyboard_with_unreadable_hosts_info);
+    let channel = scripted_channel(raw).await;
+    let shared = SharedChannel::new(
+        channel,
+        DeviceRoute::Direct {
+            vendor_id: 0x046d,
+            product_id: 0xb378,
+        },
+    );
+
+    let error = set_fn_lock_on(&shared, true)
+        .await
+        .expect_err("a keyboard with 0x1815 that cannot say which slot is current fails the write");
+    assert_eq!(
+        error,
+        WriteError::HidppFeature {
+            operation: HidppOperation::WriteFnLock,
+            feature_hex: 0x1815,
+            kind: HidppFeatureErrorKind::Busy,
+        }
+    );
+    // Nothing was written to 0x40a3: a 0xff-addressed write is the one the
+    // MX Keys S firmware drops, so it is never sent as a guess.
+    assert!(
+        !handle
+            .written_reports()
+            .into_iter()
+            .any(|report| report[2] == 0x09 && report[3] >> 4 == 0x01),
+        "no setGlobalFnInversion without a known host slot"
+    );
+
+    // The read does not need the slot: 0xff reads work on the MX Keys S, so
+    // the GUI still learns the keyboard's own state while 0x1815 is busy.
+    let state = get_fn_lock_on(&shared)
+        .await
+        .expect("a read addresses the current host directly");
+    assert!(!state.fn_lock);
+}
+
+/// A single-host keyboard (`0x40a2` only) whose firmware echoes inversion ON
+/// no matter what is written — the keyboard did not take the write.
+fn stubborn_single_host_keyboard_response(request: &[u8]) -> Option<Vec<u8>> {
+    if request.len() < 7 || !matches!(request[0], 0x10 | 0x11) {
+        return None;
+    }
+    let feature_index = request[2];
+    let function = request[3] >> 4;
+    let mut payload = [0u8; 16];
+    match (feature_index, function) {
+        (0x00, 0x01) => payload[0] = 4,
+        (0x00, 0x00) => {
+            let feature_id = u16::from_be_bytes([request[4], request[5]]);
+            payload[0] = u8::from(feature_id == 0x40a2) * 0x0b;
+        }
+        (0x0b, 0x00 | 0x01) => payload[..2].copy_from_slice(&[1, 1]),
+        _ => return None,
+    }
+    let mut response = vec![0u8; 7];
+    response[0] = 0x10;
+    response[1..4].copy_from_slice(&request[1..4]);
+    response[4..].copy_from_slice(&payload[..3]);
+    Some(response)
+}
+
+#[tokio::test]
+async fn fn_lock_write_that_the_keyboard_does_not_echo_fails() {
+    let (raw, handle) =
+        ScriptedRawHidChannel::with_responder(stubborn_single_host_keyboard_response);
+    let channel = scripted_channel(raw).await;
+    let shared = SharedChannel::new(
+        channel,
+        DeviceRoute::Direct {
+            vendor_id: 0x046d,
+            product_id: 0xb342,
+        },
+    );
+
+    let error = set_fn_lock_on(&shared, true)
+        .await
+        .expect_err("an echo that disagrees with the write is not a success");
+    assert_eq!(
+        error,
+        WriteError::UnsupportedResponse {
+            operation: HidppOperation::WriteFnLock,
+            feature_hex: 0x40a2,
+        }
+    );
+    // The single-host fallback wrote inversion OFF once; no 0x1815 lookup
+    // is attempted on a keyboard without 0x40a3.
+    let sets: Vec<_> = handle
+        .written_reports()
+        .into_iter()
+        .filter(|report| report[2] == 0x0b && report[3] >> 4 == 0x01)
+        .collect();
+    assert_eq!(sets.len(), 1);
+    assert_eq!(sets[0][4], 0);
 }

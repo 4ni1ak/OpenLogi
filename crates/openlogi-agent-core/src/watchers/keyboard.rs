@@ -34,6 +34,12 @@ use crate::runtime::{ActionDispatcher, HidppSessionId};
 /// `0x1b04` controls to divert (only keys carrying a real binding), and the
 /// per-key action map presses dispatch through. Rebuilt by the orchestrator on
 /// config / inventory / foreground-app changes.
+///
+/// `wanted` is part of the hardware target, so a per-app profile that binds a
+/// key the device-wide profile leaves native changes the divert set when that
+/// app comes to the front, and the session restarts (a brief native window
+/// for the keyboard's keys). Bindings that only change an already-diverted
+/// key's action hot-swap without touching firmware.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardSpec {
     /// Current config namespace for actions from this keyboard. Settings
@@ -145,13 +151,18 @@ fn dispatch_input(
             } else {
                 debug!(?button, "keyboard key with no binding — ignored");
             }
-            dispatcher.try_hidpp_button_down(session, button, binding);
+            dispatcher.try_hidpp_button_down(session, button, binding, None);
         }
         CapturedInput::ButtonUp(button) => {
             dispatcher.try_hidpp_button_up(session, button);
         }
         CapturedInput::ButtonPulse(button) => {
-            dispatcher.dispatch_hidpp_button_pulse(session, button, bindings.bindings.get(&button));
+            dispatcher.dispatch_hidpp_button_pulse(
+                session,
+                button,
+                bindings.bindings.get(&button),
+                None,
+            );
         }
         CapturedInput::Gesture(..)
         | CapturedInput::Scroll { .. }

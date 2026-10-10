@@ -191,7 +191,7 @@ fn fail_open_press_pairs_release() {
     );
     assert_eq!(
         remapped_release_disposition(ButtonId::Forward, &mut fail_open),
-        EventDisposition::Suppress
+        EventDisposition::PassThrough
     );
 }
 
@@ -238,6 +238,196 @@ fn queued_key_action_retains_its_press_time_target() {
 }
 
 #[test]
+fn mouse_press_uses_the_target_published_with_its_binding_not_frontmost_safari() {
+    use super::super::button::ButtonRuntimeEvent;
+    use openlogi_hook::PointerTarget;
+
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(HookMaps {
+        bindings: BTreeMap::from([(ButtonId::Back, Action::PreviousDesktop.into())]),
+        pointer_target: Some(PointerTarget::Desktop),
+        ..HookMaps::default()
+    }));
+    let mouse = EventDevice {
+        vendor_id: Some(0x046d),
+        product_name: Some("Logitech MX Master 3".into()),
+        ..EventDevice::default()
+    };
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            true,
+            Some(&mouse),
+            false,
+            &hooks,
+            &dispatcher,
+            || { panic!("pointer-scoped binding must not capture foreground Safari") }
+        ),
+        EventDisposition::Suppress
+    );
+    let ButtonRuntimeEvent::Started(press) =
+        events.recv_timeout(Duration::from_secs(1)).expect("down")
+    else {
+        panic!("started");
+    };
+    assert_eq!(
+        press.target(),
+        ActionDispatchTarget::Pointer {
+            target: PointerTarget::Desktop,
+            fallback_safari_pid: None,
+        }
+    );
+    assert_eq!(press.start_action(), Some(&Action::PreviousDesktop));
+    // Pointer movement can restore the native binding before release. The
+    // suppressed down must still have a suppressed up and end its lifecycle.
+    hooks
+        .write()
+        .expect("maps")
+        .bindings
+        .insert(ButtonId::Back, Action::MouseBack.into());
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            false,
+            Some(&mouse),
+            false,
+            &hooks,
+            &dispatcher,
+            || { panic!("release does not retarget") }
+        ),
+        EventDisposition::Suppress
+    );
+    let ButtonRuntimeEvent::Ended { press: ended, .. } =
+        events.recv_timeout(Duration::from_secs(1)).expect("up")
+    else {
+        panic!("ended");
+    };
+    assert_eq!(ended.token(), press.token());
+
+    // The inverse crossing must not swallow the release of a native press.
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            true,
+            Some(&mouse),
+            false,
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::PassThrough
+    );
+    hooks
+        .write()
+        .expect("maps")
+        .bindings
+        .insert(ButtonId::Back, Action::PreviousDesktop.into());
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            false,
+            Some(&mouse),
+            false,
+            &hooks,
+            &dispatcher,
+            || { panic!("release does not retarget") }
+        ),
+        EventDisposition::PassThrough
+    );
+    assert!(owner.shutdown());
+}
+
+#[test]
+fn queued_unidentified_pointer_action_retains_its_press_time_target() {
+    use super::super::button::ButtonRuntimeEvent;
+    use openlogi_hook::PointerTarget;
+    use std::cell::Cell;
+
+    let mouse = EventDevice {
+        vendor_id: Some(0x046d),
+        product_name: Some("Logitech MX Master 3".into()),
+        ..EventDevice::default()
+    };
+    let mut routes = Vec::new();
+    for (pressed_safari, later_safari, current_pointer) in [
+        (Some(417), None, PointerTarget::Unavailable),
+        (None, Some(518), PointerTarget::Unavailable),
+        (Some(417), Some(518), PointerTarget::Unavailable),
+        (Some(417), None, PointerTarget::Desktop),
+    ] {
+        let (dispatcher, mut owner, events) = test_dispatcher();
+        let hooks = Arc::new(RwLock::new(HookMaps {
+            bindings: BTreeMap::from([(ButtonId::Back, Action::BrowserBack.into())]),
+            pointer_target: Some(PointerTarget::Unavailable),
+            ..HookMaps::default()
+        }));
+        let focused_safari = Cell::new(pressed_safari);
+        assert_eq!(
+            handle_button(
+                ButtonId::Back,
+                true,
+                Some(&mouse),
+                false,
+                &hooks,
+                &dispatcher,
+                || focused_safari.get(),
+            ),
+            EventDisposition::Suppress
+        );
+
+        focused_safari.set(later_safari);
+        let ButtonRuntimeEvent::Started(press) =
+            events.recv_timeout(Duration::from_secs(1)).expect("down")
+        else {
+            panic!("started");
+        };
+        let action = press.start_action().expect("browser binding");
+        let resolved = press.target().resolve_with(
+            action,
+            || current_pointer,
+            |_| panic!("an unidentified target has no window to check"),
+            || focused_safari.get(),
+        );
+        let mut navigation = (None, false);
+        if let Some(target) = resolved {
+            assert!(super::super::dispatch_browser_navigation(
+                action,
+                target,
+                |pid, forward| {
+                    assert!(!forward);
+                    navigation.0 = Some(pid);
+                    true
+                },
+                || navigation.1 = true,
+            ));
+        }
+        routes.push(navigation);
+        assert_eq!(
+            handle_button(
+                ButtonId::Back,
+                false,
+                Some(&mouse),
+                false,
+                &hooks,
+                &dispatcher,
+                || panic!("release does not retarget"),
+            ),
+            EventDisposition::Suppress
+        );
+        assert!(owner.shutdown());
+    }
+    assert_eq!(
+        routes,
+        [
+            (Some(417), false),
+            (None, true),
+            (Some(417), false),
+            (None, false)
+        ]
+    );
+}
+
+#[test]
 fn safari_target_never_relaxes_device_isolation() {
     let (dispatcher, mut owner, events) = test_dispatcher();
     let hooks = Arc::new(RwLock::new(HookMaps {
@@ -274,7 +464,7 @@ fn safari_target_never_relaxes_device_isolation() {
                         false,
                         &hooks,
                         &dispatcher,
-                        || { ActionDispatchTarget::SafariProcess(417) }
+                        || Some(417)
                     ),
                     EventDisposition::PassThrough
                 );
@@ -439,7 +629,7 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
         product_name: Some("Apple Internal Keyboard / Trackpad".into()),
         ..EventDevice::default()
     };
-    let target = || ActionDispatchTarget::SafariProcess(417);
+    let target = || Some(417);
 
     // A hold begins under a known, remappable source.
     assert_eq!(
