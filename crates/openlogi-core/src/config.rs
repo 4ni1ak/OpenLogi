@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod button_map;
 mod device;
 #[cfg(feature = "fs")]
 mod file;
@@ -30,6 +31,8 @@ mod settings;
 mod tests;
 
 pub use device::{DeviceConfig, DeviceIdentity, LinkConfig, LinkOverrides};
+#[cfg(all(test, feature = "fs", unix))]
+use file::resolve_symlinks;
 #[cfg(feature = "fs")]
 pub use file::{ConfigError, ConfigFile};
 #[cfg(all(test, feature = "fs"))]
@@ -40,8 +43,9 @@ pub use key_trigger::{KeyModifiers, KeyTrigger, KeyboardConfig, ParseTriggerErro
 pub use settings::LightSettings;
 pub use settings::{
     AppIcon, AppSettings, Appearance, AssetSourcePreference, CameraControls, DeviceViewMode,
-    Lighting, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution,
-    SmartShift, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity, WheelMode,
+    Lighting, MouseProfileTarget, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE,
+    ScrollResolution, SmartShift, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
+    WheelMode,
 };
 
 use crate::binding::Action;

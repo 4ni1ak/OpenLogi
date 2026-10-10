@@ -165,10 +165,14 @@ fn dispatch_native(action: &Action, native: NativeAction) {
         NativeAction::NextDesktop => press_key(&[ctrl, alt], KeyCode::KEY_RIGHT),
         // logind LockSession() via the system bus; falls back to Super+L.
         NativeAction::LockScreen => lock_screen(),
-        // Region vs full-screen capture depends on the desktop environment's
-        // screenshot handler for Print Screen, so both map to the same key.
-        NativeAction::Screenshot | NativeAction::CaptureRegion => {
-            press_key(&[], KeyCode::KEY_SYSRQ);
+        NativeAction::Screenshot => press_key(&[], KeyCode::KEY_SYSRQ),
+        // Print alone only opens the region selector on GNOME >= 42; other
+        // desktops need an extra chord (see `capture_region_mods`).
+        NativeAction::CaptureRegion => {
+            press_key(
+                &capture_region_mods(current_desktop().as_deref()),
+                KeyCode::KEY_SYSRQ,
+            );
         }
         // logind Suspend() via the system bus.
         NativeAction::Sleep => sleep_system(),
@@ -206,12 +210,11 @@ fn desktop_is_gnome(current_desktop: impl AsRef<str>) -> bool {
 /// (-1/0/1) scaled by the fixed relative-axis magnitude the four
 /// `Scroll*`/`HorizontalScroll*` actions have always used.
 fn dispatch_scroll(dx: i8, dy: i8) {
-    if dy != 0 {
-        scroll(RelativeAxisCode::REL_WHEEL, i32::from(dy) * 3);
-    }
-    if dx != 0 {
-        scroll(RelativeAxisCode::REL_HWHEEL, i32::from(dx) * 3);
-    }
+    post_scroll(action_scroll(dx, dy));
+}
+
+fn action_scroll(dx: i8, dy: i8) -> ScrollDelta {
+    ScrollDelta::wheel_ticks(f64::from(dx) * 3.0, f64::from(dy) * 3.0)
 }
 
 /// Not implemented yet: unicode text has no uinput encoding without a keymap.
@@ -379,11 +382,6 @@ fn click(button: KeyCode) {
     emit(&[key_ev(button, 0), syn()]);
 }
 
-/// Inject a single relative-axis delta followed by `SYN_REPORT`.
-fn scroll(axis: RelativeAxisCode, value: i32) {
-    emit(&[rel_ev(axis, value), syn()]);
-}
-
 pub(super) fn post_scroll(delta: ScrollDelta) {
     let ScrollDelta::WheelTicks { .. } = delta else {
         tracing::debug!("pixel scroll output is unsupported on Linux");
@@ -393,12 +391,20 @@ pub(super) fn post_scroll(delta: ScrollDelta) {
         tracing::warn!("Linux scroll quantizer mutex poisoned");
         return;
     };
+    let events = scroll_events(&mut output, delta);
+    drop(output);
+    if !events.is_empty() {
+        emit(&events);
+    }
+}
+
+/// One `SYN_REPORT` frame carrying `delta` on the hi-res and legacy axes, or
+/// nothing while the quantizers hold less than one unit.
+fn scroll_events(output: &mut ScrollOutput, delta: ScrollDelta) -> Vec<InputEvent> {
     let high_resolution = output
         .high_resolution
         .quantize(delta, HIGH_RES_UNITS_PER_TICK);
     let legacy = output.legacy.quantize(delta, 1.0);
-    drop(output);
-
     let mut events = Vec::with_capacity(5);
     push_scroll_axes(
         &mut events,
@@ -414,8 +420,8 @@ pub(super) fn post_scroll(delta: ScrollDelta) {
     );
     if !events.is_empty() {
         events.push(syn());
-        emit(&events);
     }
+    events
 }
 
 fn push_scroll_axes(
@@ -469,6 +475,9 @@ fn modifiers_to_keycodes(combo: &openlogi_core::binding::KeyCombo) -> Vec<KeyCod
     if combo.has_option() {
         modifiers.push(KeyCode::KEY_LEFTALT);
     }
+    if combo.has_super() {
+        modifiers.push(KeyCode::KEY_LEFTMETA);
+    }
     modifiers
 }
 
@@ -477,6 +486,7 @@ fn held_keycode(key: HeldKey) -> Option<KeyCode> {
         HeldKey::Control => Some(KeyCode::KEY_LEFTCTRL),
         HeldKey::Shift => Some(KeyCode::KEY_LEFTSHIFT),
         HeldKey::Alt => Some(KeyCode::KEY_LEFTALT),
+        HeldKey::Super => Some(KeyCode::KEY_LEFTMETA),
         HeldKey::Key(usage) => {
             let key = hid_usage_to_linux(usage.code());
             if key.is_none() {
@@ -630,6 +640,35 @@ fn lock_screen() {
     press_key(&[KeyCode::KEY_LEFTMETA], KeyCode::KEY_L);
 }
 
+/// `$XDG_CURRENT_DESKTOP`, lowercased, or `None` if unset.
+fn current_desktop() -> Option<String> {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .ok()
+        .map(|d| d.to_lowercase())
+}
+
+/// The extra modifiers Print needs to open the region selector instead of
+/// taking a full-screen shot, chosen from the (colon-separated)
+/// `$XDG_CURRENT_DESKTOP` value.
+///
+/// GNOME >= 42 already opens the interactive selector on a bare Print, and
+/// that is what an unset or unrecognised desktop keeps. Cinnamon, MATE and
+/// XFCE bind region capture to Shift+Print; KDE Plasma binds it to
+/// Meta+Shift+Print.
+fn capture_region_mods(desktop: Option<&str>) -> Vec<KeyCode> {
+    let Some(desktop) = desktop else {
+        return Vec::new();
+    };
+    let mut desktops = desktop.split(':');
+    if desktops.clone().any(|d| d == "kde") {
+        vec![KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTSHIFT]
+    } else if desktops.any(|d| matches!(d, "x-cinnamon" | "cinnamon" | "mate" | "xfce")) {
+        vec![KeyCode::KEY_LEFTSHIFT]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Suspend the system via logind's `Suspend()` on the system bus. The
 /// `false` argument declines the "interactive" polkit prompt — if the
 /// session isn't allowed to suspend, the call fails and is logged rather
@@ -709,10 +748,13 @@ fn try_mpris_command(command: &str) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use evdev::KeyCode;
+    use evdev::{KeyCode, RelativeAxisCode};
     use openlogi_core::binding::{KeyCombo, Shortcut};
 
-    use super::{combo, hid_usage_to_linux, key_ev, key_phase_events, modifiers_to_keycodes, syn};
+    use super::{
+        ScrollOutput, action_scroll, capture_region_mods, combo, hid_usage_to_linux, key_ev,
+        key_phase_events, modifiers_to_keycodes, rel_ev, scroll_events, syn,
+    };
     use crate::inject::KeyPhase;
 
     #[test]
@@ -736,6 +778,32 @@ mod tests {
                 syn(),
             ]
         );
+    }
+
+    /// libinput reads only the hi-res axes of a device that has them, so a
+    /// scroll action without them does nothing.
+    #[test]
+    fn scroll_actions_send_hi_res_and_legacy_axes_in_one_frame() {
+        let (wheel, wheel_hi) = (
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+        );
+        let (hwheel, hwheel_hi) = (
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+        );
+        for (dx, dy, hi_res, legacy, sign) in [
+            (0, 1, wheel_hi, wheel, 1),
+            (0, -1, wheel_hi, wheel, -1),
+            (1, 0, hwheel_hi, hwheel, 1),
+            (-1, 0, hwheel_hi, hwheel, -1),
+        ] {
+            assert_eq!(
+                scroll_events(&mut ScrollOutput::default(), action_scroll(dx, dy)),
+                vec![rel_ev(hi_res, sign * 360), rel_ev(legacy, sign * 3), syn()],
+                "scroll ({dx}, {dy})"
+            );
+        }
     }
 
     #[test]
@@ -802,5 +870,31 @@ mod tests {
                 "XDG_CURRENT_DESKTOP={value:?}"
             );
         }
+    }
+
+    #[test]
+    fn capture_region_mods_picks_the_desktops_chord() {
+        assert_eq!(capture_region_mods(None), vec![]);
+        assert_eq!(capture_region_mods(Some("gnome")), vec![]);
+        assert_eq!(capture_region_mods(Some("unity")), vec![]);
+        assert_eq!(
+            capture_region_mods(Some("x-cinnamon")),
+            vec![KeyCode::KEY_LEFTSHIFT]
+        );
+        assert_eq!(
+            capture_region_mods(Some("mate")),
+            vec![KeyCode::KEY_LEFTSHIFT]
+        );
+        assert_eq!(
+            capture_region_mods(Some("xfce")),
+            vec![KeyCode::KEY_LEFTSHIFT]
+        );
+        assert_eq!(
+            capture_region_mods(Some("kde")),
+            vec![KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTSHIFT]
+        );
+        // GNOME-on-Ubuntu reports "ubuntu:gnome" — the compound string must
+        // still resolve to the GNOME (no-op) branch, not fall through.
+        assert_eq!(capture_region_mods(Some("ubuntu:gnome")), vec![]);
     }
 }

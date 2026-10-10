@@ -38,6 +38,12 @@ pub use openlogi_core::binding::ButtonId;
 pub use openlogi_core::config::KeyModifiers;
 pub use openlogi_core::scroll::ScrollDelta;
 
+mod pointer;
+pub use pointer::{
+    PointerContext, PointerTarget, pointer_context, pointer_context_supported,
+    pointer_target_is_focused,
+};
+
 /// Logitech's USB/Bluetooth vendor id (`0x046D`), widened from
 /// [`openlogi_core::hid::LOGITECH_VENDOR_ID`] because the hook's identity
 /// sources (IOKit, evdev) hand it back as a `u32`.
@@ -508,12 +514,9 @@ impl Hook {
 
 /// Return the currently frontmost application.
 ///
-/// [`ForegroundApp::id`] is the identifier per-app profiles match on: the
-/// bundle identifier on macOS (e.g. `"com.microsoft.VSCode"`), the `WM_CLASS`
-/// class component under X11 / XWayland (e.g. `"Code"`), the xdg-shell
-/// `app_id` under wlroots (e.g. `"org.mozilla.firefox"`), and the lower-cased
-/// executable path on Windows. [`ForegroundApp::display_name`] is whatever the
-/// platform can name it, falling back to the identifier.
+/// [`ForegroundApp::id`] defines the platform-specific identifier that per-app
+/// profiles match. [`ForegroundApp::display_name`] is the platform's application
+/// name, falling back to the identifier.
 ///
 /// `None` when no app is frontmost, when reading fails, or on an unsupported
 /// platform — including a pure-Wayland session with no backend (see
