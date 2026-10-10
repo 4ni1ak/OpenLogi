@@ -2,64 +2,76 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::marker::{PhantomData, PhantomPinned};
 
-use core_foundation::base::{CFTypeRef, TCFType as _};
+use core_foundation::array::{CFArray, CFArrayRef};
+use core_foundation::base::{CFAllocatorRef, CFType, CFTypeRef, TCFType as _};
+use core_foundation::dictionary::CFDictionaryRef;
+use core_foundation::number::CFNumber;
+use core_foundation::set::{CFSet, CFSetGetValues, CFSetRef};
 use core_foundation::string::{CFString, CFStringRef};
 use tracing::warn;
 
 use crate::EventDevice;
 
-type IOHIDManagerRef = *mut c_void;
-type IOHIDDeviceRef = *mut c_void;
-type IOHIDElementRef = *mut c_void;
-type IOHIDValueRef = *mut c_void;
-type CFSetRef = *const c_void;
-type CFArrayRef = *const c_void;
+macro_rules! opaque_hid_type {
+    ($name:ident) => {
+        #[repr(C)]
+        struct $name {
+            _data: [u8; 0],
+            _marker: PhantomData<(*mut u8, PhantomPinned)>,
+        }
+    };
+}
+opaque_hid_type!(OpaqueHidManager);
+opaque_hid_type!(OpaqueHidDevice);
+opaque_hid_type!(OpaqueHidElement);
+opaque_hid_type!(OpaqueHidValue);
 
-const IO_RETURN_SUCCESS: i32 = 0;
+type IOHIDManagerRef = *mut OpaqueHidManager;
+type IOHIDDeviceRef = *mut OpaqueHidDevice;
+type IOHIDElementRef = *mut OpaqueHidElement;
+type IOHIDValueRef = *mut OpaqueHidValue;
+type IOReturn = i32;
+
+const IO_RETURN_SUCCESS: IOReturn = 0;
 const HID_PAGE_GENERIC_DESKTOP: u32 = 0x01;
 const HID_USAGE_MOUSE: u32 = 0x02;
 const HID_PAGE_BUTTON: u32 = 0x09;
-const CF_NUMBER_SINT64_TYPE: i32 = 4;
 
+// `objc2-io-kit` binds these, but it is not an `openlogi-hook` dependency;
+// every Core Foundation value they return is adopted by a `core-foundation`
+// wrapper instead of being released by hand.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    fn IOHIDManagerCreate(allocator: CFTypeRef, options: u32) -> IOHIDManagerRef;
-    fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFTypeRef);
-    fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> i32;
-    fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> i32;
+    fn IOHIDManagerCreate(allocator: CFAllocatorRef, options: u32) -> IOHIDManagerRef;
+    fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
+    fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> IOReturn;
+    fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> IOReturn;
     fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
     fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) -> CFTypeRef;
     fn IOHIDDeviceCopyMatchingElements(
         device: IOHIDDeviceRef,
-        matching: CFTypeRef,
+        matching: CFDictionaryRef,
         options: u32,
     ) -> CFArrayRef;
     fn IOHIDDeviceGetValue(
         device: IOHIDDeviceRef,
         element: IOHIDElementRef,
         value: *mut IOHIDValueRef,
-    ) -> i32;
+    ) -> IOReturn;
     fn IOHIDElementGetUsagePage(element: IOHIDElementRef) -> u32;
     fn IOHIDElementGetUsage(element: IOHIDElementRef) -> u32;
     fn IOHIDValueGetIntegerValue(value: IOHIDValueRef) -> isize;
 }
 
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFRelease(value: *const c_void);
-    fn CFSetGetCount(set: CFSetRef) -> isize;
-    fn CFSetGetValues(set: CFSetRef, values: *mut *const c_void);
-    fn CFArrayGetCount(array: CFArrayRef) -> isize;
-    fn CFArrayGetValueAtIndex(array: CFArrayRef, index: isize) -> *const c_void;
-    fn CFGetTypeID(value: CFTypeRef) -> usize;
-    fn CFNumberGetTypeID() -> usize;
-    fn CFNumberGetValue(number: CFTypeRef, number_type: i32, value: *mut c_void) -> bool;
-    fn CFStringGetTypeID() -> usize;
-}
-
 /// Long-lived manager used only for rare sender-less button transitions.
-struct HidManager(IOHIDManagerRef);
+struct HidManager {
+    manager: IOHIDManagerRef,
+    /// The +1 reference from `IOHIDManagerCreate`; dropped after `Drop`
+    /// closes the manager.
+    _owner: CFType,
+}
 
 // SAFETY: IOHIDManager is a Core Foundation object that may be transferred
 // between threads. Ownership is exclusive and every operation is serialized by
@@ -67,22 +79,25 @@ struct HidManager(IOHIDManagerRef);
 unsafe impl Send for HidManager {}
 
 impl HidManager {
-    fn open() -> Result<Self, i32> {
+    fn open() -> Result<Self, IOReturn> {
         // SAFETY: a null allocator selects the process default; zero options are documented.
         let manager = unsafe { IOHIDManagerCreate(std::ptr::null(), 0) };
         if manager.is_null() {
             return Err(-1);
         }
+        // SAFETY: `manager` is a non-null +1 CF object owned from here on.
+        let owner = unsafe { CFType::wrap_under_create_rule(manager.cast_const().cast()) };
         // SAFETY: `manager` is live; null matching means all HID devices.
         unsafe { IOHIDManagerSetDeviceMatching(manager, std::ptr::null()) };
         // SAFETY: `manager` is live and opened once with documented zero options.
         let result = unsafe { IOHIDManagerOpen(manager, 0) };
-        if result == IO_RETURN_SUCCESS {
-            return Ok(Self(manager));
+        if result != IO_RETURN_SUCCESS {
+            return Err(result);
         }
-        // SAFETY: creation returned a +1 object which must be released on failure.
-        unsafe { CFRelease(manager.cast_const()) };
-        Err(result)
+        Ok(Self {
+            manager,
+            _owner: owner,
+        })
     }
 
     fn pressed_devices(&self, button_number: i64) -> Vec<ButtonCandidate> {
@@ -90,27 +105,23 @@ impl HidManager {
             return Vec::new();
         };
         // SAFETY: the manager stays open for `self`; Copy returns a +1 set or null.
-        let devices = unsafe { IOHIDManagerCopyDevices(self.0) };
+        let devices = unsafe { IOHIDManagerCopyDevices(self.manager) };
         if devices.is_null() {
             return Vec::new();
         }
-        let candidates = device_values(devices)
+        // SAFETY: `devices` is a non-null +1 CFSet owned from here on.
+        let devices: CFSet = unsafe { CFSet::wrap_under_create_rule(devices) };
+        device_values(&devices)
             .into_iter()
-            .filter_map(|device| candidate_for_button(device.cast_mut(), usage))
-            .collect();
-        // SAFETY: balance the +1 returned by IOHIDManagerCopyDevices.
-        unsafe { CFRelease(devices) };
-        candidates
+            .filter_map(|device| candidate_for_button(device.cast_mut().cast(), usage))
+            .collect()
     }
 }
 
 impl Drop for HidManager {
     fn drop(&mut self) {
-        // SAFETY: this is the only owner and the manager is still live.
-        unsafe {
-            let _ = IOHIDManagerClose(self.0, 0);
-            CFRelease(self.0.cast_const());
-        }
+        // SAFETY: the manager is live until `_owner` drops after this returns.
+        let _ = unsafe { IOHIDManagerClose(self.manager, 0) };
     }
 }
 
@@ -227,15 +238,11 @@ impl SenderlessButtonResolver {
     }
 }
 
-fn device_values(devices: CFSetRef) -> Vec<*const c_void> {
-    // SAFETY: `devices` is a live CFSet during this call.
-    let count = unsafe { CFSetGetCount(devices) };
-    let Ok(count) = usize::try_from(count) else {
-        return Vec::new();
-    };
-    let mut values = vec![std::ptr::null(); count];
-    // SAFETY: `values` contains exactly `count` writable pointer slots.
-    unsafe { CFSetGetValues(devices, values.as_mut_ptr()) };
+/// The set's members, borrowed: they stay valid only while `devices` lives.
+fn device_values(devices: &CFSet) -> Vec<*const c_void> {
+    let mut values = vec![std::ptr::null(); devices.len()];
+    // SAFETY: `devices` is live and `values` has exactly one slot per member.
+    unsafe { CFSetGetValues(devices.as_concrete_TypeRef(), values.as_mut_ptr()) };
     values
 }
 
@@ -262,28 +269,20 @@ fn button_value(device: IOHIDDeviceRef, usage: u32) -> Option<isize> {
     if elements.is_null() {
         return None;
     }
-    let value = find_button_value(device, elements, usage);
-    // SAFETY: balance the +1 returned by IOHIDDeviceCopyMatchingElements.
-    unsafe { CFRelease(elements) };
-    value
-}
-
-fn find_button_value(device: IOHIDDeviceRef, elements: CFArrayRef, usage: u32) -> Option<isize> {
-    // SAFETY: `elements` is a live CFArray during this call.
-    let count = unsafe { CFArrayGetCount(elements) };
-    for index in 0..count {
-        // SAFETY: `index` is within the array count; the array retains the element.
-        let element = unsafe { CFArrayGetValueAtIndex(elements, index) }.cast_mut();
-        // SAFETY: `element` came from the device's element array and is live.
+    // SAFETY: `elements` is a non-null +1 CFArray owned from here on.
+    let elements: CFArray = unsafe { CFArray::wrap_under_create_rule(elements) };
+    elements.get_all_values().into_iter().find_map(|element| {
+        let element: IOHIDElementRef = element.cast_mut().cast();
+        // SAFETY: `element` is retained by `elements`, which outlives this closure.
         let matches = unsafe {
             IOHIDElementGetUsagePage(element) == HID_PAGE_BUTTON
                 && IOHIDElementGetUsage(element) == usage
         };
-        if matches {
-            return current_value(device, element);
+        if !matches {
+            return None;
         }
-    }
-    None
+        current_value(device, element)
+    })
 }
 
 fn current_value(device: IOHIDDeviceRef, element: IOHIDElementRef) -> Option<isize> {
@@ -307,39 +306,29 @@ fn property_u32(device: IOHIDDeviceRef, key: &str) -> Option<u32> {
 /// touchpad exposing a mouse HID interface would pass the trackpad check by
 /// omission and become remappable through `is_logitech()` alone.
 fn device_string(device: IOHIDDeviceRef, key: &str) -> Option<String> {
-    let key = CFString::new(key);
-    // SAFETY: `device` is live and `key` is a valid CFString for this call.
-    let property = unsafe { IOHIDDeviceGetProperty(device, key.as_concrete_TypeRef()) };
-    // SAFETY: Core Foundation type-id queries accept any non-null CF object.
-    if property.is_null() || unsafe { CFGetTypeID(property) != CFStringGetTypeID() } {
-        return None;
-    }
-    // SAFETY: `IOHIDDeviceGetProperty` follows the "get" rule (no retain
-    // transferred to the caller) and the type-id check above proves
-    // `property` is a CFString; `wrap_under_get_rule` borrows it just long
-    // enough to copy the text out, matching `device_number`'s treatment of
-    // the same API's CFNumber results.
-    Some(unsafe { CFString::wrap_under_get_rule(property.cast()) }.to_string())
+    Some(
+        device_property(device, key)?
+            .downcast::<CFString>()?
+            .to_string(),
+    )
 }
 
 fn device_number(device: IOHIDDeviceRef, key: &str) -> Option<u64> {
+    let value = device_property(device, key)?
+        .downcast::<CFNumber>()?
+        .to_i64()?;
+    u64::try_from(value).ok()
+}
+
+fn device_property(device: IOHIDDeviceRef, key: &str) -> Option<CFType> {
     let key = CFString::new(key);
     // SAFETY: `device` is live and `key` is a valid CFString for this call.
     let property = unsafe { IOHIDDeviceGetProperty(device, key.as_concrete_TypeRef()) };
-    // SAFETY: Core Foundation type-id queries accept any non-null CF object.
-    if property.is_null() || unsafe { CFGetTypeID(property) != CFNumberGetTypeID() } {
+    if property.is_null() {
         return None;
     }
-    let mut value = 0_i64;
-    // SAFETY: type-id validation above proves `property` is a CFNumber; output is i64.
-    let read = unsafe {
-        CFNumberGetValue(
-            property,
-            CF_NUMBER_SINT64_TYPE,
-            (&raw mut value).cast::<c_void>(),
-        )
-    };
-    (read && value >= 0).then_some(value.unsigned_abs())
+    // SAFETY: a non-null Get-rule CF object; this takes its own retain.
+    Some(unsafe { CFType::wrap_under_get_rule(property) })
 }
 
 fn unique_pressed_logitech(candidates: &[ButtonCandidate]) -> Option<EventDevice> {
