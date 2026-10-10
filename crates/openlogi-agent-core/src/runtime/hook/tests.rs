@@ -172,9 +172,13 @@ fn resolve_gesture_click_prefers_explicit_then_falls_back_to_default() {
 
 #[test]
 fn fail_open_press_pairs_release() {
-    let mut fail_open = HashSet::new();
+    let mut fail_open = HashMap::new();
     assert_eq!(
-        remapped_press_disposition(ButtonId::Back, true, &mut fail_open),
+        remapped_press_disposition(
+            ButtonId::Back,
+            Some(token(1, ButtonId::Back)),
+            &mut fail_open
+        ),
         EventDisposition::Suppress
     );
     assert_eq!(
@@ -182,7 +186,7 @@ fn fail_open_press_pairs_release() {
         EventDisposition::Suppress
     );
     assert_eq!(
-        remapped_press_disposition(ButtonId::Forward, false, &mut fail_open),
+        remapped_press_disposition(ButtonId::Forward, None, &mut fail_open),
         EventDisposition::PassThrough
     );
     assert_eq!(
@@ -691,6 +695,78 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
     assert_eq!(
         HOLD.with_borrow_mut(|h| h.accumulate(GESTURE_SWIPE_THRESHOLD + 10, 0)),
         None
+    );
+
+    assert!(owner.shutdown());
+}
+
+/// The held-binding half of the same hazard: a long-press accepted under a
+/// known source must not keep timing after a competing press invalidates its
+/// attribution, because its own release will arrive unattributed and pass
+/// through without ever reaching the dispatcher.
+#[test]
+fn an_invalidated_attribution_cancels_the_held_binding_it_began_under() {
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(HookMaps {
+        bindings: BTreeMap::from([(
+            ButtonId::Back,
+            Binding::LongPress(LongPressBinding::new(Action::Copy, Action::MissionControl)),
+        )]),
+        ..HookMaps::default()
+    }));
+    let logitech = EventDevice {
+        product_name: Some("Logitech MX Master 3".into()),
+        ..EventDevice::default()
+    };
+    // A non-remappable known source drives the rejected-source branch on
+    // every platform, as in the gesture-hold test above.
+    let trackpad = EventDevice {
+        product_name: Some("Apple Internal Keyboard / Trackpad".into()),
+        ..EventDevice::default()
+    };
+
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            true,
+            Some(&logitech),
+            false,
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::Suppress
+    );
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(1)),
+        Ok(ButtonRuntimeEvent::Started(_))
+    ));
+
+    assert_eq!(
+        handle_button(
+            ButtonId::Back,
+            true,
+            Some(&trackpad),
+            true,
+            &hooks,
+            &dispatcher,
+            || None
+        ),
+        EventDisposition::PassThrough
+    );
+    assert!(
+        matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Ok(ButtonRuntimeEvent::Ended {
+                reason: EndReason::Canceled(CancelReason::StaleHold),
+                ..
+            })
+        ),
+        "the held binding's lifecycle must be released"
+    );
+    assert!(
+        SUPPRESSED_PRESSES.with_borrow(|s| !s.contains_key(&ButtonId::Back)),
+        "a later attributed release must not be suppressed for the cancelled press"
     );
 
     assert!(owner.shutdown());

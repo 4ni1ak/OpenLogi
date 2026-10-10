@@ -4,7 +4,7 @@
 //! and converts callback-thread mouse/key input into the shared action runtime.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -188,7 +188,8 @@ thread_local! {
     static HOLD: RefCell<HoldState> = RefCell::new(HoldState::default());
     /// Accepted non-gesture presses retain their edge disposition even when
     /// moving the pointer changes the binding before physical release.
-    static SUPPRESSED_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
+    static SUPPRESSED_PRESSES: RefCell<HashMap<ButtonId, PressToken>> =
+        RefCell::new(HashMap::new());
     /// Function keys whose held action owns an accepted lifecycle. Repeated
     /// key-down events are auto-repeat, not replacement presses; their first
     /// matching key-up ends the lifecycle.
@@ -267,15 +268,17 @@ fn handle_button(
     }
     if !button_source_may_remap(device) {
         // On macOS, a competing device can make `id`'s attribution ambiguous
-        // mid-hold. The release that would otherwise end that hold arrives
-        // unattributed too and never reaches the `HOLD.end` branch below, so
-        // cancel it here instead of leaving a stale hold for the next stray
-        // pointer move to turn into a phantom swipe.
-        if pressed
-            && attribution_invalidated
-            && let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id))
-        {
-            dispatcher.cancel_stale_hook_press(&press);
+        // mid-press. The release that would otherwise end that press arrives
+        // unattributed too and never reaches the release handling below, so
+        // cancel its hold or held binding here instead of leaving a stale
+        // lifecycle for a stray pointer move or timer to fire.
+        if pressed && attribution_invalidated {
+            if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id)) {
+                dispatcher.cancel_stale_hook_press(&press);
+            }
+            if let Some(press) = SUPPRESSED_PRESSES.with_borrow_mut(|s| s.remove(&id)) {
+                dispatcher.cancel_stale_hook_press(&press);
+            }
         }
         return EventDisposition::PassThrough;
     }
@@ -307,8 +310,7 @@ fn handle_button(
                 HOLD.with_borrow_mut(|h| h.begin(id, press));
                 return EventDisposition::Suppress;
             }
-            return SUPPRESSED_PRESSES
-                .with_borrow_mut(|s| remapped_press_disposition(id, false, s));
+            return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, None, s));
         }
     } else {
         // Drop the HOLD borrow before any queueing (re-entrancy freeze hazard).
@@ -336,16 +338,14 @@ fn handle_button(
     }
 
     let Some(binding) = binding else {
-        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, false, s));
+        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, None, s));
     };
     if binding_is_native_click(id, &binding) {
-        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, false, s));
+        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, None, s));
     }
     info!(button = %id, action = %binding.click_action().label(), "button → handling binding");
-    let queued = dispatcher
-        .try_hook_button_down(id, Some(&binding), action_target)
-        .is_some();
-    SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, queued, s))
+    let press = dispatcher.try_hook_button_down(id, Some(&binding), action_target);
+    SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, press, s))
 }
 
 fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
@@ -353,14 +353,14 @@ fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
 }
 
 /// Press of a remapped single-action button: suppress when the action was
-/// queued, and remember that decision so release uses the same disposition.
+/// queued, and remember its press so release uses the same disposition.
 fn remapped_press_disposition(
     id: ButtonId,
-    queued: bool,
-    suppressed: &mut HashSet<ButtonId>,
+    press: Option<PressToken>,
+    suppressed: &mut HashMap<ButtonId, PressToken>,
 ) -> EventDisposition {
-    if queued {
-        suppressed.insert(id);
+    if let Some(press) = press {
+        suppressed.insert(id, press);
         EventDisposition::Suppress
     } else {
         suppressed.remove(&id);
@@ -371,9 +371,9 @@ fn remapped_press_disposition(
 /// A release follows its matching press, not the pointer's current profile.
 fn remapped_release_disposition(
     id: ButtonId,
-    suppressed: &mut HashSet<ButtonId>,
+    suppressed: &mut HashMap<ButtonId, PressToken>,
 ) -> EventDisposition {
-    if suppressed.remove(&id) {
+    if suppressed.remove(&id).is_some() {
         EventDisposition::Suppress
     } else {
         EventDisposition::PassThrough
