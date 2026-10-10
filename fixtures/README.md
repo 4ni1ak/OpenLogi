@@ -19,6 +19,31 @@ review. `cargo test -p openlogi-cli fixture::verify` also discovers and strictly
 verifies every fixture directory in this corpus and the packaged synthetic
 corpus, including newly added specimens.
 
+## Automatic verification
+
+The repository tests discover every specimen through `openlogi_fixture::fs::repository_corpus`. Missing files, extra files, symlinks, invalid identities, and an absent or empty repository corpus fail the suite. Published packages without the repository workspace report that the contributed corpus is unavailable; their embedded synthetic fixture remains testable.
+
+Run the complete recorded-data chain on macOS:
+
+```sh
+cargo test -p openlogi-cli -p openlogi-agent-core -p openlogi-agent -p openlogi-desktop contributed_corpus
+cargo test -p openlogi-cli fixture::verify
+cargo test -p openlogi-fixture --features fs fs::tests
+```
+
+| Boundary | Automated contract |
+| --- | --- |
+| CLI / device operations | Every declared case executes its production read and consumes every required cassette exchange. Settings match the profile. Feature tables, control tables, and battery diagnostics match fixed reviewed expectations. |
+| Agent hardware | All recorded DPI, SmartShift, wheel, and backlight reads use the injected backend, exact-route registry, receiver lease, and device-I/O gate. An unpublished route and a suspended gate refuse the operation. Resuming permits the recorded read on one channel. |
+| Mock Agent / IPC | Every profile supplies the real mock RPC handlers. Tests check setting support, DPI and SmartShift write/readback, snapshots, and frozen-time observations. Unix tests run the production handshake and bincode socket transport in an isolated process. |
+| Desktop | Every profile enters `AppState::apply_agent_snapshot`. Tests check identity, routes, battery, measured capabilities, expected detail tabs, and stable identity across offline/online snapshots. |
+
+The operation expectation file is [`corpus_diagnostics.json`](../crates/openlogi-cli/src/cmd/fixture/record_case/corpus_diagnostics.json). Each feature tuple is `[feature_id, version, type_bits]`; each control tuple is `[control_id, task_id, capability_bits]`. The initial tables were transcribed from reviewed response payloads, independently of the production decoder. Tests never regenerate expectations. When adding a specimen, review and add its exact case set, diagnostics, and desktop tab expectations. Unknown operations, missing expectations, deleted reviewed specimens, and changed case coverage fail.
+
+All suites run under the existing workspace test jobs. Linux and Windows run device and Agent tests; macOS also runs desktop tests. Unix socket isolation is unavailable on the fixed Windows pipe, so Windows runs the in-memory RPC suite instead.
+
+These contributions contain individual read operations, not full discovery sessions. Agent tests publish an opened recorded route as fixture setup; separate synthetic enumeration tests cover discovery and reconnect topology. The corpus replay helper rejects multi-device and raw-HID profiles instead of guessing an operation target. Firmware cases remain excluded pending privacy classification. Mock writes, offline transitions, and replay do not establish physical write behavior, gestures, haptics, radio reconnects, or OS permissions.
+
 ## Contribute a device fixture
 
 Use the contribution wizard instead of writing `manifest.json`, synthetic
