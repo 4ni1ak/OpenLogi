@@ -217,6 +217,9 @@ pub(super) fn translate(
             // TapDisabledByUserInput fires during ordinary heavy input bursts and
             // self-heals next slice, so it isn't worth a warning each time.
             debug!("CGEventTap disabled by OS (type={etype:?}); re-enabling, cancelling any hold");
+            // The same gap can drop the button-up a cached sender-less
+            // attribution was waiting for.
+            resolver.cancel_all();
             Some(MouseEvent::CaptureInterrupted)
         }
         _ => None,
