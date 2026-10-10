@@ -444,20 +444,13 @@ fn thumbwheel_inspector(
         (Some(_), false) => tr!("profiles.inherited_from_default"),
         (None, _) => tr!("profiles.default_profile"),
     };
-    let current_label = current.map_or_else(
-        || tr!("common.custom"),
-        |preset| tr!(preset.translation_key()),
-    );
+    let current_label = current.map_or_else(|| tr!("common.custom"), |p| tr!(p.translation_key()));
     let current_icon = current.map_or("action-icons/chevrons-right.svg", ThumbwheelPreset::icon);
     let observer = picker.view.clone();
 
     v_flex()
         .gap_3()
-        .child(inspector_heading(
-            tr!("pointer.thumb_wheel"),
-            Some(status),
-            pal,
-        ))
+        .child(inspector_heading(tr!("pointer.thumb_wheel"), Some(status), pal))
         .child(selection_card(
             "inspector-current-thumbwheel-preset",
             tr!("common.preset"),
