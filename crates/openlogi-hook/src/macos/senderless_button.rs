@@ -135,18 +135,63 @@ impl Drop for HidManager {
     }
 }
 
+/// How the backing HID event identified the device behind a button event.
+pub(super) enum ButtonSender {
+    /// No HID event backs the `CGEvent`: software posted it, so it has no
+    /// physical device to attribute and must not touch any held press.
+    Posted,
+    /// The HID sender resolved to this device.
+    Device(EventDevice),
+    /// A HID event with sender id zero, which macOS 27 reports for some
+    /// physical button transitions.
+    Unidentified,
+}
+
+impl ButtonSender {
+    /// Classify `event_sender_id`'s result: `None` is a posted event, zero is
+    /// a sender-less HID event, anything else names a device via `lookup`.
+    pub(super) fn from_sender_id(
+        sender_id: Option<u64>,
+        lookup: impl FnOnce(u64) -> EventDevice,
+    ) -> Self {
+        match sender_id {
+            None => Self::Posted,
+            Some(0) => Self::Unidentified,
+            Some(sender_id) => Self::Device(lookup(sender_id)),
+        }
+    }
+}
+
+/// What a mouse's HID element reports for the queried button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ButtonState {
+    Pressed,
+    Released,
+    /// The device has the button but its state could not be read.
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 struct ButtonCandidate {
     device: EventDevice,
-    pressed: bool,
+    state: ButtonState,
+}
+
+/// The device a still-held button press was attributed to.
+#[derive(Clone, Debug)]
+struct HeldSource {
+    device: EventDevice,
+    /// Whether the press was attributed by the `IOHIDManager` fallback, so
+    /// its release will arrive sender-less too.
+    senderless: bool,
 }
 
 /// Resolves and caches device identity across a sender-less down/up pair.
 pub(super) struct SenderlessButtonResolver {
     manager: Option<HidManager>,
-    held_sources: HashMap<i64, EventDevice>,
-    /// Set by [`Self::resolve_press`] when an ambiguous press evicts a
-    /// previously cached attribution, read and cleared by
+    held_sources: HashMap<i64, HeldSource>,
+    /// Set by [`Self::resolve_press`] when a refused press evicts a
+    /// sender-less attribution, read and cleared by
     /// [`Self::take_attribution_invalidated`]. See that method's doc for why
     /// this needs to outlive `resolve`'s own return value.
     attribution_invalidated: bool,
@@ -180,15 +225,14 @@ impl SenderlessButtonResolver {
         }
     }
 
-    /// Whether the most recent [`Self::resolve`] call evicted a previously
-    /// cached attribution because a competing device made its button
-    /// ambiguous — distinct from an ordinary release removing its own cache
-    /// entry. The corresponding release for the device that lost its
-    /// attribution will itself arrive unattributed (see `resolve`'s
-    /// no-sender-id release path) and never reach the code that would end a
-    /// hold begun under it, so the runtime uses this to cancel that hold
-    /// directly instead. Clears on read so a later, unrelated call doesn't
-    /// see a stale `true`.
+    /// Whether the most recent [`Self::resolve`] call evicted a sender-less
+    /// attribution because a competing press made its button ambiguous —
+    /// distinct from an ordinary release removing its own cache entry. The
+    /// release for the device that lost its attribution will itself arrive
+    /// unattributed and never reach the code that would end a hold begun
+    /// under it, so the runtime uses this to cancel that hold directly
+    /// instead. Clears on read so a later, unrelated call doesn't see a
+    /// stale `true`.
     pub(super) fn take_attribution_invalidated(&mut self) -> bool {
         std::mem::take(&mut self.attribution_invalidated)
     }
@@ -206,44 +250,67 @@ impl SenderlessButtonResolver {
         &mut self,
         button_number: i64,
         pressed: bool,
-        sender_source: Option<EventDevice>,
+        sender: ButtonSender,
     ) -> Option<EventDevice> {
-        if let Some(source) = sender_source {
-            if !pressed {
-                self.held_sources.remove(&button_number);
+        match sender {
+            ButtonSender::Posted => None,
+            ButtonSender::Device(device) => {
+                if pressed {
+                    self.held_sources.insert(
+                        button_number,
+                        HeldSource {
+                            device: device.clone(),
+                            senderless: false,
+                        },
+                    );
+                } else if self
+                    .held_sources
+                    .get(&button_number)
+                    .is_some_and(|held| held.device == device)
+                {
+                    self.held_sources.remove(&button_number);
+                }
+                Some(device)
             }
-            return Some(source);
+            ButtonSender::Unidentified if !pressed => self
+                .held_sources
+                .remove(&button_number)
+                .map(|held| held.device),
+            ButtonSender::Unidentified => {
+                let candidates = self
+                    .manager
+                    .as_ref()
+                    .map(|manager| manager.pressed_devices(button_number));
+                self.resolve_press(button_number, candidates.as_deref())
+            }
         }
-        if !pressed {
-            return self.held_sources.remove(&button_number);
-        }
-        let candidates = self.manager.as_ref()?.pressed_devices(button_number);
-        self.resolve_press(button_number, &candidates)
     }
 
-    /// The new-press half of [`Self::resolve`], taking already-read
-    /// candidates directly so it can be exercised without a live
-    /// `IOHIDManager` — see the tests module.
+    /// The sender-less press half of [`Self::resolve`], taking already-read
+    /// candidates (`None` when no `IOHIDManager` is available) so it can be
+    /// exercised without hardware — see the tests module.
     fn resolve_press(
         &mut self,
         button_number: i64,
-        candidates: &[ButtonCandidate],
+        candidates: Option<&[ButtonCandidate]>,
     ) -> Option<EventDevice> {
-        let Some(source) = unique_pressed_logitech(candidates) else {
-            // An ambiguous new press (e.g. a second mouse pressing the same
-            // button number while a prior press is still held) invalidates
-            // any stale cache entry for this button: nothing proves a later
-            // release belongs to the device that earned the cached
-            // attribution rather than to this new, unattributable press.
-            // Without this, that release would wrongly end the cached
-            // device's hold instead of passing through unattributed like its
-            // own down did.
-            if self.held_sources.remove(&button_number).is_some() {
-                self.attribution_invalidated = true;
-            }
+        // A device cannot press a button it is still holding, so a press of a
+        // held button belongs to some other device — possibly one the HID
+        // poll cannot see — and the held device's pressed state proves
+        // nothing about it. The held attribution is just as unprovable from
+        // here on: a later sender-less release could belong to either.
+        if let Some(held) = self.held_sources.remove(&button_number) {
+            self.attribution_invalidated = held.senderless;
             return None;
-        };
-        self.held_sources.insert(button_number, source.clone());
+        }
+        let source = unique_pressed_logitech(candidates?)?;
+        self.held_sources.insert(
+            button_number,
+            HeldSource {
+                device: source.clone(),
+                senderless: true,
+            },
+        );
         Some(source)
     }
 }
@@ -256,43 +323,48 @@ fn device_values(devices: &CFSet) -> Vec<*const c_void> {
     values
 }
 
+/// The device's state for button `usage`, or `None` when it has no such
+/// button. The manager only opens devices exposing a mouse usage, so every
+/// device here is a potential source; any read that fails reports
+/// [`ButtonState::Unknown`] instead of dropping the device.
 fn candidate_for_button(device: IOHIDDeviceRef, usage: u32) -> Option<ButtonCandidate> {
-    if device_number(device, "PrimaryUsagePage")? != u64::from(HID_PAGE_GENERIC_DESKTOP)
-        || device_number(device, "PrimaryUsage")? != u64::from(HID_USAGE_MOUSE)
-    {
-        return None;
-    }
-    let pressed = button_value(device, usage)? != 0;
+    let state = button_state(device, usage)?;
     Some(ButtonCandidate {
         device: EventDevice {
             vendor_id: property_u32(device, "VendorID"),
             product_id: property_u32(device, "ProductID"),
             product_name: device_string(device, "Product"),
         },
-        pressed,
+        state,
     })
 }
 
-fn button_value(device: IOHIDDeviceRef, usage: u32) -> Option<isize> {
+fn button_state(device: IOHIDDeviceRef, usage: u32) -> Option<ButtonState> {
     // SAFETY: `device` is retained by the copied device set; null matches all elements.
     let elements = unsafe { IOHIDDeviceCopyMatchingElements(device, std::ptr::null(), 0) };
     if elements.is_null() {
-        return None;
+        return Some(ButtonState::Unknown);
     }
     // SAFETY: `elements` is a non-null +1 CFArray owned from here on.
     let elements: CFArray = unsafe { CFArray::wrap_under_create_rule(elements) };
-    elements.get_all_values().into_iter().find_map(|element| {
+    let mut state = None;
+    for element in elements.get_all_values() {
         let element: IOHIDElementRef = element.cast_mut().cast();
-        // SAFETY: `element` is retained by `elements`, which outlives this closure.
+        // SAFETY: `element` is retained by `elements`, which outlives this loop.
         let matches = unsafe {
             IOHIDElementGetUsagePage(element) == HID_PAGE_BUTTON
                 && IOHIDElementGetUsage(element) == usage
         };
         if !matches {
-            return None;
+            continue;
         }
-        current_value(device, element)
-    })
+        match current_value(device, element) {
+            Some(0) => state = state.or(Some(ButtonState::Released)),
+            Some(_) => return Some(ButtonState::Pressed),
+            None => state = Some(ButtonState::Unknown),
+        }
+    }
+    state
 }
 
 fn current_value(device: IOHIDDeviceRef, element: IOHIDElementRef) -> Option<isize> {
@@ -341,8 +413,18 @@ fn device_property(device: IOHIDDeviceRef, key: &str) -> Option<CFType> {
     Some(unsafe { CFType::wrap_under_get_rule(property) })
 }
 
+/// The one Logitech device holding the button, provided every other
+/// potential source is confirmed released.
 fn unique_pressed_logitech(candidates: &[ButtonCandidate]) -> Option<EventDevice> {
-    let mut pressed = candidates.iter().filter(|candidate| candidate.pressed);
+    if candidates
+        .iter()
+        .any(|candidate| candidate.state == ButtonState::Unknown)
+    {
+        return None;
+    }
+    let mut pressed = candidates
+        .iter()
+        .filter(|candidate| candidate.state == ButtonState::Pressed);
     let source = pressed.next()?;
     if pressed.next().is_some() || !source.device.is_logitech() {
         return None;

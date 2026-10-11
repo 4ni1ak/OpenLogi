@@ -9,7 +9,7 @@ use core_graphics::event::{CGEvent, CGEventField, CGEventFlags, CGEventType, Eve
 use tracing::debug;
 
 use super::sender::{event_sender_id, sender_device_info};
-use super::senderless_button::SenderlessButtonResolver;
+use super::senderless_button::{ButtonSender, SenderlessButtonResolver};
 use crate::{ButtonId, KeyEvent, KeyModifiers, MouseEvent, ScrollDelta};
 
 /// Translate a raw OS button number to a [`ButtonId`].
@@ -37,16 +37,18 @@ fn button_event(
     event: &CGEvent,
     resolver: &mut SenderlessButtonResolver,
 ) -> MouseEvent {
-    let sender_source = event_sender_id(event)
-        .filter(|sender_id| *sender_id != 0)
-        .map(|sender_id| sender_device_info(sender_id).event_device);
+    let sender = ButtonSender::from_sender_id(event_sender_id(event), |sender_id| {
+        sender_device_info(sender_id).event_device
+    });
     // Primary clicks are never remapped, so their attribution is not worth an
     // IOHIDManager poll on the tap thread.
     let (device, attribution_invalidated) = if id.is_os_hook_button() {
-        let device = resolver.resolve(button_number, pressed, sender_source);
+        let device = resolver.resolve(button_number, pressed, sender);
         (device, resolver.take_attribution_invalidated())
+    } else if let ButtonSender::Device(device) = sender {
+        (Some(device), false)
     } else {
-        (sender_source, false)
+        (None, false)
     };
     MouseEvent::Button {
         id,
