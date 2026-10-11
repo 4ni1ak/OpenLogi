@@ -177,21 +177,14 @@ struct ButtonCandidate {
     state: ButtonState,
 }
 
-/// The device a still-held button press was attributed to.
-#[derive(Clone, Debug)]
-struct HeldSource {
-    device: EventDevice,
-    /// Whether the press was attributed by the `IOHIDManager` fallback, so
-    /// its release will arrive sender-less too.
-    senderless: bool,
-}
-
 /// Resolves and caches device identity across a sender-less down/up pair.
 pub(super) struct SenderlessButtonResolver {
     manager: Option<HidManager>,
-    held_sources: HashMap<i64, HeldSource>,
-    /// Set by [`Self::resolve_press`] when a refused press evicts a
-    /// sender-less attribution, read and cleared by
+    /// Sender-less presses attributed by the `IOHIDManager` fallback and not
+    /// yet released, keyed by CoreGraphics button number.
+    held_sources: HashMap<i64, EventDevice>,
+    /// Set by [`Self::resolve_press`] when a refused press evicts a held
+    /// attribution, read and cleared by
     /// [`Self::take_attribution_invalidated`]. See that method's doc for why
     /// this needs to outlive `resolve`'s own return value.
     attribution_invalidated: bool,
@@ -254,28 +247,17 @@ impl SenderlessButtonResolver {
     ) -> Option<EventDevice> {
         match sender {
             ButtonSender::Posted => None,
+            // An identified device never replaces a held sender-less
+            // attribution: that press's release still arrives sender-less and
+            // must find its own device. Only the same device's release, with a
+            // sender id this time, clears it.
             ButtonSender::Device(device) => {
-                if pressed {
-                    self.held_sources.insert(
-                        button_number,
-                        HeldSource {
-                            device: device.clone(),
-                            senderless: false,
-                        },
-                    );
-                } else if self
-                    .held_sources
-                    .get(&button_number)
-                    .is_some_and(|held| held.device == device)
-                {
+                if !pressed && self.held_sources.get(&button_number) == Some(&device) {
                     self.held_sources.remove(&button_number);
                 }
                 Some(device)
             }
-            ButtonSender::Unidentified if !pressed => self
-                .held_sources
-                .remove(&button_number)
-                .map(|held| held.device),
+            ButtonSender::Unidentified if !pressed => self.held_sources.remove(&button_number),
             ButtonSender::Unidentified => {
                 let candidates = self
                     .manager
@@ -299,18 +281,12 @@ impl SenderlessButtonResolver {
         // poll cannot see — and the held device's pressed state proves
         // nothing about it. The held attribution is just as unprovable from
         // here on: a later sender-less release could belong to either.
-        if let Some(held) = self.held_sources.remove(&button_number) {
-            self.attribution_invalidated = held.senderless;
+        if self.held_sources.remove(&button_number).is_some() {
+            self.attribution_invalidated = true;
             return None;
         }
         let source = unique_pressed_logitech(candidates?)?;
-        self.held_sources.insert(
-            button_number,
-            HeldSource {
-                device: source.clone(),
-                senderless: true,
-            },
-        );
+        self.held_sources.insert(button_number, source.clone());
         Some(source)
     }
 }

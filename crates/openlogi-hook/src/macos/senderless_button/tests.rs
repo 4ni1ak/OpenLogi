@@ -165,24 +165,21 @@ fn a_press_of_a_held_button_is_never_attributed_to_its_holder() {
 
     assert!(resolver.resolve_press(BACK, Some(&only_holder)).is_none());
     assert!(resolver.take_attribution_invalidated());
-
-    let mut resolver = SenderlessButtonResolver::unavailable();
-    assert_eq!(
-        resolver.resolve(BACK, true, ButtonSender::Device(logitech())),
-        Some(logitech())
-    );
-    assert!(resolver.resolve_press(BACK, Some(&only_holder)).is_none());
-    assert!(
-        !resolver.take_attribution_invalidated(),
-        "an attributed hold still gets its attributed release"
-    );
 }
 
 #[test]
-fn another_devices_attributed_release_keeps_a_senderless_attribution() {
+fn an_identified_press_keeps_a_held_senderless_attribution() {
+    // Hold Back on a sender-less Logitech mouse, then press and release Back
+    // on an identified mouse: the Logitech release must still find its
+    // press-time identity, or the hold begun under it would never end.
     let mut resolver = holding_senderless_back();
     let other = device(0x4f53);
 
+    assert_eq!(
+        resolver.resolve(BACK, true, ButtonSender::Device(other.clone())),
+        Some(other.clone())
+    );
+    assert!(!resolver.take_attribution_invalidated());
     assert_eq!(
         resolver.resolve(BACK, false, ButtonSender::Device(other.clone())),
         Some(other)
@@ -194,10 +191,26 @@ fn another_devices_attributed_release_keeps_a_senderless_attribution() {
 }
 
 #[test]
+fn the_holders_identified_release_clears_its_senderless_attribution() {
+    let mut resolver = holding_senderless_back();
+
+    assert_eq!(
+        resolver.resolve(BACK, false, ButtonSender::Device(logitech())),
+        Some(logitech())
+    );
+    assert!(
+        resolver
+            .resolve(BACK, false, ButtonSender::Unidentified)
+            .is_none()
+    );
+}
+
+#[test]
 fn cancel_all_drops_every_cached_attribution() {
     let mut resolver = holding_senderless_back();
+    let only_logitech = [candidate(0x046d, ButtonState::Pressed)];
     assert_eq!(
-        resolver.resolve(BACK + 1, true, ButtonSender::Device(logitech())),
+        resolver.resolve_press(BACK + 1, Some(&only_logitech)),
         Some(logitech())
     );
 
