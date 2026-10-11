@@ -277,7 +277,7 @@ fn handle_button(
     id: ButtonId,
     pressed: bool,
     device: Option<&EventDevice>,
-    invalidated_source: Option<&EventDevice>,
+    invalidated_sources: &[EventDevice],
     hooks: &SharedHookMaps,
     dispatcher: &ActionDispatcher,
     capture_safari_pid: impl FnOnce() -> Option<i32>,
@@ -292,7 +292,7 @@ fn handle_button(
     // release handling below, so cancel that device's hold or held binding
     // here instead of leaving a stale lifecycle for a stray pointer move or
     // timer to fire.
-    if let Some(source) = invalidated_source {
+    for source in invalidated_sources {
         if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id, source)) {
             dispatcher.cancel_stale_hook_press(&press);
         }
@@ -329,7 +329,7 @@ fn handle_button(
             if let Some(HoldAdmission::Replace(stale)) = &admission {
                 dispatcher.cancel_stale_hook_press(stale);
             }
-            if let Some(press) = dispatcher.try_hook_button_down(id, None, action_target) {
+            if let Some(press) = dispatcher.try_hook_button_down(device, id, None, action_target) {
                 HOLD.with_borrow_mut(|h| h.begin(id, device, press));
                 return EventDisposition::Suppress;
             }
@@ -350,13 +350,13 @@ fn handle_button(
                     dispatcher.try_dispatch_while_pressed(&press, &action);
                 }
             }
-            dispatcher.try_hook_button_up(id);
+            dispatcher.try_hook_button_up(device, id);
             return EventDisposition::Suppress;
         }
         let disposition =
             SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_release_disposition(&key, s));
         if disposition == EventDisposition::Suppress {
-            dispatcher.try_hook_button_up(id);
+            dispatcher.try_hook_button_up(device, id);
         }
         return disposition;
     }
@@ -368,7 +368,7 @@ fn handle_button(
         return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(key, None, s));
     }
     info!(button = %id, action = %binding.click_action().label(), "button → handling binding");
-    let press = dispatcher.try_hook_button_down(id, Some(&binding), action_target);
+    let press = dispatcher.try_hook_button_down(device, id, Some(&binding), action_target);
     SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(key, press, s))
 }
 
@@ -517,12 +517,12 @@ pub fn start(
                     id,
                     pressed,
                     device,
-                    invalidated_source,
+                    invalidated_sources,
                 } => handle_button(
                     id,
                     pressed,
                     device.as_ref(),
-                    invalidated_source.as_ref(),
+                    &invalidated_sources,
                     &hooks,
                     &dispatcher,
                     openlogi_hook::frontmost_safari_pid,
