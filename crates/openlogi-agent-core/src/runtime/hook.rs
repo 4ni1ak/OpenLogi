@@ -266,20 +266,20 @@ fn handle_button(
     if !id.is_os_hook_button() {
         return EventDisposition::PassThrough;
     }
-    if !button_source_may_remap(device) {
-        // On macOS, a competing device can make `id`'s attribution ambiguous
-        // mid-press. The release that would otherwise end that press arrives
-        // unattributed too and never reaches the release handling below, so
-        // cancel its hold or held binding here instead of leaving a stale
-        // lifecycle for a stray pointer move or timer to fire.
-        if attribution_invalidated {
-            if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id)) {
-                dispatcher.cancel_stale_hook_press(&press);
-            }
-            if let Some(press) = SUPPRESSED_PRESSES.with_borrow_mut(|s| s.remove(&id)) {
-                dispatcher.cancel_stale_hook_press(&press);
-            }
+    // On macOS, an attributed press can lose its attribution mid-press (its
+    // holder became unreadable, or was unplugged). The release that would
+    // otherwise end that press never reaches the release handling below, so
+    // cancel its hold or held binding here instead of leaving a stale
+    // lifecycle for a stray pointer move or timer to fire.
+    if attribution_invalidated {
+        if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id)) {
+            dispatcher.cancel_stale_hook_press(&press);
         }
+        if let Some(press) = SUPPRESSED_PRESSES.with_borrow_mut(|s| s.remove(&id)) {
+            dispatcher.cancel_stale_hook_press(&press);
+        }
+    }
+    if !button_source_may_remap(device) {
         return EventDisposition::PassThrough;
     }
     // `try_read` only: a blocking read on the tap thread freezes every pointer

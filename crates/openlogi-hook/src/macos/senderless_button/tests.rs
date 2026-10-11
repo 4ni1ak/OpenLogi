@@ -51,6 +51,22 @@ fn press(
     )
 }
 
+fn release(
+    resolver: &mut SenderlessButtonResolver,
+    poll: Option<&[ButtonCandidate]>,
+) -> Option<EventDevice> {
+    step(resolver, BACK, false, ButtonSender::Unidentified, poll)
+}
+
+const HOLDER_RELEASED: [ButtonCandidate; 1] = [ButtonCandidate {
+    device: EventDevice {
+        vendor_id: Some(0x046d),
+        product_id: None,
+        product_name: None,
+    },
+    state: ButtonState::Released,
+}];
+
 /// A resolver holding a sender-less Logitech attribution for Back.
 fn holding_senderless_back() -> SenderlessButtonResolver {
     let mut resolver = SenderlessButtonResolver::unavailable();
@@ -146,7 +162,7 @@ fn posted_events_neither_borrow_nor_consume_a_held_attribution() {
     );
 
     assert_eq!(
-        resolver.resolve(BACK, false, ButtonSender::Unidentified),
+        release(&mut resolver, Some(&HOLDER_RELEASED)),
         Some(logitech()),
         "the physical release must still find its press-time identity"
     );
@@ -157,14 +173,74 @@ fn release_uses_the_source_cached_on_press() {
     let mut resolver = holding_senderless_back();
 
     assert_eq!(
-        resolver.resolve(BACK, false, ButtonSender::Unidentified),
+        release(&mut resolver, Some(&HOLDER_RELEASED)),
         Some(logitech())
     );
-    assert!(
-        resolver
-            .resolve(BACK, false, ButtonSender::Unidentified)
-            .is_none()
+    assert!(release(&mut resolver, Some(&HOLDER_RELEASED)).is_none());
+}
+
+#[test]
+fn an_abandoned_refused_press_does_not_block_later_attribution() {
+    // A second mouse's refused press whose release is lost — it was
+    // unplugged mid-press — leaves nothing behind.
+    let mut resolver = SenderlessButtonResolver::unavailable();
+    let second_mouse = [
+        candidate(0x046d, ButtonState::Released),
+        candidate(0x4f53, ButtonState::Pressed),
+    ];
+    assert!(press(&mut resolver, BACK, Some(&second_mouse)).is_none());
+
+    let only_logitech = [candidate(0x046d, ButtonState::Pressed)];
+    assert_eq!(
+        press(&mut resolver, BACK, Some(&only_logitech)),
+        Some(logitech())
     );
+}
+
+#[test]
+fn an_unreadable_suspect_stays_pinned_once_readable() {
+    // The Logitech's press is refused while its state cannot be read. Once
+    // readable and still held, it must not lend its identity to an unseen
+    // device's press.
+    let mut resolver = SenderlessButtonResolver::unavailable();
+    let unreadable = [candidate(0x046d, ButtonState::Unknown)];
+    let held = [candidate(0x046d, ButtonState::Pressed)];
+
+    assert!(press(&mut resolver, BACK, Some(&unreadable)).is_none());
+    assert!(press(&mut resolver, BACK, Some(&held)).is_none());
+}
+
+#[test]
+fn a_lost_senderless_holder_is_cancelled_by_the_next_press() {
+    let mut resolver = holding_senderless_back();
+    let other_logitech = EventDevice {
+        product_id: Some(2),
+        ..logitech()
+    };
+    let holder_unplugged = [ButtonCandidate {
+        device: other_logitech.clone(),
+        state: ButtonState::Pressed,
+    }];
+
+    assert_eq!(
+        press(&mut resolver, BACK, Some(&holder_unplugged)),
+        Some(other_logitech)
+    );
+    assert!(resolver.take_attribution_invalidated());
+}
+
+#[test]
+fn a_lost_identified_holder_stops_vetoing_once_seen_released() {
+    // The identified Logitech's release is lost; once a poll sees it
+    // released, its own sender-less presses are attributable again.
+    let mut resolver = SenderlessButtonResolver::unavailable();
+    step(&mut resolver, BACK, true, identified(7, logitech()), None);
+    let pressed = [candidate(0x046d, ButtonState::Pressed)];
+
+    assert!(press(&mut resolver, BACK, Some(&pressed)).is_none());
+    assert!(release(&mut resolver, Some(&HOLDER_RELEASED)).is_none());
+    assert_eq!(press(&mut resolver, BACK, Some(&pressed)), Some(logitech()));
+    assert!(!resolver.take_attribution_invalidated());
 }
 
 #[test]
@@ -180,8 +256,6 @@ fn the_holders_state_decides_whose_senderless_release_it_is() {
     let mut resolver = holding_senderless_back();
     assert!(press(&mut resolver, BACK, Some(&ambiguous)).is_none());
     assert!(!resolver.take_attribution_invalidated());
-    let release =
-        |resolver: &mut _, poll| step(resolver, BACK, false, ButtonSender::Unidentified, poll);
     assert!(
         release(&mut resolver, Some(&holder_pressed)).is_none(),
         "the second mouse's release must not end the held attribution"
@@ -217,6 +291,29 @@ fn a_press_of_a_held_button_is_never_attributed_to_its_holder() {
 
     assert!(press(&mut resolver, BACK, Some(&only_holder)).is_none());
     assert!(!resolver.take_attribution_invalidated());
+}
+
+#[test]
+fn a_second_senderless_logitech_never_replaces_the_held_one() {
+    let mut resolver = holding_senderless_back();
+    let other_logitech = EventDevice {
+        product_id: Some(2),
+        ..logitech()
+    };
+    let both = [
+        candidate(0x046d, ButtonState::Pressed),
+        ButtonCandidate {
+            device: other_logitech,
+            state: ButtonState::Pressed,
+        },
+    ];
+
+    assert!(press(&mut resolver, BACK, Some(&both)).is_none());
+    assert!(!resolver.take_attribution_invalidated());
+    assert_eq!(
+        release(&mut resolver, Some(&HOLDER_RELEASED)),
+        Some(logitech())
+    );
 }
 
 #[test]
@@ -270,7 +367,7 @@ fn an_identified_press_keeps_a_held_senderless_attribution() {
         Some(other)
     );
     assert_eq!(
-        resolver.resolve(BACK, false, ButtonSender::Unidentified),
+        release(&mut resolver, Some(&HOLDER_RELEASED)),
         Some(logitech())
     );
 }
@@ -379,38 +476,181 @@ fn interleavings(
 }
 
 /// Every ordering of one press and release per actor, under every poll view
-/// per mouse and both release senders for the sender-less Logitech, checked
-/// against the invariants a remapping runtime relies on.
+/// per mouse, every subset of mice unplugged in place of their release, and
+/// both release senders for the sender-less Logitech, checked against the
+/// invariants a remapping runtime relies on.
 #[test]
 fn every_interleaving_attributes_only_physical_presses_and_closes_every_hold() {
     let mut orders = Vec::new();
     interleavings(&mut Vec::new(), &mut [0; 4], &mut orders);
     assert_eq!(orders.len(), 2520);
 
-    for order in &orders {
-        for views in VIEWS
-            .iter()
-            .flat_map(|&a| VIEWS.iter().flat_map(move |&b| VIEWS.map(|c| [a, b, c])))
-        {
-            for identified_release in [false, true] {
-                check_interleaving(order, views, identified_release);
-            }
+    let views = VIEWS
+        .iter()
+        .flat_map(|&a| VIEWS.iter().flat_map(move |&b| VIEWS.map(|c| [a, b, c])));
+    std::thread::scope(|scope| {
+        for views in views {
+            let orders = &orders;
+            scope.spawn(move || {
+                for unplugged in 0..8_u8 {
+                    let unplugged = [0, 1, 2].map(|index| unplugged & (1 << index) != 0);
+                    for identified_release in [false, true] {
+                        if identified_release && unplugged[1] {
+                            continue;
+                        }
+                        for order in orders {
+                            let case = Case {
+                                views,
+                                unplugged,
+                                identified_release,
+                                early: [false; 3],
+                            };
+                            check_interleaving(order, case);
+                        }
+                    }
+                }
+            });
         }
+    });
+}
+
+/// The same orderings with the HID poll running ahead of the event queue:
+/// a mouse may already read pressed one event before its own press event.
+/// Skipped: an invisible second mouse's press arriving while a Logitech is
+/// already down ahead of its own press event, whose poll sees just that
+/// Logitech pressed — indistinguishable from the Logitech's own press.
+#[test]
+fn every_interleaving_holds_with_the_poll_ahead_of_press_events() {
+    let mut orders = Vec::new();
+    interleavings(&mut Vec::new(), &mut [0; 4], &mut orders);
+
+    std::thread::scope(|scope| {
+        for early in 1..8_u8 {
+            let early = [0, 1, 2].map(|index| early & (1 << index) != 0);
+            let orders = &orders;
+            scope.spawn(move || {
+                for second_mouse in [PollView::Truthful, PollView::AlwaysReleased] {
+                    let indistinguishable = |order: &[(usize, bool)]| {
+                        matches!(second_mouse, PollView::AlwaysReleased)
+                            && order.windows(2).any(|pair| {
+                                pair[0] == (2, true)
+                                    && matches!(pair[1], (next, true) if next < 2 && early[next])
+                            })
+                    };
+                    for unplugged in 0..8_u8 {
+                        let unplugged = [0, 1, 2].map(|index| unplugged & (1 << index) != 0);
+                        for identified_release in [false, true] {
+                            if identified_release && unplugged[1] {
+                                continue;
+                            }
+                            for order in orders.iter().filter(|order| !indistinguishable(order)) {
+                                let case = Case {
+                                    views: [PollView::Truthful, PollView::Truthful, second_mouse],
+                                    unplugged,
+                                    identified_release,
+                                    early,
+                                };
+                                check_interleaving(order, case);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Case {
+    views: [PollView; 3],
+    /// Mice unplugged in place of their release.
+    unplugged: [bool; 3],
+    /// Whether the sender-less Logitech's release arrives identified.
+    identified_release: bool,
+    /// Mice that read pressed one event before their press event.
+    early: [bool; 3],
+}
+
+/// The resolver plus the runtime-side view of the sender-less hold.
+struct Model {
+    resolver: SenderlessButtonResolver,
+    /// The device a hold begun under a sender-less attribution belongs to.
+    hold: Option<EventDevice>,
+}
+
+impl Model {
+    /// Apply one transition's invalidation and attribution to `hold`, with
+    /// `may_invalidate` saying whether dropping the hold unreleased is
+    /// justified. Returns the attribution.
+    fn apply(
+        &mut self,
+        pressed: bool,
+        sender: ButtonSender,
+        poll: Vec<ButtonCandidate>,
+        may_invalidate: bool,
+        context: &dyn Fn() -> String,
+    ) -> Option<EventDevice> {
+        let senderless = matches!(sender, ButtonSender::Unidentified);
+        let result = self
+            .resolver
+            .tracker
+            .transition(BACK, pressed, sender, || Some(poll));
+        if self.resolver.take_attribution_invalidated() {
+            assert!(
+                self.hold.is_some() && may_invalidate,
+                "invalidated without a lost or unreadable holder: {}",
+                context()
+            );
+            self.hold = None;
+        }
+        if senderless && let Some(source) = &result {
+            if pressed {
+                assert!(self.hold.is_none(), "{}", context());
+                self.hold = Some(source.clone());
+            } else {
+                assert_eq!(
+                    self.hold.take().as_ref(),
+                    Some(source),
+                    "a sender-less release ended a hold it does not own: {}",
+                    context()
+                );
+            }
+        } else if !pressed && result.is_some() && self.hold == result {
+            self.hold = None;
+        }
+        result
     }
 }
 
-fn check_interleaving(order: &[(usize, bool)], views: [PollView; 3], identified_release: bool) {
-    let context = || format!("{order:?} {views:?} identified release: {identified_release}");
-    let mut resolver = SenderlessButtonResolver::unavailable();
+fn check_interleaving(order: &[(usize, bool)], case: Case) {
+    let Case {
+        views,
+        unplugged,
+        identified_release,
+        early,
+    } = case;
+    let context = || format!("{order:?} {case:?}");
+    let mut model = Model {
+        resolver: SenderlessButtonResolver::unavailable(),
+        hold: None,
+    };
     let mut down = [false; 3];
+    let mut present = [true; 3];
     let mut polled_before = false;
-    // The runtime's view: whether a hold begun under a sender-less
-    // attribution is still open.
-    let mut hold_open = false;
 
-    for &(actor, pressed) in order {
+    for (step, &(actor, pressed)) in order.iter().enumerate() {
         if actor < 3 {
             down[actor] = pressed;
+        }
+        if let Some(&(next, true)) = order.get(step + 1)
+            && next < 3
+            && early[next]
+        {
+            down[next] = true;
+        }
+        if actor < 3 && !pressed && unplugged[actor] {
+            present[actor] = false;
+            continue;
         }
         let sender = match ACTORS[actor] {
             Actor::IdentifiedLogitech => identified(7, mouse(0)),
@@ -419,7 +659,8 @@ fn check_interleaving(order: &[(usize, bool)], views: [PollView; 3], identified_
             Actor::Posted => ButtonSender::Posted,
         };
         let senderless = matches!(sender, ButtonSender::Unidentified);
-        let poll: Vec<_> = (0..3)
+        let poll = (0..3)
+            .filter(|&index| present[index])
             .map(|index| {
                 let truth = if down[index] {
                     ButtonState::Pressed
@@ -438,19 +679,15 @@ fn check_interleaving(order: &[(usize, bool)], views: [PollView; 3], identified_
                 }
             })
             .collect();
-        let result = resolver.tracker.transition(BACK, pressed, sender, || {
-            polled_before = true;
-            Some(poll)
-        });
-        let invalidated = resolver.take_attribution_invalidated();
+        polled_before |= senderless;
+        let may_invalidate = matches!(views[1], PollView::FailsLater) || !present[1];
+        let result = model.apply(pressed, sender, poll, may_invalidate, &context);
 
         match ACTORS[actor] {
             Actor::Posted => assert!(result.is_none(), "{}", context()),
             Actor::IdentifiedLogitech => assert_eq!(result, Some(mouse(0)), "{}", context()),
-            Actor::SenderlessLogitech | Actor::SecondMouse if !senderless => {
-                assert_eq!(result, Some(mouse(actor)), "{}", context());
-            }
-            Actor::SenderlessLogitech | Actor::SecondMouse => {
+            _ if !senderless => assert_eq!(result, Some(mouse(actor)), "{}", context()),
+            _ => {
                 if let Some(source) = &result {
                     assert!(
                         ACTORS[actor] == Actor::SenderlessLogitech && *source == mouse(1),
@@ -460,37 +697,98 @@ fn check_interleaving(order: &[(usize, bool)], views: [PollView; 3], identified_
                 }
             }
         }
-
-        let attributed_senderless = result.as_ref() == Some(&mouse(1));
-        if pressed && attributed_senderless {
-            assert!(!hold_open, "{}", context());
-            hold_open = true;
-        } else if !pressed && attributed_senderless {
-            assert!(
-                hold_open || !senderless,
-                "a sender-less release found an attribution no press made: {}",
-                context()
-            );
-            hold_open = false;
-        }
-        if invalidated {
-            assert!(
-                hold_open && matches!(views[1], PollView::FailsLater),
-                "invalidated without an unreadable holder: {}",
-                context()
-            );
-            hold_open = false;
-        }
         if ACTORS[actor] == Actor::SenderlessLogitech && !pressed {
             assert!(
-                !hold_open,
+                model.hold.is_none(),
                 "hold outlived its owner's release: {}",
                 context()
             );
         }
     }
+
+    probe_after(&mut model, views, present, &context);
+}
+
+/// After every release, delivered or lost, each Logitech still plugged in
+/// gets a clean sender-less click attributed: no permanent pass-through.
+/// With none left, the second mouse's click must still expire a lost hold.
+fn probe_after(
+    model: &mut Model,
+    views: [PollView; 3],
+    present: [bool; 3],
+    context: &dyn Fn() -> String,
+) {
+    if !present[0] && !present[1] {
+        if present[2] {
+            let poll = |state| {
+                vec![ButtonCandidate {
+                    device: mouse(2),
+                    state,
+                }]
+            };
+            for (pressed, state) in [(true, ButtonState::Pressed), (false, ButtonState::Released)] {
+                let senderless = ButtonSender::Unidentified;
+                assert!(
+                    model
+                        .apply(pressed, senderless, poll(state), true, context)
+                        .is_none(),
+                    "{}",
+                    context()
+                );
+            }
+            assert!(model.hold.is_none(), "hold leaked: {}", context());
+            assert!(
+                model.resolver.tracker.holds.is_empty(),
+                "state leaked: {}",
+                context()
+            );
+        }
+        return;
+    }
+    for probe in [0, 1].into_iter().filter(|&index| present[index]) {
+        let poll = |pressed: bool| {
+            (0..3)
+                .filter(|&index| present[index])
+                .map(|index| ButtonCandidate {
+                    device: mouse(index),
+                    state: if pressed && index == probe {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    },
+                })
+                .collect()
+        };
+        let may_invalidate = !present[1];
+        let mut click = |pressed: bool| {
+            model.apply(
+                pressed,
+                ButtonSender::Unidentified,
+                poll(pressed),
+                may_invalidate,
+                context,
+            )
+        };
+        // While a mouse is unreadable, a sender-less release cannot say which
+        // refused press it ended, so a stale record may pin the probed mouse,
+        // which reads pressed exactly as if it still held that press; only
+        // its first clean release proves otherwise.
+        let unreadable =
+            |index: usize| matches!(views[index], PollView::Unknown | PollView::FailsLater);
+        if click(true).is_none() {
+            assert!(
+                (0..3).any(unreadable),
+                "a clean click after the sequence passed through: {}",
+                context()
+            );
+            assert!(click(false).is_none(), "{}", context());
+            assert_eq!(click(true), Some(mouse(probe)), "{}", context());
+        }
+        assert_eq!(click(false), Some(mouse(probe)), "{}", context());
+    }
+    assert!(model.hold.is_none(), "hold leaked: {}", context());
     assert!(
-        resolver.tracker.holds.is_empty(),
+        model.resolver.tracker.holds.is_empty(),
         "state leaked: {}",
         context()
     );

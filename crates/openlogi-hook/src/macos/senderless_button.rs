@@ -8,6 +8,7 @@ use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFAllocatorRef, CFType, CFTypeRef, TCFType as _};
 use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::number::CFNumber;
+use core_foundation::runloop::{CFRunLoop, CFRunLoopRef, kCFRunLoopDefaultMode};
 use core_foundation::set::{CFSet, CFSetGetValues, CFSetRef};
 use core_foundation::string::{CFString, CFStringRef};
 use tracing::warn;
@@ -46,6 +47,16 @@ const HID_PAGE_BUTTON: u32 = 0x09;
 unsafe extern "C" {
     fn IOHIDManagerCreate(allocator: CFAllocatorRef, options: u32) -> IOHIDManagerRef;
     fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
+    fn IOHIDManagerScheduleWithRunLoop(
+        manager: IOHIDManagerRef,
+        run_loop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
+    fn IOHIDManagerUnscheduleFromRunLoop(
+        manager: IOHIDManagerRef,
+        run_loop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
     fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> IOReturn;
     fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> IOReturn;
     fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
@@ -68,6 +79,10 @@ unsafe extern "C" {
 /// Long-lived manager used only for rare sender-less button transitions.
 struct HidManager {
     manager: IOHIDManagerRef,
+    /// The event-tap thread's run loop, which delivers the manager's device
+    /// arrival and removal notifications; without it the device set stays
+    /// as it was at open, and an unplugged mouse lingers there unreadable.
+    run_loop: CFRunLoop,
     /// The +1 reference from `IOHIDManagerCreate`; dropped after `Drop`
     /// closes the manager.
     _owner: CFType,
@@ -75,7 +90,8 @@ struct HidManager {
 
 // SAFETY: IOHIDManager is a Core Foundation object that may be transferred
 // between threads. Ownership is exclusive and every operation is serialized by
-// the event-tap callback's RefCell, so it is never accessed concurrently.
+// the event-tap callback's RefCell, so it is never accessed concurrently. It is
+// created, scheduled, used and dropped on the event-tap thread.
 unsafe impl Send for HidManager {}
 
 impl HidManager {
@@ -99,15 +115,27 @@ impl HidManager {
         ]);
         // SAFETY: `manager` is live; the manager copies the matching dictionary.
         unsafe { IOHIDManagerSetDeviceMatching(manager, matching.as_concrete_TypeRef()) };
+        let run_loop = CFRunLoop::get_current();
+        // SAFETY: `manager` and the run loop are live; the mode is a static
+        // framework constant. Unscheduled in `Drop`.
+        unsafe {
+            IOHIDManagerScheduleWithRunLoop(
+                manager,
+                run_loop.as_concrete_TypeRef(),
+                kCFRunLoopDefaultMode,
+            );
+        }
+        let manager = Self {
+            manager,
+            run_loop,
+            _owner: owner,
+        };
         // SAFETY: `manager` is live and opened once with documented zero options.
-        let result = unsafe { IOHIDManagerOpen(manager, 0) };
+        let result = unsafe { IOHIDManagerOpen(manager.manager, 0) };
         if result != IO_RETURN_SUCCESS {
             return Err(result);
         }
-        Ok(Self {
-            manager,
-            _owner: owner,
-        })
+        Ok(manager)
     }
 
     fn pressed_devices(&self, button_number: i64) -> Vec<ButtonCandidate> {
@@ -130,8 +158,16 @@ impl HidManager {
 
 impl Drop for HidManager {
     fn drop(&mut self) {
-        // SAFETY: the manager is live until `_owner` drops after this returns.
-        let _ = unsafe { IOHIDManagerClose(self.manager, 0) };
+        // SAFETY: the manager is live until `_owner` drops after this returns,
+        // and was scheduled on `run_loop` in this mode by `open`.
+        unsafe {
+            IOHIDManagerUnscheduleFromRunLoop(
+                self.manager,
+                self.run_loop.as_concrete_TypeRef(),
+                kCFRunLoopDefaultMode,
+            );
+            let _ = IOHIDManagerClose(self.manager, 0);
+        }
     }
 }
 
@@ -187,14 +223,135 @@ struct ButtonHolds {
     identified: HashMap<u64, EventDevice>,
     /// The sender-less press attributed by the `IOHIDManager` fallback.
     senderless: Option<EventDevice>,
-    /// Sender-less presses refused attribution. Their releases arrive
-    /// sender-less as well, indistinguishable from `senderless`'s own.
-    unattributed: usize,
+    /// Sender-less presses refused attribution, each as the mice that may
+    /// have made it: those otherwise unaccounted for that read pressed (or
+    /// unreadable) when it arrived and still do.
+    refused: Vec<Vec<EventDevice>>,
 }
+
+/// A sender-less transition's attribution, and whether it dropped a held
+/// sender-less attribution whose hold the runtime must now cancel.
+type Resolved = (Option<EventDevice>, bool);
 
 impl ButtonHolds {
     fn is_empty(&self) -> bool {
-        self.identified.is_empty() && self.senderless.is_none() && self.unattributed == 0
+        self.identified.is_empty() && self.senderless.is_none() && self.refused.is_empty()
+    }
+
+    /// Forget holders the poll no longer sees pressed: their release was
+    /// lost, e.g. the mouse was unplugged mid-press, or is still queued.
+    /// They only ever veto attribution, so dropping one early is harmless.
+    fn prune(&mut self, candidates: &[ButtonCandidate]) {
+        let may_hold = |device: &EventDevice| {
+            matches!(
+                polled_state(candidates, device),
+                Some(ButtonState::Pressed | ButtonState::Unknown)
+            )
+        };
+        self.identified.retain(|_, held| may_hold(held));
+        for suspects in &mut self.refused {
+            suspects.retain(|suspect| may_hold(suspect));
+        }
+        self.refused.retain(|suspects| !suspects.is_empty());
+    }
+
+    /// Clear `device` from every refused press: a device holds one press at
+    /// most, and that one is accounted for elsewhere or just ended.
+    fn disown(&mut self, device: &EventDevice) {
+        for suspects in &mut self.refused {
+            suspects.retain(|suspect| suspect != device);
+        }
+        self.refused.retain(|suspects| !suspects.is_empty());
+    }
+
+    /// Whether `device` certainly holds the button under a recorded press,
+    /// so its pressed state proves nothing about a new one. A refused press
+    /// with several suspects pins none of them: all but one may be pressing
+    /// anew.
+    fn accounts_for(&self, device: &EventDevice) -> bool {
+        self.senderless.as_ref() == Some(device)
+            || self.identified.values().any(|held| held == device)
+            || self
+                .refused
+                .iter()
+                .any(|suspects| matches!(suspects.as_slice(), [suspect] if suspect == device))
+    }
+
+    fn senderless_press(&mut self, candidates: Option<&[ButtonCandidate]>) -> Resolved {
+        let Some(candidates) = candidates else {
+            return (None, false);
+        };
+        self.prune(candidates);
+        let mut invalidated = false;
+        // The holder cannot press the button again, so while it may still
+        // hold, this press is some other, possibly unseen, device's.
+        let holder_may_hold = match &self.senderless {
+            Some(held) => match polled_state(candidates, held) {
+                Some(ButtonState::Pressed | ButtonState::Unknown) => true,
+                // The holder's release was lost, e.g. it was unplugged.
+                Some(ButtonState::Released) | None => {
+                    self.senderless = None;
+                    invalidated = true;
+                    false
+                }
+            },
+            None => false,
+        };
+        let unaccounted: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| !self.accounts_for(&candidate.device))
+            .cloned()
+            .collect();
+        let source = if holder_may_hold {
+            None
+        } else {
+            unique_pressed_logitech(&unaccounted)
+        };
+        if source.is_some() {
+            self.senderless.clone_from(&source);
+        } else {
+            let suspects: Vec<_> = unaccounted
+                .into_iter()
+                .filter(|candidate| candidate.state != ButtonState::Released)
+                .map(|candidate| candidate.device)
+                .collect();
+            if !suspects.is_empty() {
+                self.refused.push(suspects);
+            }
+        }
+        (source, invalidated)
+    }
+
+    /// A sender-less release ends the attributed press only once its holder
+    /// reads released; any other release ends a refused press, whose record
+    /// the poll prunes once its suspects read released.
+    fn senderless_release(
+        &mut self,
+        poll: impl FnOnce() -> Option<Vec<ButtonCandidate>>,
+    ) -> Resolved {
+        if self.is_empty() {
+            return (None, false);
+        }
+        let candidates = poll();
+        if let Some(candidates) = &candidates {
+            self.prune(candidates);
+        }
+        let Some(held) = self.senderless.take() else {
+            return (None, false);
+        };
+        match candidates
+            .as_deref()
+            .and_then(|candidates| polled_state(candidates, &held))
+        {
+            Some(ButtonState::Released) => (Some(held), false),
+            Some(ButtonState::Pressed) => {
+                self.senderless = Some(held);
+                (None, false)
+            }
+            // Unreadable or unplugged: whose release this is is unknowable,
+            // so the attributed hold is cancelled rather than guessed at.
+            Some(ButtonState::Unknown) | None => (None, true),
+        }
     }
 }
 
@@ -202,8 +359,8 @@ impl ButtonHolds {
 #[derive(Debug, Default)]
 struct HoldTracker {
     holds: HashMap<i64, ButtonHolds>,
-    /// Set when a sender-less release could not be told apart from the
-    /// attributed press's own; read and cleared by
+    /// Set when a sender-less attribution is dropped without its release;
+    /// read and cleared by
     /// [`SenderlessButtonResolver::take_attribution_invalidated`].
     attribution_invalidated: bool,
 }
@@ -241,11 +398,11 @@ impl SenderlessButtonResolver {
     }
 
     /// Whether the most recent [`Self::resolve`] call dropped a sender-less
-    /// attribution because the sender-less release it saw could belong to
-    /// either that press or a refused one. Its device's release can then no
-    /// longer be recognized, so the runtime uses this to cancel the hold
-    /// begun under it directly. Clears on read so a later, unrelated call
-    /// doesn't see a stale `true`.
+    /// attribution without its release: the holder became unreadable, or
+    /// the poll shows its release was lost (e.g. it was unplugged). That
+    /// release will never be recognized, so the runtime uses this to cancel
+    /// the hold begun under it directly. Clears on read so a later,
+    /// unrelated call doesn't see a stale `true`.
     pub(super) fn take_attribution_invalidated(&mut self) -> bool {
         std::mem::take(&mut self.tracker.attribution_invalidated)
     }
@@ -286,62 +443,27 @@ impl HoldTracker {
         poll: impl FnOnce() -> Option<Vec<ButtonCandidate>>,
     ) -> Option<EventDevice> {
         let holds = self.holds.entry(button_number).or_default();
-        let device = match sender {
-            ButtonSender::Posted => None,
+        let (device, invalidated) = match sender {
+            ButtonSender::Posted => (None, false),
             ButtonSender::Device { sender_id, device } => {
                 if pressed {
+                    // The press a refused one's poll saw this device making
+                    // is this one, delivered late, not the refused press.
+                    holds.disown(&device);
                     holds.identified.insert(sender_id, device.clone());
                 } else if holds.identified.remove(&sender_id).is_none() {
                     // No identified press to end, so this ends a sender-less one.
                     if holds.senderless.as_ref() == Some(&device) {
                         holds.senderless = None;
-                    } else {
-                        holds.unattributed = holds.unattributed.saturating_sub(1);
                     }
+                    holds.disown(&device);
                 }
-                Some(device)
+                (Some(device), false)
             }
-            ButtonSender::Unidentified if pressed => {
-                // Only a lone sender-less press is attributable: with two
-                // outstanding, the poll could not later tell their releases
-                // apart. A candidate already holding the button under an
-                // identified press proves nothing about this one either.
-                let source = if holds.senderless.is_none() && holds.unattributed == 0 {
-                    poll()
-                        .as_deref()
-                        .and_then(unique_pressed_logitech)
-                        .filter(|source| !holds.identified.values().any(|held| held == source))
-                } else {
-                    None
-                };
-                match &source {
-                    Some(source) => holds.senderless = Some(source.clone()),
-                    None => holds.unattributed += 1,
-                }
-                source
-            }
-            ButtonSender::Unidentified => match (holds.senderless.take(), holds.unattributed) {
-                (held, 0) => held,
-                (None, _) => {
-                    holds.unattributed -= 1;
-                    None
-                }
-                // The holder's own state says whose release this is.
-                (Some(held), _) => match holder_state(poll().as_deref(), &held) {
-                    Some(ButtonState::Released) => Some(held),
-                    Some(ButtonState::Pressed) => {
-                        holds.senderless = Some(held);
-                        holds.unattributed -= 1;
-                        None
-                    }
-                    // One of the two presses ended; the survivor is anonymous.
-                    _ => {
-                        self.attribution_invalidated = true;
-                        None
-                    }
-                },
-            },
+            ButtonSender::Unidentified if pressed => holds.senderless_press(poll().as_deref()),
+            ButtonSender::Unidentified => holds.senderless_release(poll),
         };
+        self.attribution_invalidated |= invalidated;
         if self
             .holds
             .get(&button_number)
@@ -353,14 +475,19 @@ impl HoldTracker {
     }
 }
 
-/// `held`'s state when every polled device matching it agrees.
-fn holder_state(candidates: Option<&[ButtonCandidate]>, held: &EventDevice) -> Option<ButtonState> {
-    let mut states = candidates?
+/// `device`'s polled state, or `None` when no polled mouse matches it. Any
+/// matching mouse pressed counts as pressed, and any unreadable one as
+/// unknown, so look-alike mice never make a hold look released.
+fn polled_state(candidates: &[ButtonCandidate], device: &EventDevice) -> Option<ButtonState> {
+    candidates
         .iter()
-        .filter(|candidate| candidate.device == *held)
-        .map(|candidate| candidate.state);
-    let state = states.next()?;
-    (state != ButtonState::Unknown && states.all(|other| other == state)).then_some(state)
+        .filter(|candidate| candidate.device == *device)
+        .map(|candidate| candidate.state)
+        .reduce(|state, other| match (state, other) {
+            (ButtonState::Unknown, _) | (_, ButtonState::Unknown) => ButtonState::Unknown,
+            (ButtonState::Pressed, _) | (_, ButtonState::Pressed) => ButtonState::Pressed,
+            (ButtonState::Released, ButtonState::Released) => ButtonState::Released,
+        })
 }
 
 /// The set's members, borrowed: they stay valid only while `devices` lives.

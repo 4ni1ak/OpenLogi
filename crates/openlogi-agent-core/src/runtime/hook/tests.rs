@@ -607,7 +607,7 @@ fn resolve_gesture_click_falls_back_when_click_is_absent() {
 
 /// Reproduces the sender-less-attribution hazard: a hold begins under a known
 /// source, a later release of the same button arrives with its attribution
-/// invalidated (the resolver's ambiguous-release case), and the hold must be
+/// invalidated (the resolver's unreadable- or lost-holder case), and the hold must be
 /// cancelled there and then — not left for a stray pointer move to turn into
 /// a phantom swipe (the downstream state `HoldState::cancel_for` guards, not
 /// just the resolver's own cache checked by `senderless_button`'s tests).
@@ -622,13 +622,14 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
         product_name: Some("Logitech MX Master 3".into()),
         ..EventDevice::default()
     };
-    // `attribution_invalidated` is only ever `true` on macOS alongside
-    // `device: None` (see `MouseEvent::Button`'s doc), but `handle_button`'s
-    // policy split is platform-neutral: any source `button_source_may_remap`
-    // rejects takes the same branch. A non-remappable *known* device (a
-    // trackpad, rejected on every platform) drives that branch without
-    // relying on macOS's `None`-fails-closed rule, so this test is not
-    // vacuous on the Linux/Windows CI hosts that run it.
+    // `attribution_invalidated` is only ever `true` on macOS, usually
+    // alongside `device: None` (see `MouseEvent::Button`'s doc), but
+    // `handle_button`'s policy split is platform-neutral: any source
+    // `button_source_may_remap` rejects takes the same branch. A
+    // non-remappable *known* device (a trackpad, rejected on every platform)
+    // drives that branch without relying on macOS's `None`-fails-closed
+    // rule, so this test is not vacuous on the Linux/Windows CI hosts that
+    // run it.
     let trackpad = EventDevice {
         product_name: Some("Apple Internal Keyboard / Trackpad".into()),
         ..EventDevice::default()
@@ -660,9 +661,9 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
         "the dispatcher must have accepted the lifecycle"
     );
 
-    // A competing device makes the same button's attribution ambiguous. The
-    // event itself still can't be remapped, but it must cancel the hold it
-    // silently invalidated rather than leave it dangling.
+    // The hold's attribution is lost. The event itself still can't be
+    // remapped, but it must cancel the hold it silently invalidated rather
+    // than leave it dangling.
     assert_eq!(
         handle_button(
             ButtonId::Back,
@@ -701,7 +702,7 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
 }
 
 /// The held-binding half of the same hazard: a long-press accepted under a
-/// known source must not keep timing after an ambiguous release invalidates
+/// known source must not keep timing after a lost holder invalidates
 /// its attribution, because its own release will arrive unattributed and pass
 /// through without ever reaching the dispatcher.
 #[test]
@@ -767,6 +768,55 @@ fn an_invalidated_attribution_cancels_the_held_binding_it_began_under() {
     assert!(
         SUPPRESSED_PRESSES.with_borrow(|s| !s.contains_key(&ButtonId::Back)),
         "a later attributed release must not be suppressed for the cancelled press"
+    );
+
+    assert!(owner.shutdown());
+}
+
+/// A press attributed in the same event that drops a lost holder's
+/// attribution cancels the stale hold even when the button is no longer a
+/// gesture, so nothing else would replace it.
+#[test]
+fn an_attributed_press_that_invalidates_a_lost_hold_cancels_it() {
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(HookMaps {
+        gestures: BTreeMap::from([(ButtonId::Back, BTreeMap::new())]),
+        ..HookMaps::default()
+    }));
+    let logitech = EventDevice {
+        product_name: Some("Logitech MX Master 3".into()),
+        ..EventDevice::default()
+    };
+    let press = |invalidated| {
+        handle_button(
+            ButtonId::Back,
+            true,
+            Some(&logitech),
+            invalidated,
+            &hooks,
+            &dispatcher,
+            || None,
+        )
+    };
+
+    assert_eq!(press(false), EventDisposition::Suppress);
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(1)),
+        Ok(ButtonRuntimeEvent::Started(_))
+    ));
+
+    *hooks.write().unwrap() = HookMaps::default();
+    assert_eq!(press(true), EventDisposition::PassThrough);
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(1)),
+        Ok(ButtonRuntimeEvent::Ended {
+            reason: EndReason::Canceled(CancelReason::StaleHold),
+            ..
+        })
+    ));
+    assert!(
+        HOLD.with_borrow(|h| h.current.is_none()),
+        "the stale hold must not survive the invalidation"
     );
 
     assert!(owner.shutdown());
