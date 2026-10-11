@@ -45,7 +45,7 @@ fn button_event(
     let (device, attribution_invalidated) = if id.is_os_hook_button() {
         let device = resolver.resolve(button_number, pressed, sender);
         (device, resolver.take_attribution_invalidated())
-    } else if let ButtonSender::Device(device) = sender {
+    } else if let ButtonSender::Device { device, .. } = sender {
         (Some(device), false)
     } else {
         (None, false)

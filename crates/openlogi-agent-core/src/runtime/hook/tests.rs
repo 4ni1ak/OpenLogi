@@ -606,8 +606,8 @@ fn resolve_gesture_click_falls_back_when_click_is_absent() {
 }
 
 /// Reproduces the sender-less-attribution hazard: a hold begins under a known
-/// source, a later press on the same button arrives with its attribution
-/// invalidated (the resolver's ambiguous-press case), and the hold must be
+/// source, a later release of the same button arrives with its attribution
+/// invalidated (the resolver's ambiguous-release case), and the hold must be
 /// cancelled there and then — not left for a stray pointer move to turn into
 /// a phantom swipe (the downstream state `HoldState::cancel_for` guards, not
 /// just the resolver's own cache checked by `senderless_button`'s tests).
@@ -666,7 +666,7 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
     assert_eq!(
         handle_button(
             ButtonId::Back,
-            true,
+            false,
             Some(&trackpad),
             true,
             &hooks,
@@ -701,8 +701,8 @@ fn an_invalidated_attribution_cancels_the_hold_it_began_under() {
 }
 
 /// The held-binding half of the same hazard: a long-press accepted under a
-/// known source must not keep timing after a competing press invalidates its
-/// attribution, because its own release will arrive unattributed and pass
+/// known source must not keep timing after an ambiguous release invalidates
+/// its attribution, because its own release will arrive unattributed and pass
 /// through without ever reaching the dispatcher.
 #[test]
 fn an_invalidated_attribution_cancels_the_held_binding_it_began_under() {
@@ -745,7 +745,7 @@ fn an_invalidated_attribution_cancels_the_held_binding_it_began_under() {
     assert_eq!(
         handle_button(
             ButtonId::Back,
-            true,
+            false,
             Some(&trackpad),
             true,
             &hooks,

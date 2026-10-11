@@ -191,13 +191,12 @@ pub enum MouseEvent {
         /// Best-effort physical source. `None` when the platform cannot
         /// attribute the event (Windows today) or it was synthetic.
         device: Option<EventDevice>,
-        /// `true` when this press just evicted a previously cached
-        /// attribution for `id` because a competing device made it
-        /// ambiguous (macOS's sender-less-event resolver only). The
-        /// corresponding release will then also arrive with `device: None`
-        /// and never reach the code that would end a hold begun under the
-        /// stale attribution, so the runtime must cancel that hold here
-        /// instead. Always `false` on Linux/Windows and for every other
+        /// `true` when this release just evicted a previously cached
+        /// attribution for `id` because it could have ended either that
+        /// press or a competing device's (macOS's sender-less-event resolver
+        /// only). The attributed press's own release can then no longer be
+        /// recognized and never reaches the code that would end a hold begun
+        /// under it, so the runtime must cancel that hold here instead. Always `false` on Linux/Windows and for every other
         /// macOS button event.
         attribution_invalidated: bool,
     },

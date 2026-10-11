@@ -141,7 +141,7 @@ pub(super) enum ButtonSender {
     /// physical device to attribute and must not touch any held press.
     Posted,
     /// The HID sender resolved to this device.
-    Device(EventDevice),
+    Device { sender_id: u64, device: EventDevice },
     /// A HID event with sender id zero, which macOS 27 reports for some
     /// physical button transitions.
     Unidentified,
@@ -157,7 +157,10 @@ impl ButtonSender {
         match sender_id {
             None => Self::Posted,
             Some(0) => Self::Unidentified,
-            Some(sender_id) => Self::Device(lookup(sender_id)),
+            Some(sender_id) => Self::Device {
+                sender_id,
+                device: lookup(sender_id),
+            },
         }
     }
 }
@@ -177,17 +180,38 @@ struct ButtonCandidate {
     state: ButtonState,
 }
 
+/// Every unreleased press of one button.
+#[derive(Debug, Default)]
+struct ButtonHolds {
+    /// Identified devices holding the button, keyed by HID sender id.
+    identified: HashMap<u64, EventDevice>,
+    /// The sender-less press attributed by the `IOHIDManager` fallback.
+    senderless: Option<EventDevice>,
+    /// Sender-less presses refused attribution. Their releases arrive
+    /// sender-less as well, indistinguishable from `senderless`'s own.
+    unattributed: usize,
+}
+
+impl ButtonHolds {
+    fn is_empty(&self) -> bool {
+        self.identified.is_empty() && self.senderless.is_none() && self.unattributed == 0
+    }
+}
+
+/// Every button's unreleased presses, keyed by CoreGraphics button number.
+#[derive(Debug, Default)]
+struct HoldTracker {
+    holds: HashMap<i64, ButtonHolds>,
+    /// Set when a sender-less release could not be told apart from the
+    /// attributed press's own; read and cleared by
+    /// [`SenderlessButtonResolver::take_attribution_invalidated`].
+    attribution_invalidated: bool,
+}
+
 /// Resolves and caches device identity across a sender-less down/up pair.
 pub(super) struct SenderlessButtonResolver {
     manager: Option<HidManager>,
-    /// Sender-less presses attributed by the `IOHIDManager` fallback and not
-    /// yet released, keyed by CoreGraphics button number.
-    held_sources: HashMap<i64, EventDevice>,
-    /// Set by [`Self::resolve_press`] when a refused press evicts a held
-    /// attribution, read and cleared by
-    /// [`Self::take_attribution_invalidated`]. See that method's doc for why
-    /// this needs to outlive `resolve`'s own return value.
-    attribution_invalidated: bool,
+    tracker: HoldTracker,
 }
 
 impl SenderlessButtonResolver {
@@ -204,8 +228,7 @@ impl SenderlessButtonResolver {
         };
         Self {
             manager,
-            held_sources: HashMap::new(),
-            attribution_invalidated: false,
+            tracker: HoldTracker::default(),
         }
     }
 
@@ -213,21 +236,18 @@ impl SenderlessButtonResolver {
     pub(super) fn unavailable() -> Self {
         Self {
             manager: None,
-            held_sources: HashMap::new(),
-            attribution_invalidated: false,
+            tracker: HoldTracker::default(),
         }
     }
 
-    /// Whether the most recent [`Self::resolve`] call evicted a sender-less
-    /// attribution because a competing press made its button ambiguous —
-    /// distinct from an ordinary release removing its own cache entry. The
-    /// release for the device that lost its attribution will itself arrive
-    /// unattributed and never reach the code that would end a hold begun
-    /// under it, so the runtime uses this to cancel that hold directly
-    /// instead. Clears on read so a later, unrelated call doesn't see a
-    /// stale `true`.
+    /// Whether the most recent [`Self::resolve`] call dropped a sender-less
+    /// attribution because the sender-less release it saw could belong to
+    /// either that press or a refused one. Its device's release can then no
+    /// longer be recognized, so the runtime uses this to cancel the hold
+    /// begun under it directly. Clears on read so a later, unrelated call
+    /// doesn't see a stale `true`.
     pub(super) fn take_attribution_invalidated(&mut self) -> bool {
-        std::mem::take(&mut self.attribution_invalidated)
+        std::mem::take(&mut self.tracker.attribution_invalidated)
     }
 
     /// Drop every cached attribution. The OS tap being disabled and
@@ -236,7 +256,7 @@ impl SenderlessButtonResolver {
     /// source would otherwise outlive the physical hold it was attributed to
     /// and later mis-attribute an unrelated button's release.
     pub(super) fn cancel_all(&mut self) {
-        self.held_sources.clear();
+        self.tracker.holds.clear();
     }
 
     pub(super) fn resolve(
@@ -245,50 +265,102 @@ impl SenderlessButtonResolver {
         pressed: bool,
         sender: ButtonSender,
     ) -> Option<EventDevice> {
-        match sender {
+        let Self { manager, tracker } = self;
+        tracker.transition(button_number, pressed, sender, || {
+            manager
+                .as_ref()
+                .map(|manager| manager.pressed_devices(button_number))
+        })
+    }
+}
+
+impl HoldTracker {
+    /// [`SenderlessButtonResolver::resolve`] with the `IOHIDManager` read
+    /// injected as `poll` (`None` when no manager is available), so it can be
+    /// exercised without hardware — see the tests module.
+    fn transition(
+        &mut self,
+        button_number: i64,
+        pressed: bool,
+        sender: ButtonSender,
+        poll: impl FnOnce() -> Option<Vec<ButtonCandidate>>,
+    ) -> Option<EventDevice> {
+        let holds = self.holds.entry(button_number).or_default();
+        let device = match sender {
             ButtonSender::Posted => None,
-            // An identified device never replaces a held sender-less
-            // attribution: that press's release still arrives sender-less and
-            // must find its own device. Only the same device's release, with a
-            // sender id this time, clears it.
-            ButtonSender::Device(device) => {
-                if !pressed && self.held_sources.get(&button_number) == Some(&device) {
-                    self.held_sources.remove(&button_number);
+            ButtonSender::Device { sender_id, device } => {
+                if pressed {
+                    holds.identified.insert(sender_id, device.clone());
+                } else if holds.identified.remove(&sender_id).is_none() {
+                    // No identified press to end, so this ends a sender-less one.
+                    if holds.senderless.as_ref() == Some(&device) {
+                        holds.senderless = None;
+                    } else {
+                        holds.unattributed = holds.unattributed.saturating_sub(1);
+                    }
                 }
                 Some(device)
             }
-            ButtonSender::Unidentified if !pressed => self.held_sources.remove(&button_number),
-            ButtonSender::Unidentified => {
-                let candidates = self
-                    .manager
-                    .as_ref()
-                    .map(|manager| manager.pressed_devices(button_number));
-                self.resolve_press(button_number, candidates.as_deref())
+            ButtonSender::Unidentified if pressed => {
+                // Only a lone sender-less press is attributable: with two
+                // outstanding, the poll could not later tell their releases
+                // apart. A candidate already holding the button under an
+                // identified press proves nothing about this one either.
+                let source = if holds.senderless.is_none() && holds.unattributed == 0 {
+                    poll()
+                        .as_deref()
+                        .and_then(unique_pressed_logitech)
+                        .filter(|source| !holds.identified.values().any(|held| held == source))
+                } else {
+                    None
+                };
+                match &source {
+                    Some(source) => holds.senderless = Some(source.clone()),
+                    None => holds.unattributed += 1,
+                }
+                source
             }
+            ButtonSender::Unidentified => match (holds.senderless.take(), holds.unattributed) {
+                (held, 0) => held,
+                (None, _) => {
+                    holds.unattributed -= 1;
+                    None
+                }
+                // The holder's own state says whose release this is.
+                (Some(held), _) => match holder_state(poll().as_deref(), &held) {
+                    Some(ButtonState::Released) => Some(held),
+                    Some(ButtonState::Pressed) => {
+                        holds.senderless = Some(held);
+                        holds.unattributed -= 1;
+                        None
+                    }
+                    // One of the two presses ended; the survivor is anonymous.
+                    _ => {
+                        self.attribution_invalidated = true;
+                        None
+                    }
+                },
+            },
+        };
+        if self
+            .holds
+            .get(&button_number)
+            .is_some_and(ButtonHolds::is_empty)
+        {
+            self.holds.remove(&button_number);
         }
+        device
     }
+}
 
-    /// The sender-less press half of [`Self::resolve`], taking already-read
-    /// candidates (`None` when no `IOHIDManager` is available) so it can be
-    /// exercised without hardware — see the tests module.
-    fn resolve_press(
-        &mut self,
-        button_number: i64,
-        candidates: Option<&[ButtonCandidate]>,
-    ) -> Option<EventDevice> {
-        // A device cannot press a button it is still holding, so a press of a
-        // held button belongs to some other device — possibly one the HID
-        // poll cannot see — and the held device's pressed state proves
-        // nothing about it. The held attribution is just as unprovable from
-        // here on: a later sender-less release could belong to either.
-        if self.held_sources.remove(&button_number).is_some() {
-            self.attribution_invalidated = true;
-            return None;
-        }
-        let source = unique_pressed_logitech(candidates?)?;
-        self.held_sources.insert(button_number, source.clone());
-        Some(source)
-    }
+/// `held`'s state when every polled device matching it agrees.
+fn holder_state(candidates: Option<&[ButtonCandidate]>, held: &EventDevice) -> Option<ButtonState> {
+    let mut states = candidates?
+        .iter()
+        .filter(|candidate| candidate.device == *held)
+        .map(|candidate| candidate.state);
+    let state = states.next()?;
+    (state != ButtonState::Unknown && states.all(|other| other == state)).then_some(state)
 }
 
 /// The set's members, borrowed: they stay valid only while `devices` lives.

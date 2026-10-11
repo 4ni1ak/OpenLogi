@@ -272,7 +272,7 @@ fn handle_button(
         // unattributed too and never reaches the release handling below, so
         // cancel its hold or held binding here instead of leaving a stale
         // lifecycle for a stray pointer move or timer to fire.
-        if pressed && attribution_invalidated {
+        if attribution_invalidated {
             if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id)) {
                 dispatcher.cancel_stale_hook_press(&press);
             }
