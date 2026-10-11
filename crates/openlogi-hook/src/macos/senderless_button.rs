@@ -227,11 +227,18 @@ struct ButtonHolds {
     /// have made it: those otherwise unaccounted for that read pressed (or
     /// unreadable) when it arrived and still do.
     refused: Vec<Vec<EventDevice>>,
+    /// Passed-through presses no record can place, whose release may still
+    /// be queued: those during the attributed hold whose maker the poll
+    /// could not see, and refused ones whose suspects all read released
+    /// before a release ended them. Until as many unexplained releases
+    /// arrive, the holder's release cannot be told from theirs. Reset by
+    /// the next attribution, so a lost one costs at most that hold.
+    unplaced: usize,
 }
 
-/// A sender-less transition's attribution, and whether it dropped a held
-/// sender-less attribution whose hold the runtime must now cancel.
-type Resolved = (Option<EventDevice>, bool);
+/// A sender-less transition's attribution, and the held sender-less
+/// attribution it dropped, whose hold the runtime must now cancel.
+type Resolved = (Option<EventDevice>, Option<EventDevice>);
 
 impl ButtonHolds {
     fn is_empty(&self) -> bool {
@@ -241,7 +248,9 @@ impl ButtonHolds {
     /// Forget holders the poll no longer sees pressed: their release was
     /// lost, e.g. the mouse was unplugged mid-press, or is still queued.
     /// They only ever veto attribution, so dropping one early is harmless.
-    fn prune(&mut self, candidates: &[ButtonCandidate]) {
+    /// Returns how many refused presses ended with a suspect still plugged
+    /// in, whose release may be the queued one.
+    fn prune(&mut self, candidates: &[ButtonCandidate]) -> usize {
         let may_hold = |device: &EventDevice| {
             matches!(
                 polled_state(candidates, device),
@@ -249,10 +258,16 @@ impl ButtonHolds {
             )
         };
         self.identified.retain(|_, held| may_hold(held));
-        for suspects in &mut self.refused {
+        let mut queued = 0;
+        self.refused.retain_mut(|suspects| {
+            let plugged_in = suspects
+                .iter()
+                .any(|suspect| polled_state(candidates, suspect).is_some());
             suspects.retain(|suspect| may_hold(suspect));
-        }
-        self.refused.retain(|suspects| !suspects.is_empty());
+            queued += usize::from(suspects.is_empty() && plugged_in);
+            !suspects.is_empty()
+        });
+        queued
     }
 
     /// Clear `device` from every refused press: a device holds one press at
@@ -279,19 +294,19 @@ impl ButtonHolds {
 
     fn senderless_press(&mut self, candidates: Option<&[ButtonCandidate]>) -> Resolved {
         let Some(candidates) = candidates else {
-            return (None, false);
+            return (None, None);
         };
-        self.prune(candidates);
-        let mut invalidated = false;
+        let queued = self.prune(candidates);
+        let mut invalidated = None;
         // The holder cannot press the button again, so while it may still
         // hold, this press is some other, possibly unseen, device's.
         let holder_may_hold = match &self.senderless {
             Some(held) => match polled_state(candidates, held) {
                 Some(ButtonState::Pressed | ButtonState::Unknown) => true,
-                // The holder's release was lost, e.g. it was unplugged.
+                // The holder's release was lost, e.g. it was unplugged, or is
+                // still queued; either way it can no longer be recognized.
                 Some(ButtonState::Released) | None => {
-                    self.senderless = None;
-                    invalidated = true;
+                    invalidated = self.senderless.take();
                     false
                 }
             },
@@ -309,7 +324,9 @@ impl ButtonHolds {
         };
         if source.is_some() {
             self.senderless.clone_from(&source);
+            self.unplaced = queued;
         } else {
+            self.unplaced += queued;
             let suspects: Vec<_> = unaccounted
                 .into_iter()
                 .filter(|candidate| candidate.state != ButtonState::Released)
@@ -317,40 +334,53 @@ impl ButtonHolds {
                 .collect();
             if !suspects.is_empty() {
                 self.refused.push(suspects);
+            } else if holder_may_hold {
+                self.unplaced += 1;
             }
         }
         (source, invalidated)
     }
 
     /// A sender-less release ends the attributed press only once its holder
-    /// reads released; any other release ends a refused press, whose record
-    /// the poll prunes once its suspects read released.
+    /// reads released and no other recorded press may have just ended; any
+    /// other release ends a refused press, whose record the poll prunes once
+    /// its suspects read released. The poll is skipped only with nothing
+    /// recorded: without it a stale record would pin its mouse for good.
     fn senderless_release(
         &mut self,
         poll: impl FnOnce() -> Option<Vec<ButtonCandidate>>,
     ) -> Resolved {
         if self.is_empty() {
-            return (None, false);
+            return (None, None);
         }
-        let candidates = poll();
-        if let Some(candidates) = &candidates {
-            self.prune(candidates);
-        }
-        let Some(held) = self.senderless.take() else {
-            return (None, false);
+        let Some(candidates) = poll() else {
+            return (None, self.senderless.take());
         };
-        match candidates
-            .as_deref()
-            .and_then(|candidates| polled_state(candidates, &held))
-        {
-            Some(ButtonState::Released) => (Some(held), false),
+        // Whether this may end another recorded press, whose raw press the
+        // runtime passed through: suppressing its release would leave that
+        // press stuck down.
+        let may_end =
+            |device: &EventDevice| polled_state(&candidates, device) != Some(ButtonState::Pressed);
+        let refused_may_end = self.refused.iter().flatten().any(may_end);
+        let contested =
+            refused_may_end || self.unplaced > 0 || self.identified.values().any(may_end);
+        self.prune(&candidates);
+        let Some(held) = self.senderless.take() else {
+            return (None, None);
+        };
+        match polled_state(&candidates, &held) {
+            Some(ButtonState::Released) if !contested => (Some(held), None),
             Some(ButtonState::Pressed) => {
+                if !refused_may_end {
+                    self.unplaced = self.unplaced.saturating_sub(1);
+                }
                 self.senderless = Some(held);
-                (None, false)
+                (None, None)
             }
-            // Unreadable or unplugged: whose release this is is unknowable,
-            // so the attributed hold is cancelled rather than guessed at.
-            Some(ButtonState::Unknown) | None => (None, true),
+            // Unreadable, unplugged or contested: whose release this is is
+            // unknowable, so the attributed hold is cancelled and the
+            // release passed through rather than guessed at.
+            Some(ButtonState::Released | ButtonState::Unknown) | None => (None, Some(held)),
         }
     }
 }
@@ -359,10 +389,10 @@ impl ButtonHolds {
 #[derive(Debug, Default)]
 struct HoldTracker {
     holds: HashMap<i64, ButtonHolds>,
-    /// Set when a sender-less attribution is dropped without its release;
+    /// The device of a sender-less attribution dropped without its release;
     /// read and cleared by
-    /// [`SenderlessButtonResolver::take_attribution_invalidated`].
-    attribution_invalidated: bool,
+    /// [`SenderlessButtonResolver::take_invalidated_source`].
+    invalidated_source: Option<EventDevice>,
 }
 
 /// Resolves and caches device identity across a sender-less down/up pair.
@@ -397,14 +427,15 @@ impl SenderlessButtonResolver {
         }
     }
 
-    /// Whether the most recent [`Self::resolve`] call dropped a sender-less
-    /// attribution without its release: the holder became unreadable, or
-    /// the poll shows its release was lost (e.g. it was unplugged). That
-    /// release will never be recognized, so the runtime uses this to cancel
-    /// the hold begun under it directly. Clears on read so a later,
-    /// unrelated call doesn't see a stale `true`.
-    pub(super) fn take_attribution_invalidated(&mut self) -> bool {
-        std::mem::take(&mut self.tracker.attribution_invalidated)
+    /// The holder of a sender-less attribution the most recent
+    /// [`Self::resolve`] call dropped without its release: the holder became
+    /// unreadable, the poll shows its release was lost (e.g. it was
+    /// unplugged), or the release may be another press's. That release will
+    /// never be recognized, so the runtime uses this to cancel the hold this
+    /// device began directly. Clears on read so a later, unrelated call
+    /// doesn't see a stale value.
+    pub(super) fn take_invalidated_source(&mut self) -> Option<EventDevice> {
+        self.tracker.invalidated_source.take()
     }
 
     /// Drop every cached attribution. The OS tap being disabled and
@@ -444,7 +475,7 @@ impl HoldTracker {
     ) -> Option<EventDevice> {
         let holds = self.holds.entry(button_number).or_default();
         let (device, invalidated) = match sender {
-            ButtonSender::Posted => (None, false),
+            ButtonSender::Posted => (None, None),
             ButtonSender::Device { sender_id, device } => {
                 if pressed {
                     // The press a refused one's poll saw this device making
@@ -458,12 +489,14 @@ impl HoldTracker {
                     }
                     holds.disown(&device);
                 }
-                (Some(device), false)
+                (Some(device), None)
             }
             ButtonSender::Unidentified if pressed => holds.senderless_press(poll().as_deref()),
             ButtonSender::Unidentified => holds.senderless_release(poll),
         };
-        self.attribution_invalidated |= invalidated;
+        if invalidated.is_some() {
+            self.invalidated_source = invalidated;
+        }
         if self
             .holds
             .get(&button_number)

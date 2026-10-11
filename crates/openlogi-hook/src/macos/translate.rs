@@ -42,19 +42,19 @@ fn button_event(
     });
     // Primary clicks are never remapped, so their attribution is not worth an
     // IOHIDManager poll on the tap thread.
-    let (device, attribution_invalidated) = if id.is_os_hook_button() {
+    let (device, invalidated_source) = if id.is_os_hook_button() {
         let device = resolver.resolve(button_number, pressed, sender);
-        (device, resolver.take_attribution_invalidated())
+        (device, resolver.take_invalidated_source())
     } else if let ButtonSender::Device { device, .. } = sender {
-        (Some(device), false)
+        (Some(device), None)
     } else {
-        (None, false)
+        (None, None)
     };
     MouseEvent::Button {
         id,
         pressed,
         device,
-        attribution_invalidated,
+        invalidated_source,
     }
 }
 

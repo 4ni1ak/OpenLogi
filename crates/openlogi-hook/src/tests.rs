@@ -27,7 +27,7 @@ fn mouse_event_clone_and_debug() {
             id: ButtonId::Back,
             pressed: true,
             device: None,
-            attribution_invalidated: false,
+            invalidated_source: None,
         },
         MouseEvent::Scroll {
             delta: ScrollDelta::wheel_ticks(1.0, -1.5),

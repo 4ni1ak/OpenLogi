@@ -68,7 +68,7 @@ pub struct CursorPosition {
 /// Platform hooks fill the stable fields they can read cheaply from the native
 /// event. Consumers use this to apply host-side settings per device rather than
 /// through the currently selected UI device.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EventDevice {
     /// USB/Bluetooth vendor id when the platform exposes it.
     pub vendor_id: Option<u32>,
@@ -191,14 +191,15 @@ pub enum MouseEvent {
         /// Best-effort physical source. `None` when the platform cannot
         /// attribute the event (Windows today) or it was synthetic.
         device: Option<EventDevice>,
-        /// `true` when this event just evicted a previously cached
-        /// attribution for `id` whose holder became unreadable or lost its
-        /// release, e.g. by being unplugged (macOS's sender-less-event
-        /// resolver only). That press's release will never be recognized
-        /// and reach the code that would end a hold begun under it, so the
-        /// runtime must cancel that hold here instead. Always `false` on Linux/Windows and for every other
-        /// macOS button event.
-        attribution_invalidated: bool,
+        /// The holder of a previously cached attribution for `id` this event
+        /// just evicted because it became unreadable, lost its release (e.g.
+        /// by being unplugged), or its release could not be told apart from
+        /// another press's (macOS's sender-less-event resolver only). That
+        /// press's release will never be recognized and reach the code that
+        /// would end the hold this device began, so the runtime must cancel
+        /// that hold here instead. Always `None` on Linux/Windows and for
+        /// every other macOS button event.
+        invalidated_source: Option<EventDevice>,
     },
     /// A scroll-wheel tick or pixel-precise continuous scroll.
     Scroll {

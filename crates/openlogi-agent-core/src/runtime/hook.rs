@@ -78,8 +78,17 @@ struct HoldState {
 
 struct GestureHold {
     button: ButtonId,
+    /// The press's attributed device: macOS's one tap thread sees every
+    /// mouse, so only this source's release or invalidation ends the hold.
+    source: Option<EventDevice>,
     started_at: Instant,
     press: PressToken,
+}
+
+impl GestureHold {
+    fn is(&self, button: ButtonId, source: Option<&EventDevice>) -> bool {
+        self.button == button && self.source.as_ref() == source
+    }
 }
 
 enum HoldAdmission {
@@ -95,21 +104,22 @@ impl HoldState {
     ///
     /// Two presses recover a hold whose button-up was lost (nothing else ever
     /// clears it when the OS drops a release without an interrupt): a re-press
-    /// of the held button itself — a button cannot be pressed while down, so
-    /// this is proof the release was lost — and any press once the hold has
-    /// aged past [`HOLD_STALE_AFTER`], without which every other gesture button
-    /// would stay refused indefinitely.
-    fn prepare_begin(&mut self, button: ButtonId) -> HoldAdmission {
+    /// of the held button by its own source — a button cannot be pressed while
+    /// down, so this is proof the release was lost — and any press once the
+    /// hold has aged past [`HOLD_STALE_AFTER`], without which every other
+    /// gesture button would stay refused indefinitely.
+    fn prepare_begin(&mut self, button: ButtonId, source: Option<&EventDevice>) -> HoldAdmission {
         let Some(held) = self.current.take() else {
             return HoldAdmission::Begin;
         };
-        if held.button != button && held.started_at.elapsed() < HOLD_STALE_AFTER {
+        let repress = held.is(button, source);
+        if !repress && held.started_at.elapsed() < HOLD_STALE_AFTER {
             self.current = Some(held);
             return HoldAdmission::Refuse;
         }
 
         self.swipe.end();
-        if held.button == button {
+        if repress {
             HoldAdmission::Begin
         } else {
             HoldAdmission::Replace(held.press)
@@ -117,9 +127,10 @@ impl HoldState {
     }
 
     /// Store the token returned by the accepted lifecycle `Down`.
-    fn begin(&mut self, button: ButtonId, press: PressToken) {
+    fn begin(&mut self, button: ButtonId, source: Option<&EventDevice>, press: PressToken) {
         self.current = Some(GestureHold {
             button,
+            source: source.cloned(),
             started_at: Instant::now(),
             press,
         });
@@ -136,10 +147,14 @@ impl HoldState {
             .map(|dir| (held.press.clone(), held.button, dir))
     }
 
-    /// End the hold for `button`, returning its exact token and whether it was a
-    /// click. A swipe returns `false`; a stray release returns `None`.
-    fn end(&mut self, button: ButtonId) -> Option<(PressToken, bool)> {
-        let held = self.current.take_if(|held| held.button == button)?;
+    /// End `source`'s hold for `button`, returning its exact token and whether
+    /// it was a click. A swipe returns `false`; a stray release returns `None`.
+    fn end(
+        &mut self,
+        button: ButtonId,
+        source: Option<&EventDevice>,
+    ) -> Option<(PressToken, bool)> {
+        let held = self.current.take_if(|held| held.is(button, source))?;
         let was_click = self.swipe.end();
         Some((held.press, was_click))
     }
@@ -152,17 +167,17 @@ impl HoldState {
         self.swipe.end();
     }
 
-    /// Cancel the hold for `button` specifically, without touching a hold on
-    /// any other button, returning its press token so the caller can release
-    /// the matching dispatcher-owned lifecycle. Used when a competing device
-    /// makes `button`'s attribution ambiguous: the release that would
-    /// otherwise end this hold now arrives unattributed on macOS and never
+    /// Cancel `source`'s hold for `button` specifically, without touching a
+    /// hold on any other button or begun by any other device, returning its
+    /// press token so the caller can release the matching dispatcher-owned
+    /// lifecycle. Used when macOS loses `source`'s attribution: the release
+    /// that would otherwise end this hold now arrives unattributed and never
     /// reaches [`Self::end`], which would otherwise leave a stale hold for
     /// the next stray pointer move to turn into a phantom swipe — the same
-    /// hazard `cancel` guards against, scoped to one button instead of every
+    /// hazard `cancel` guards against, scoped to one press instead of every
     /// hold.
-    fn cancel_for(&mut self, button: ButtonId) -> Option<PressToken> {
-        let held = self.current.take_if(|held| held.button == button)?;
+    fn cancel_for(&mut self, button: ButtonId, source: &EventDevice) -> Option<PressToken> {
+        let held = self.current.take_if(|held| held.is(button, Some(source)))?;
         self.swipe.end();
         Some(held.press)
     }
@@ -187,14 +202,19 @@ thread_local! {
     /// free of cross-thread contention on the freeze-sensitive callback.
     static HOLD: RefCell<HoldState> = RefCell::new(HoldState::default());
     /// Accepted non-gesture presses retain their edge disposition even when
-    /// moving the pointer changes the binding before physical release.
-    static SUPPRESSED_PRESSES: RefCell<HashMap<ButtonId, PressToken>> =
+    /// moving the pointer changes the binding before physical release. Keyed
+    /// by source too, so a release suppresses only when that same device's
+    /// press was suppressed: another mouse's raw press would stick otherwise.
+    static SUPPRESSED_PRESSES: RefCell<HashMap<PressSource, PressToken>> =
         RefCell::new(HashMap::new());
     /// Function keys whose held action owns an accepted lifecycle. Repeated
     /// key-down events are auto-repeat, not replacement presses; their first
     /// matching key-up ends the lifecycle.
     static HELD_KEYS: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
 }
+
+/// A button and the attributed device pressing it.
+type PressSource = (ButtonId, Option<EventDevice>);
 
 /// Whether a button event's physical source may be remapped/suppressed.
 ///
@@ -257,7 +277,7 @@ fn handle_button(
     id: ButtonId,
     pressed: bool,
     device: Option<&EventDevice>,
-    attribution_invalidated: bool,
+    invalidated_source: Option<&EventDevice>,
     hooks: &SharedHookMaps,
     dispatcher: &ActionDispatcher,
     capture_safari_pid: impl FnOnce() -> Option<i32>,
@@ -267,21 +287,24 @@ fn handle_button(
         return EventDisposition::PassThrough;
     }
     // On macOS, an attributed press can lose its attribution mid-press (its
-    // holder became unreadable, or was unplugged). The release that would
-    // otherwise end that press never reaches the release handling below, so
-    // cancel its hold or held binding here instead of leaving a stale
-    // lifecycle for a stray pointer move or timer to fire.
-    if attribution_invalidated {
-        if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id)) {
+    // holder became unreadable, was unplugged, or its release was ambiguous).
+    // The release that would otherwise end that press never reaches the
+    // release handling below, so cancel that device's hold or held binding
+    // here instead of leaving a stale lifecycle for a stray pointer move or
+    // timer to fire.
+    if let Some(source) = invalidated_source {
+        if let Some(press) = HOLD.with_borrow_mut(|h| h.cancel_for(id, source)) {
             dispatcher.cancel_stale_hook_press(&press);
         }
-        if let Some(press) = SUPPRESSED_PRESSES.with_borrow_mut(|s| s.remove(&id)) {
+        let key = (id, Some(source.clone()));
+        if let Some(press) = SUPPRESSED_PRESSES.with_borrow_mut(|s| s.remove(&key)) {
             dispatcher.cancel_stale_hook_press(&press);
         }
     }
     if !button_source_may_remap(device) {
         return EventDisposition::PassThrough;
     }
+    let key = (id, device.cloned());
     // `try_read` only: a blocking read on the tap thread freezes every pointer
     // event while a config rebuild holds the write lock. Fail open if unavailable.
     let (binding, is_gesture, pointer_target) =
@@ -301,20 +324,21 @@ fn handle_button(
         // A refused begin — a second gesture button pressed mid-hold — falls
         // through to the single-action path: the first hold wins and this press
         // still means its plain click.
-        let admission = is_gesture.then(|| HOLD.with_borrow_mut(|h| h.prepare_begin(id)));
+        let admission = is_gesture.then(|| HOLD.with_borrow_mut(|h| h.prepare_begin(id, device)));
         if let Some(HoldAdmission::Begin | HoldAdmission::Replace(_)) = &admission {
             if let Some(HoldAdmission::Replace(stale)) = &admission {
                 dispatcher.cancel_stale_hook_press(stale);
             }
             if let Some(press) = dispatcher.try_hook_button_down(id, None, action_target) {
-                HOLD.with_borrow_mut(|h| h.begin(id, press));
+                HOLD.with_borrow_mut(|h| h.begin(id, device, press));
                 return EventDisposition::Suppress;
             }
-            return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, None, s));
+            return SUPPRESSED_PRESSES
+                .with_borrow_mut(|s| remapped_press_disposition(key, None, s));
         }
     } else {
         // Drop the HOLD borrow before any queueing (re-entrancy freeze hazard).
-        let ended = HOLD.with_borrow_mut(|h| h.end(id));
+        let ended = HOLD.with_borrow_mut(|h| h.end(id, device));
         if let Some((press, was_click)) = ended {
             if was_click {
                 let action = hooks
@@ -330,7 +354,7 @@ fn handle_button(
             return EventDisposition::Suppress;
         }
         let disposition =
-            SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_release_disposition(id, s));
+            SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_release_disposition(&key, s));
         if disposition == EventDisposition::Suppress {
             dispatcher.try_hook_button_up(id);
         }
@@ -338,14 +362,14 @@ fn handle_button(
     }
 
     let Some(binding) = binding else {
-        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, None, s));
+        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(key, None, s));
     };
     if binding_is_native_click(id, &binding) {
-        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, None, s));
+        return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(key, None, s));
     }
     info!(button = %id, action = %binding.click_action().label(), "button → handling binding");
     let press = dispatcher.try_hook_button_down(id, Some(&binding), action_target);
-    SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, press, s))
+    SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(key, press, s))
 }
 
 fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
@@ -355,25 +379,25 @@ fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
 /// Press of a remapped single-action button: suppress when the action was
 /// queued, and remember its press so release uses the same disposition.
 fn remapped_press_disposition(
-    id: ButtonId,
+    key: PressSource,
     press: Option<PressToken>,
-    suppressed: &mut HashMap<ButtonId, PressToken>,
+    suppressed: &mut HashMap<PressSource, PressToken>,
 ) -> EventDisposition {
     if let Some(press) = press {
-        suppressed.insert(id, press);
+        suppressed.insert(key, press);
         EventDisposition::Suppress
     } else {
-        suppressed.remove(&id);
+        suppressed.remove(&key);
         EventDisposition::PassThrough
     }
 }
 
 /// A release follows its matching press, not the pointer's current profile.
 fn remapped_release_disposition(
-    id: ButtonId,
-    suppressed: &mut HashMap<ButtonId, PressToken>,
+    key: &PressSource,
+    suppressed: &mut HashMap<PressSource, PressToken>,
 ) -> EventDisposition {
-    if suppressed.remove(&id).is_some() {
+    if suppressed.remove(key).is_some() {
         EventDisposition::Suppress
     } else {
         EventDisposition::PassThrough
@@ -493,12 +517,12 @@ pub fn start(
                     id,
                     pressed,
                     device,
-                    attribution_invalidated,
+                    invalidated_source,
                 } => handle_button(
                     id,
                     pressed,
                     device.as_ref(),
-                    attribution_invalidated,
+                    invalidated_source.as_ref(),
                     &hooks,
                     &dispatcher,
                     openlogi_hook::frontmost_safari_pid,
