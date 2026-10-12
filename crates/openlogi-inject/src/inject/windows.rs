@@ -4,6 +4,7 @@
 use std::mem::size_of;
 use std::sync::{LazyLock, Mutex};
 
+use windows_sys::Win32::System::Shutdown::LockWorkStation;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
@@ -25,7 +26,6 @@ static SCROLL_QUANTIZER: LazyLock<Mutex<ScrollQuantizer>> =
     LazyLock::new(|| Mutex::new(ScrollQuantizer::default()));
 
 const VK_D: u16 = 0x44;
-const VK_L: u16 = 0x4C;
 const VK_S: u16 = 0x53;
 const VK_TAB: u16 = 0x09;
 const VK_LEFT: u16 = 0x25;
@@ -124,7 +124,10 @@ fn dispatch_native(native: NativeAction) {
         NativeAction::NextDesktop => post_key(VK_RIGHT, &[VK_LWIN, VK_CONTROL]),
         NativeAction::ShowDesktop => post_key(VK_D, &[VK_LWIN]),
         NativeAction::LaunchpadShow => post_key(VK_LWIN, &[]),
-        NativeAction::LockScreen => post_key(VK_L, &[VK_LWIN]),
+        // Win+L is a system-reserved chord that Windows ignores when
+        // injected via SendInput; LockWorkStation is the API that actually
+        // locks the session.
+        NativeAction::LockScreen => lock_workstation(),
         // Win+Shift+S opens the snip overlay, which serves both full-screen
         // and region capture on Windows.
         NativeAction::Screenshot | NativeAction::CaptureRegion => {
@@ -136,6 +139,19 @@ fn dispatch_native(native: NativeAction) {
         NativeAction::Sleep => {
             tracing::debug!("Sleep has no Windows synthesis yet — action skipped");
         }
+    }
+}
+
+/// Lock the current session via the dedicated Win32 API. Windows silently
+/// swallows a synthetic Win+L posted through `SendInput` (the chord is
+/// system-reserved), so this is the only way to synthesise `LockScreen`.
+fn lock_workstation() {
+    // SAFETY: `LockWorkStation` takes no arguments and touches no caller
+    // memory; it either locks the session or fails, reported via the
+    // return value.
+    let locked = unsafe { LockWorkStation() };
+    if locked == 0 {
+        tracing::warn!("LockWorkStation failed — the session was not locked");
     }
 }
 
