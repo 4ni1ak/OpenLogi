@@ -142,6 +142,29 @@ pub fn scroll_inversion() -> bool {
     INVERT_SCROLL.load(Ordering::Relaxed)
 }
 
+/// Flip the vertical delta of a scroll [`MouseEvent`], leaving every other
+/// variant untouched.
+///
+/// Shared by every backend that applies software scroll inversion: the
+/// callback must see the same inverted delta that a pass-through event gets
+/// written back with, so a suppressed impulse (smoothing, non-1x
+/// sensitivity) is reversed too instead of only a forwarded one (#1737).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn negate_scroll_y(event: MouseEvent) -> MouseEvent {
+    match event {
+        MouseEvent::Scroll {
+            delta,
+            from_trackpad,
+            device,
+        } => MouseEvent::Scroll {
+            delta: delta.negate_y(),
+            from_trackpad,
+            device,
+        },
+        other => other,
+    }
+}
+
 /// Whether the OS hook may suppress/remap a button event from this source.
 ///
 /// Fail-closed on macOS-style attribution: only a known Logitech non-trackpad
@@ -180,7 +203,7 @@ pub enum HookEvent {
 }
 
 /// An event captured at the OS layer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MouseEvent {
     /// A mouse button was pressed or released.
     Button {

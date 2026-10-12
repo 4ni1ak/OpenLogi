@@ -45,6 +45,32 @@ fn mouse_event_clone_and_debug() {
     }
 }
 
+/// `negate_scroll_y` flips only a scroll event's vertical delta, and leaves
+/// every other `MouseEvent` variant untouched — the shared fix for #1737.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn negate_scroll_y_flips_only_scroll_events() {
+    let scroll = MouseEvent::Scroll {
+        delta: ScrollDelta::wheel_ticks(2.0, 3.0),
+        from_trackpad: false,
+        device: None,
+    };
+    assert_eq!(
+        negate_scroll_y(scroll),
+        MouseEvent::Scroll {
+            delta: ScrollDelta::wheel_ticks(2.0, -3.0),
+            from_trackpad: false,
+            device: None,
+        }
+    );
+
+    let moved = MouseEvent::Moved {
+        delta_x: 1,
+        delta_y: 2,
+    };
+    assert_eq!(negate_scroll_y(moved.clone()), moved);
+}
+
 /// `EventDisposition` implements `PartialEq` correctly.
 #[test]
 fn event_disposition_equality() {

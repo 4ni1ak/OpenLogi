@@ -608,7 +608,27 @@ fn device_thread(
                     companions.hold(event);
                     continue;
                 }
-                let disposition = translate(&event, hires_scroll)
+                let is_vertical_wheel = matches!(
+                    event.destructure(),
+                    EventSummary::RelativeAxis(
+                        _,
+                        RelativeAxisCode::REL_WHEEL | RelativeAxisCode::REL_WHEEL_HI_RES,
+                        _
+                    )
+                );
+                let inverted = is_vertical_wheel
+                    .then(|| *report_inverted.get_or_insert_with(crate::scroll_inversion));
+                let mouse_event = translate(&event, hires_scroll).map(|me| {
+                    // The callback sees the already-inverted delta too, so a
+                    // suppressed impulse (smoothing, non-1x sensitivity) is
+                    // reversed the same as a passed-through one — see #1737.
+                    if inverted == Some(true) {
+                        crate::negate_scroll_y(me)
+                    } else {
+                        me
+                    }
+                });
+                let disposition = mouse_event
                     .map_or(EventDisposition::PassThrough, |me| cb(HookEvent::Mouse(me)));
                 if disposition == EventDisposition::PassThrough
                     && let EventSummary::RelativeAxis(_, axis, _) = event.destructure()
@@ -617,7 +637,9 @@ fn device_thread(
                 }
                 match disposition {
                     EventDisposition::PassThrough => {
-                        let inverted = *report_inverted.get_or_insert_with(crate::scroll_inversion);
+                        let inverted = inverted.unwrap_or_else(|| {
+                            *report_inverted.get_or_insert_with(crate::scroll_inversion)
+                        });
                         pending.push(invert_wheel(event, inverted));
                     }
                     EventDisposition::Suppress => {}

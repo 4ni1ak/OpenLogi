@@ -352,6 +352,17 @@ fn run_tap_callback(
         // scroll (never a trackpad) is the only thing software inversion may
         // touch.
         let invert = crate::scroll_inversion() && wheel_scroll_to_invert(&hook_event);
+        // The callback sees the already-inverted delta too, so a suppressed
+        // impulse (smoothing, non-1x sensitivity) is reversed the same as a
+        // passed-through one — see #1737.
+        let hook_event = if invert {
+            match hook_event {
+                HookEvent::Mouse(me) => HookEvent::Mouse(crate::negate_scroll_y(me)),
+                key @ HookEvent::Key(_) => key,
+            }
+        } else {
+            hook_event
+        };
         match cb(hook_event) {
             EventDisposition::PassThrough => {
                 if invert {
