@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use openlogi_core::app::ForegroundApp;
-use openlogi_core::binding::{Action, Binding, ButtonId};
+use openlogi_core::binding::{Binding, ButtonId};
 use openlogi_core::bindings::{button_bindings_for, oshook_gestures_for};
 use openlogi_core::config::{Config, LightSettings, MouseProfileTarget, canonical_device_key};
 use openlogi_core::device::{
@@ -1287,20 +1287,22 @@ struct KeyboardDivertSet {
     reserved: Vec<u16>,
 }
 
-/// Which of `bindings` carry a real action on a keyboard control. A
-/// [`Binding::LongPress`] is bound whatever its arms hold; a single binding is
-/// bound unless it is [`Action::None`], the "leave native" value.
+/// Which of `bindings` carry a stored binding on a keyboard control — a
+/// control is diverted whenever it is present at all, even as
+/// [`openlogi_core::binding::Action::None`] (which means "suppress this key," not "leave native"):
+/// `button_bindings_for` seeds no default for a [`ButtonId::Control`], so
+/// presence here is always an explicit user choice (#1747).
 fn keyboard_divert_set(bindings: &BTreeMap<ButtonId, Binding>) -> KeyboardDivertSet {
     let mut set = KeyboardDivertSet::default();
-    for (button, binding) in bindings {
+    for button in bindings.keys() {
         let Some(cid) = button.cid().map(openlogi_core::binding::Cid::raw) else {
             continue;
         };
-        let bound =
-            matches!(binding, Binding::LongPress(_)) || binding.click_action() != Action::None;
-        if !bound {
-            continue;
-        }
+        // A keyboard key never seeds a default (see `ButtonId::ALL`'s own
+        // doc), so its presence here means the user explicitly bound it —
+        // even to `Action::None`, which means "suppress", not "leave
+        // native" (#1747). Only a key truly absent from the stored config
+        // is left on its firmware function.
         if is_reserved_keyboard_control(cid) {
             set.reserved.push(cid);
         } else {

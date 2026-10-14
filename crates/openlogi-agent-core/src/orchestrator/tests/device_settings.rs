@@ -156,8 +156,11 @@ fn keyboard(key: &str, slot: u8, online: bool) -> AgentDevice {
 #[test]
 fn keyboard_spec_diverts_exactly_the_bound_controls() {
     let mut config = Config::default();
-    // A catalogued key, a key OpenLogi has no catalog row for, and a key
-    // bound to nothing — only the first two are diverted, by their CID.
+    // A catalogued key and a key OpenLogi has no catalog row for — both
+    // stored, both diverted by their CID. A key explicitly bound to
+    // `Action::None` is stored too, and is diverted just the same: presence
+    // in the config is the user's explicit choice to suppress it (#1747),
+    // not a reason to leave it native.
     config.set_binding(
         "kbd",
         ButtonId::control(0x010a),
@@ -191,6 +194,7 @@ fn keyboard_spec_diverts_exactly_the_bound_controls() {
             (multiplatform_back, ButtonId::control(multiplatform_back)),
             (0x010a, ButtonId::control(0x010a)),
             (0x01f3, ButtonId::control(0x01f3)),
+            (0x00e5, ButtonId::control(0x00e5)),
         ])
     );
     assert_eq!(spec.config_key, "kbd");
@@ -198,15 +202,13 @@ fn keyboard_spec_diverts_exactly_the_bound_controls() {
 
 #[test]
 fn keyboard_spec_is_absent_without_a_real_binding_or_for_a_disabled_keyboard() {
-    let mut config = Config::default();
-    config.set_binding(
-        "kbd",
-        ButtonId::control(0x010a),
-        Binding::Single(Action::None),
-    );
+    let config = Config::default();
     let mut orch = orchestrator(config);
     orch.devices = vec![keyboard("kbd", 1, true)];
-    assert!(orch.keyboard_spec_for().is_none(), "None is not a binding");
+    assert!(
+        orch.keyboard_spec_for().is_none(),
+        "an unconfigured key is never diverted"
+    );
 
     let mut config = Config::default();
     config.set_binding(
