@@ -4,6 +4,7 @@
 use std::mem::size_of;
 use std::sync::{LazyLock, Mutex};
 
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Shutdown::LockWorkStation;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_HWHEEL,
@@ -189,11 +190,11 @@ fn post_click(button: MouseButton) {
 /// hardening against injected input triggering it), so there is no
 /// `post_key` equivalent here.
 fn lock_screen() {
-    // SAFETY: LockWorkStation takes no arguments and has no preconditions;
-    // its return value only reports whether the lock happened and is not
-    // needed here.
-    unsafe {
-        LockWorkStation();
+    // SAFETY: LockWorkStation and GetLastError take no arguments and have no
+    // preconditions.
+    let (succeeded, error) = unsafe { (LockWorkStation() != 0, GetLastError()) };
+    if !succeeded {
+        tracing::warn!(error, "LockWorkStation failed");
     }
 }
 
