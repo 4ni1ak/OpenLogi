@@ -3,9 +3,9 @@
 //! A dedicated thread owns the persistent enumerator and every HID++ channel
 //! it opens. OS hotplug, receiver/device lifecycle broadcasts, native/system
 //! resume, bounded repair, and settings confirmation are typed reasons to run
-//! one full authoritative reconciliation. A named half-minute recovery scan is
-//! retained because some firmware/hosts miss lifecycle events and legacy or
-//! voltage battery features have no broadcast API.
+//! one full authoritative reconciliation. A recovery scan runs inside the probe
+//! cache's freshness window because some firmware/hosts miss lifecycle events
+//! and legacy or voltage battery features have no broadcast API.
 
 use std::collections::{BTreeMap, HashSet};
 use std::future::pending;
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use schedule::{
     DeadlinePurpose, HID_EVENT_SETTLE, HOTPLUG_SETTLE, ReconcileTrigger, SYSTEM_RESUME_SETTLE,
-    Schedule, WakeDetector,
+    ScanClock, Schedule, WakeDetector,
 };
 
 use crate::hardware::HardwareContext;
@@ -430,14 +430,11 @@ impl InventoryWorker {
     }
 
     async fn reconcile(&mut self, trigger: ReconcileTrigger) -> bool {
-        // Stamped before the probe, matching the probe cache's own `probed_at`
-        // reference point (`openlogi_device::inventory::probe_or_reuse`). Using
-        // a post-probe `Instant::now()` here instead would schedule the next
-        // recovery scan `RECOVERY_SCAN_PERIOD` after this scan *finished*,
-        // which always exceeds the cache's freshness window measured from this
-        // scan's *start* — every recovery scan would then see a stale cache and
-        // re-walk the full HID++ feature table instead of hitting it (#1774).
-        let now = Instant::now();
+        // Recovery uses this instant: enumerate stamps `probed_at` from its own
+        // start, and the cache stays fresh through `PROBE_CACHE_FRESHNESS`.
+        // Repair retries use completion, or a pass longer than
+        // `FAST_RETRY_DELAY` would already be due when it returns (#1774).
+        let started = Instant::now();
         let (event, needs_repair) = match self.enumerator.enumerate().await {
             Ok(inventories) => {
                 let standalone = self.hardware.enumerate_standalone().await;
@@ -466,7 +463,14 @@ impl InventoryWorker {
             debug!("inventory watcher receiver dropped — exiting");
             return false;
         }
-        self.schedule.scan_finished(trigger, needs_repair, now);
+        self.schedule.scan_finished(
+            trigger,
+            needs_repair,
+            ScanClock {
+                started,
+                finished: Instant::now(),
+            },
+        );
         true
     }
 
