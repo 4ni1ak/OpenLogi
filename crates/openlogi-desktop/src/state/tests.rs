@@ -46,6 +46,7 @@ use super::{
 };
 
 mod asset_targets;
+mod backlight;
 mod bindings;
 mod camera;
 pub(crate) mod device_list;
@@ -56,6 +57,7 @@ mod lighting;
 mod os_layout;
 mod profile_scope;
 mod reload;
+mod report_rate;
 mod smartshift;
 mod transient_identity;
 mod wheel_resolution;

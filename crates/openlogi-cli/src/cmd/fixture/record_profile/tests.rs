@@ -8,8 +8,9 @@ use openlogi_core::binding::ActionRingSlot;
 use openlogi_core::config::Lighting;
 use openlogi_core::device::DeviceInventory;
 use openlogi_core::hid::{
-    BacklightMode, BacklightState, BacklightStatus, Dpi, DpiInfo, FnLockState, LightCommand,
-    PasskeyMethod, ReceiverSelector, ScrollWheelMode, SmartShiftStatus,
+    BacklightChange, BacklightControls, BacklightMode, BacklightState, BacklightStatus, Dpi,
+    DpiInfo, FnLockState, LightCommand, PasskeyMethod, ReceiverSelector, ReportRate,
+    ReportRateInfo, ScrollWheelMode, SmartShiftStatus,
 };
 use openlogi_fixture::{
     CANONICAL_DEVICE_PROFILE_JSON, SyntheticIdentityKind, classify_synthetic_identity_bytes,
@@ -40,6 +41,7 @@ enum ReadFamily {
     Wheel,
     Backlight,
     FnLock,
+    ReportRate,
 }
 
 #[derive(Clone)]
@@ -164,6 +166,34 @@ impl Agent for TestAgent {
         _route: DeviceRoute,
     ) -> Result<(), PairingFailure> {
         unreachable!("profile capture must never unpair a device")
+    }
+    async fn read_report_rate(
+        self,
+        _: TarpcContext,
+        route: DeviceRoute,
+    ) -> Result<ReportRateInfo, WriteError> {
+        self.read(
+            ReadFamily::ReportRate,
+            &route,
+            |settings| &settings.report_rate,
+            0x8061,
+        )
+    }
+    async fn set_report_rate(
+        self,
+        _: TarpcContext,
+        _route: DeviceRoute,
+        _rate: ReportRate,
+    ) -> Result<ReportRateInfo, WriteError> {
+        unreachable!("profile capture must never write the report rate")
+    }
+    async fn set_backlight(
+        self,
+        _: TarpcContext,
+        _route: DeviceRoute,
+        _change: BacklightChange,
+    ) -> Result<BacklightState, WriteError> {
+        unreachable!("profile capture must never write the backlight")
     }
 
     async fn read_dpi(self, _: TarpcContext, route: DeviceRoute) -> Result<DpiInfo, WriteError> {
@@ -365,6 +395,8 @@ fn fixture_agent() -> TestAgent {
         status: BacklightStatus::AlsAutomatic,
         current_level: 3,
         nb_levels: 8,
+        power_save: false,
+        controls: BacklightControls::default(),
     });
     profile.standalone[0].address.identity = RAW_STANDALONE_ID.to_string();
     profile.standalone[0].serial_number = Some("RAW-LIGHT-SERIAL".to_string());
@@ -433,7 +465,8 @@ async fn receiver_capture_uses_agent_reads_and_writes_validated_profile_only() {
             ReadFamily::Dpi,
             ReadFamily::Smartshift,
             ReadFamily::Wheel,
-            ReadFamily::Backlight,
+            // A mouse has no `0x1982`, so its backlight is recorded
+            // unsupported without asking the agent.
             ReadFamily::Smartshift,
         ]
     );

@@ -282,7 +282,9 @@ impl AppView {
                         )
                         && is_current(key)
                 }
-                StateEvent::DpiChanged(key) | StateEvent::FnLockChanged(key) => {
+                StateEvent::DpiChanged(key)
+                | StateEvent::FnLockChanged(key)
+                | StateEvent::BacklightChanged(key) => {
                     !on_home && view.active_tab == DetailTab::Device && is_current(key)
                 }
                 StateEvent::LightingChanged(key) => {
@@ -299,6 +301,7 @@ impl AppView {
                 // caches no localized text. A refused removal is a dialog,
                 // opened through `removal_obs`.
                 StateEvent::SmartShiftChanged(_)
+                | StateEvent::ReportRateChanged(_)
                 | StateEvent::DeviceRemovalFailed { .. }
                 | StateEvent::CameraPermissionChanged
                 | StateEvent::DiagnosticsChanged

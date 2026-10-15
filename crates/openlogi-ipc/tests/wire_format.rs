@@ -41,10 +41,11 @@ use openlogi_core::device::{
     PairedDevice, RawDeviceAddress, ReceiverInfo, StandaloneDevice,
 };
 use openlogi_core::hid::{
-    BacklightMode, BacklightState, BacklightStatus, Click, DeviceRoute, Dpi, DpiCapabilities,
-    DpiInfo, FnLockState, HidppFeatureErrorKind, HidppOperation, LightCommand, PasskeyMethod,
-    ReceiverSelector, ScrollReportingTarget, ScrollWheelMode, SmartShiftAutoDisengage,
-    SmartShiftMode, SmartShiftStatus, SmartShiftThreshold, TunableTorque, WriteError,
+    BacklightChange, BacklightControls, BacklightMode, BacklightState, BacklightStatus, Click,
+    DeviceRoute, Dpi, DpiCapabilities, DpiInfo, FnLockState, HidppFeatureErrorKind, HidppOperation,
+    LightCommand, PasskeyMethod, ReceiverSelector, ReportRate, ReportRateInfo,
+    ScrollReportingTarget, ScrollWheelMode, SmartShiftAutoDisengage, SmartShiftMode,
+    SmartShiftStatus, SmartShiftThreshold, TunableTorque, WriteError,
 };
 use openlogi_ipc::{
     ActionRingCommandError, ActionRingInvocation, ActionRingPresentation, AgentRequest,
@@ -261,6 +262,35 @@ fn semantic_read_requests() {
         },
         "1e0008463030444341464501",
     );
+    assert_wire(
+        &AgentRequest::ReadReportRate {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+        },
+        "1f0008463030444341464501",
+    );
+    assert_wire(
+        &AgentRequest::SetReportRate {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+            rate: ReportRate::new(1000),
+        },
+        "200008463030444341464501fbe803",
+    );
+    assert_wire(
+        &AgentRequest::SetBacklight {
+            route: DeviceRoute::Bolt {
+                receiver_uid: "F00DCAFE".into(),
+                slot: 1,
+            },
+            change: BacklightChange::Level(5),
+        },
+        "2100084630304443414645010205",
+    );
 }
 
 /// A chord crosses the wire as its modifier bits and the key's HID usage.
@@ -325,6 +355,8 @@ fn action_ring_types() {
     assert_wire(&HidppOperation::ReadPointerScaling, "10");
     assert_wire(&HidppOperation::WritePointerScaling, "11");
     assert_wire(&HidppOperation::WriteOsLayout, "12");
+    assert_wire(&HidppOperation::ReadReportRate, "13");
+    assert_wire(&HidppOperation::WriteReportRate, "14");
 }
 
 #[test]
@@ -495,13 +527,15 @@ fn device_inventory() {
                 dpi_gestures: true,
                 fn_lock: false,
                 os_layout: true,
+                report_rate: true,
+                backlight: true,
             }),
             settings_revision: 7,
         }],
     }];
     assert_wire(
         &inventory,
-        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b00001010150020001030106323134304c5a0102030400010100fb34b0fb8240000b01010100000101010101000107",
+        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b00001010150020001030106323134304c5a0102030400010100fb34b0fb8240000b010101000001010101010001010107",
     );
 }
 
@@ -632,8 +666,15 @@ fn semantic_read_payloads() {
         status: BacklightStatus::AlsAutomatic,
         current_level: 4,
         nb_levels: 8,
+        power_save: true,
+        controls: BacklightControls {
+            automatic: true,
+            level: true,
+            power_save: false,
+        },
     });
-    assert_wire(&backlight, "000101020408");
+    // v36 appends `power_save` and `controls` after the level count.
+    assert_wire(&backlight, "00010102040801010100");
 
     let fn_lock: Result<FnLockState, WriteError> = Ok(FnLockState {
         fn_lock: true,
@@ -728,5 +769,55 @@ fn standalone_light_dtos_commands_and_errors() {
     assert_wire(
         &WriteError::HapticWaveformUnsupported { waveform: 1 },
         "1001",
+    );
+    assert_wire(&WriteError::HapticsUnavailable { status: 2 }, "1502");
+}
+
+#[test]
+fn backlight_changes_and_errors() {
+    assert_wire(&BacklightChange::Enabled(true), "0001");
+    assert_wire(&BacklightChange::Automatic(false), "0100");
+    assert_wire(&BacklightChange::Level(3), "0203");
+    assert_wire(&BacklightChange::PowerSave(true), "0301");
+    assert_wire(
+        &WriteError::BacklightChangeUnsupported {
+            change: BacklightChange::Level(8),
+        },
+        "130208",
+    );
+    assert_wire(
+        &WriteError::BacklightNotApplied {
+            change: BacklightChange::Automatic(true),
+        },
+        "140101",
+    );
+}
+
+#[test]
+fn report_rate_dtos_and_errors() {
+    assert_wire(
+        &WriteError::ReportRateUnsupported {
+            requested: ReportRate::new(2000),
+        },
+        "11fbd007",
+    );
+    assert_wire(
+        &WriteError::ReportRateNotApplied {
+            requested: ReportRate::new(1000),
+            actual: ReportRate::new(500),
+        },
+        "12fbe803fbf401",
+    );
+    // Rates are whole hertz as varints: 125 fits one byte, the rest take three.
+    assert_wire(
+        &ReportRateInfo {
+            current: ReportRate::new(1000),
+            supported: vec![
+                ReportRate::new(125),
+                ReportRate::new(500),
+                ReportRate::new(1000),
+            ],
+        },
+        "fbe803037dfbf401fbe803",
     );
 }

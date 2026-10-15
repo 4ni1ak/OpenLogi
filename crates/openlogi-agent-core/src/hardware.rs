@@ -26,8 +26,8 @@ use std::time::Duration;
 use openlogi_core::config::Lighting;
 use openlogi_hid::{
     CaptureChannelSlot, ChannelRegistry, DeviceIoGate, DeviceRoute, Dpi, HidppOperation, HostOs,
-    OsLayoutOutcome, ScrollResolution, SharedChannel, SmartShiftStatus, WeakSharedChannel,
-    WriteError,
+    OsLayoutOutcome, ReportRate, ScrollResolution, SharedChannel, SmartShiftStatus,
+    WeakSharedChannel, WriteError,
 };
 use tokio::time::error::Elapsed;
 use tracing::{debug, info, warn};
@@ -35,12 +35,12 @@ use tracing::{debug, info, warn};
 use crate::receiver_access::ReceiverAccess;
 
 mod context;
-mod fn_lock;
 mod light;
 mod rgb_control;
+mod write_order;
 
 pub use context::HardwareContext;
-pub(crate) use fn_lock::{FnLockOrder, FnLockTicket};
+pub(crate) use write_order::{WriteOrder, WriteTicket};
 
 /// Upper bound on a single HID++ write. `hidpp` has no request timeout of its
 /// own, so without this an asleep / unresponsive device would hang (and leak)
@@ -228,6 +228,72 @@ impl DeviceOp {
         timed(op, f(shared)).await
     }
 
+    /// [`Self::run`] for a write ordered by `ticket`: lease the receiver,
+    /// wait for the device's earlier writes of the same setting, then resolve
+    /// the channel and give `write` — or `superseded`, when a newer write was
+    /// requested meanwhile — the whole `WRITE_TIMEOUT`.
+    ///
+    /// The wait is not part of the deadline: a pick queued behind a reconnect
+    /// write to a mouse that stopped answering still gets its full budget once
+    /// that write gives up. Resolving after the wait keeps [`Self::run`]'s
+    /// rule of never queueing on an already-resolved channel.
+    pub(crate) async fn run_in_turn<W, WriteFut, S, SupersededFut, T>(
+        self,
+        op: HidppOperation,
+        ticket: &WriteTicket,
+        write: W,
+        superseded: S,
+    ) -> Result<T, WriteError>
+    where
+        W: FnOnce(SharedChannel) -> WriteFut,
+        WriteFut: Future<Output = Result<T, WriteError>>,
+        S: FnOnce(SharedChannel) -> SupersededFut,
+        SupersededFut: Future<Output = Result<T, WriteError>>,
+    {
+        if !self.access.device_io.allows_io() {
+            return Err(WriteError::DeviceNotFound);
+        }
+        let _lease = self.access.receiver_access.acquire_for_io().await;
+        within_turn(
+            ticket,
+            || async { write(self.resolve()?).await },
+            || async { superseded(self.resolve()?).await },
+        )
+        .await
+        .map_err(|_| WriteError::RequestTimedOut { operation: op })?
+    }
+
+    /// [`Self::run`] for a write that must land after every earlier write of
+    /// the same setting and must not be skipped (see
+    /// [`WriteTicket::in_order`]): wait for those writes, then lease the
+    /// receiver, resolve the channel and give `write` the whole
+    /// `WRITE_TIMEOUT`.
+    ///
+    /// The wait comes before the lease. The lease is a fair `RwLock`, so
+    /// waiting while holding it could deadlock: a queued pairing session
+    /// would block the earlier write's lease, which waits for this one.
+    pub(crate) async fn run_in_order<W, WriteFut, T>(
+        self,
+        op: HidppOperation,
+        ticket: WriteTicket,
+        write: W,
+    ) -> Result<T, WriteError>
+    where
+        W: FnOnce(SharedChannel) -> WriteFut,
+        WriteFut: Future<Output = Result<T, WriteError>>,
+    {
+        if !self.access.device_io.allows_io() {
+            return Err(WriteError::DeviceNotFound);
+        }
+        ticket
+            .in_order(|| async {
+                let _lease = self.access.receiver_access.acquire_for_io().await;
+                let shared = self.resolve()?;
+                timed(op, write(shared)).await
+            })
+            .await
+    }
+
     /// Own the whole lighting transaction outside the requester runtime. The
     /// worker leases and resolves AFTER obtaining its lighting route lock and
     /// retains that lease through any RGB rollback after requester cancellation.
@@ -359,6 +425,26 @@ impl DeviceOp {
         F: FnOnce(SharedChannel) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, WriteError>>,
     {
+        self.spawn_timed_write(
+            label,
+            move |shared| tokio::time::timeout(WRITE_TIMEOUT, f(shared)),
+            log,
+        );
+    }
+
+    /// [`Self::spawn_write`] for a write that bounds its own device I/O, as
+    /// `tokio::time::timeout` would: one that first waits its turn behind
+    /// the device's earlier writes (see [`within_turn`]) must not spend its
+    /// deadline on that wait.
+    fn spawn_timed_write<F, Fut, T>(
+        self,
+        label: &'static str,
+        f: F,
+        log: impl FnOnce(Result<Result<T, WriteError>, Elapsed>) + Send + 'static,
+    ) where
+        F: FnOnce(SharedChannel) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Result<T, WriteError>, Elapsed>>,
+    {
         let shared = match self.resolve() {
             Ok(shared) => shared,
             Err(reason) => {
@@ -380,7 +466,7 @@ impl DeviceOp {
                 if !device_io.allows_io() {
                     return None;
                 }
-                Some(tokio::time::timeout(WRITE_TIMEOUT, f(shared)).await)
+                Some(f(shared).await)
             });
             if let Some(result) = result {
                 log(result);
@@ -409,6 +495,29 @@ fn log_outcome<T>(
         Ok(Err(error)) => warn!(index, ?error, "{what} failed"),
         Err(_) => warn!(index, "{what} timed out (device asleep/unresponsive)"),
     }
+}
+
+/// Wait for `ticket`'s turn, then give whichever of `write` and `superseded`
+/// runs the whole `WRITE_TIMEOUT`. Every ordered write goes through here: the
+/// turn is held only while that bounded I/O runs, so the wait behind earlier
+/// writes is bounded by their deadlines without eating this one's.
+async fn within_turn<T, W, WriteFut, S, SupersededFut>(
+    ticket: &WriteTicket,
+    write: W,
+    superseded: S,
+) -> Result<T, Elapsed>
+where
+    W: FnOnce() -> WriteFut,
+    WriteFut: Future<Output = T>,
+    S: FnOnce() -> SupersededFut,
+    SupersededFut: Future<Output = T>,
+{
+    ticket
+        .write_or(
+            || tokio::time::timeout(WRITE_TIMEOUT, write()),
+            || tokio::time::timeout(WRITE_TIMEOUT, superseded()),
+        )
+        .await
 }
 
 /// Build the one-shot current-thread runtime every background write spawns
@@ -446,15 +555,17 @@ pub fn toggle_smartshift_in_background(op: DeviceOp) {
 /// keyboard was requested after `ticket`. Returns immediately; failures (incl.
 /// keyboards that expose neither `0x40a3` nor `0x40a2` fn inversion, and a
 /// keyboard whose read-back disagrees with the write) are logged.
-pub(crate) fn write_fn_lock_in_background(op: DeviceOp, ticket: FnLockTicket, on: bool) {
+pub(crate) fn write_fn_lock_in_background(op: DeviceOp, ticket: WriteTicket, on: bool) {
     let index = op.route.device_index();
-    op.spawn_write(
+    op.spawn_timed_write(
         "Fn-lock write",
         move |c| async move {
-            let Some(_turn) = ticket.turn().await else {
-                return Ok(None);
-            };
-            openlogi_hid::set_fn_lock_on(&c, on).await.map(Some)
+            within_turn(
+                &ticket,
+                || async { openlogi_hid::set_fn_lock_on(&c, on).await.map(Some) },
+                || async { Ok(None) },
+            )
+            .await
         },
         move |result| {
             log_outcome(index, "Fn-lock write", result, |state| {
@@ -540,6 +651,9 @@ pub struct VolatileMouseSettings {
     pub wheel: Option<WheelModeChange>,
     /// Sensor DPI.
     pub dpi: Option<Dpi>,
+    /// Report rate. Written only when the device lists it, and skipped when
+    /// the device already reports at it.
+    pub report_rate: Option<ReportRate>,
     /// SmartShift mode and thresholds.
     pub smartshift: Option<SmartShiftStatus>,
 }
@@ -566,10 +680,21 @@ impl VolatileMouseSettings {
 /// on the one OS thread spawned here. Takes `op` by reference (unlike every
 /// other function here) because it only ever reads its fields — it never
 /// hands the operation itself to [`DeviceOp::run`] or [`DeviceOp::detach`].
-pub fn reapply_mouse_volatile_in_background(op: &DeviceOp, settings: VolatileMouseSettings) {
+///
+/// The report rate is the one setting here the GUI also writes on its own, so
+/// its write is numbered in `report_rate_order` now, as the reapply is
+/// scheduled: a pick the user makes before the reapply reaches the mouse is
+/// newer, and the reapply then leaves the rate to it rather than writing the
+/// configured one over it.
+pub(crate) fn reapply_mouse_volatile_in_background(
+    op: &DeviceOp,
+    settings: VolatileMouseSettings,
+    report_rate_order: &WriteOrder,
+) {
     let VolatileMouseSettings {
         wheel,
         dpi,
+        report_rate,
         smartshift,
     } = settings;
     let shared = match op.resolve() {
@@ -579,6 +704,9 @@ pub fn reapply_mouse_volatile_in_background(op: &DeviceOp, settings: VolatileMou
             return;
         }
     };
+    // Numbered only once the reapply will run: a ticket that never writes
+    // would still supersede a pick already waiting for its turn.
+    let report_rate = report_rate.map(|rate| (rate, report_rate_order.request(&op.route)));
     let receiver_access = op.access.receiver_access.clone();
     let device_io = op.access.device_io.clone();
     let index = op.route.device_index();
@@ -606,6 +734,25 @@ pub fn reapply_mouse_volatile_in_background(op: &DeviceOp, settings: VolatileMou
                 .await;
                 log_outcome(index, "DPI write", result, |()| {
                     debug!(index, %dpi, "DPI written to device");
+                });
+            }
+            if let Some((rate, ticket)) = report_rate {
+                let result = within_turn(
+                    &ticket,
+                    || async {
+                        openlogi_hid::set_report_rate_on(&shared, rate)
+                            .await
+                            .map(Some)
+                    },
+                    || async { Ok(None) },
+                )
+                .await;
+                log_outcome(index, "report-rate write", result, |info| {
+                    if let Some(info) = info {
+                        debug!(index, rate = %info.current, "report rate written to device");
+                    } else {
+                        debug!(index, %rate, "report-rate reapply superseded by a newer write");
+                    }
                 });
             }
             if let Some(ss) = smartshift {
@@ -938,6 +1085,97 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "f must not run when the route can't be resolved"
+        );
+    }
+
+    /// A reapply that cannot reach the mouse numbers no report-rate write:
+    /// a ticket that never writes would still make a pick already waiting
+    /// for its turn read the mouse instead of writing the user's rate.
+    #[tokio::test]
+    async fn a_reapply_that_cannot_resolve_leaves_a_waiting_pick_its_turn() {
+        let capture: CaptureChannelSlot = std::sync::Arc::new(RwLock::new(None));
+        let registry = ChannelRegistry::default();
+        let receiver_access = ReceiverAccess::default();
+        let (_device_io_signal, device_io) = device_io_channel();
+        let route = unresolvable_route();
+        let rates = WriteOrder::default();
+        let pick = rates.request(&route);
+
+        reapply_mouse_volatile_in_background(
+            &device_op(&capture, &registry, &receiver_access, &device_io, &route),
+            VolatileMouseSettings {
+                report_rate: Some(ReportRate::new(1000)),
+                ..VolatileMouseSettings::default()
+            },
+            &rates,
+        );
+
+        assert!(
+            pick.write_or(|| async { true }, || async { false }).await,
+            "the pick is still the newest report-rate write"
+        );
+    }
+
+    /// A backlight change to a keyboard that cannot be resolved fails, and
+    /// its turn passes on: the change requested after it still runs.
+    #[tokio::test]
+    async fn an_in_order_write_that_cannot_resolve_passes_its_turn_on() {
+        let capture: CaptureChannelSlot = std::sync::Arc::new(RwLock::new(None));
+        let registry = ChannelRegistry::default();
+        let receiver_access = ReceiverAccess::default();
+        let (_device_io_signal, device_io) = device_io_channel();
+        let route = unresolvable_route();
+        let backlight = WriteOrder::default();
+        let first = backlight.request(&route);
+        let next = backlight.request(&route);
+        let failed = device_op(&capture, &registry, &receiver_access, &device_io, &route)
+            .run_in_order(HidppOperation::WriteBacklight, first, |_| async {
+                Ok::<_, WriteError>(())
+            })
+            .await;
+        assert!(matches!(failed, Err(WriteError::DeviceNotFound)));
+        let ran =
+            tokio::time::timeout(Duration::from_secs(1), next.in_order(|| async { true })).await;
+        assert_eq!(ran.ok(), Some(true), "the next change gets its turn");
+    }
+
+    /// A reconnect write to a mouse that stopped answering holds the turn
+    /// until its deadline. The pick queued behind it still gets the whole
+    /// deadline once its turn comes, rather than what the wait left over.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_queued_behind_a_stalled_one_keeps_its_whole_deadline() {
+        let rates = WriteOrder::default();
+        let route = unresolvable_route();
+        let stalled = rates.request(&route);
+        let (started, has_started) = tokio::sync::oneshot::channel();
+        let reapply = tokio::spawn(async move {
+            within_turn(
+                &stalled,
+                || async move {
+                    let _ = started.send(());
+                    std::future::pending::<()>().await;
+                },
+                || async {},
+            )
+            .await
+        });
+        has_started.await.expect("the stalled write holds the turn");
+
+        let pick = rates.request(&route);
+        let picked = within_turn(
+            &pick,
+            || async {
+                tokio::time::sleep(WRITE_TIMEOUT / 2).await;
+                2000
+            },
+            || async { 0 },
+        )
+        .await;
+
+        assert_eq!(picked.ok(), Some(2000));
+        assert!(
+            reapply.await.expect("reapply joins").is_err(),
+            "the stalled write gave up at its own deadline"
         );
     }
 
