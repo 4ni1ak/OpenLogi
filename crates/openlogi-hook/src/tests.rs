@@ -71,6 +71,48 @@ fn negate_scroll_y_flips_only_scroll_events() {
     assert_eq!(negate_scroll_y(moved.clone()), moved);
 }
 
+/// `Delivery::run` hands the callback the reversed delta whatever it decides,
+/// and asks for the native event to be reversed only when it is passed
+/// through, so the desktop sees the wheel reversed exactly once (#1737).
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn delivery_reverses_the_callback_delta_and_only_a_forwarded_native_event() {
+    let cases = [
+        (true, EventDisposition::PassThrough, -3.0, true),
+        (true, EventDisposition::Suppress, -3.0, false),
+        (false, EventDisposition::PassThrough, 3.0, false),
+        (false, EventDisposition::Suppress, 3.0, false),
+    ];
+    for (invert, disposition, seen_y, invert_native) in cases {
+        let event = HookEvent::Mouse(MouseEvent::Scroll {
+            delta: ScrollDelta::wheel_ticks(2.0, 3.0),
+            from_trackpad: false,
+            device: None,
+        });
+        let mut seen = None;
+        let delivery = Delivery::run(event, invert, |hook_event| {
+            seen = Some(hook_event);
+            disposition
+        });
+        assert_eq!(
+            delivery,
+            Delivery {
+                disposition,
+                invert_native
+            },
+            "invert={invert} {disposition:?}"
+        );
+        assert!(
+            matches!(
+                seen,
+                Some(HookEvent::Mouse(MouseEvent::Scroll { delta, .. }))
+                    if delta == ScrollDelta::wheel_ticks(2.0, seen_y)
+            ),
+            "invert={invert} {disposition:?}: callback saw {seen:?}"
+        );
+    }
+}
+
 /// `EventDisposition` implements `PartialEq` correctly.
 #[test]
 fn event_disposition_equality() {
