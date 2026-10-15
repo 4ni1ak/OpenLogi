@@ -706,6 +706,9 @@ fn keyboard_with_buttons_shows_keys_tab() {
     let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
     assert!(tabs.contains(&DetailTab::Keys));
     assert!(!tabs.contains(&DetailTab::Buttons));
+    // A key can be bound to the Actions Ring action, so the ring needs its
+    // own editor tab even on a keyboard that has no mouse model (#1833).
+    assert!(tabs.contains(&DetailTab::ActionsRing));
 }
 
 /// A sleeping keyboard whose slot was never probed has no capability data,
