@@ -703,12 +703,16 @@ fn keyboard_with_buttons_shows_keys_tab() {
         easy_switch: false,
         virtual_thumbwheel: false,
     });
-    let tabs = DetailTab::tabs_for(&record(DeviceKind::Keyboard, caps));
+    let keyboard = record(DeviceKind::Keyboard, caps);
+    let tabs = DetailTab::tabs_for(&keyboard);
     assert!(tabs.contains(&DetailTab::Keys));
     assert!(!tabs.contains(&DetailTab::Buttons));
     // A key can be bound to the Actions Ring action, so the ring needs its
     // own editor tab even on a keyboard that has no mouse model (#1833).
     assert!(tabs.contains(&DetailTab::ActionsRing));
+    // Keys stays the keyboard's opening tab: adding the ring editor must not
+    // reassign `default_for` away from the main keyboard screen.
+    assert_eq!(DetailTab::default_for(&keyboard), DetailTab::Keys);
 }
 
 /// A sleeping keyboard whose slot was never probed has no capability data,

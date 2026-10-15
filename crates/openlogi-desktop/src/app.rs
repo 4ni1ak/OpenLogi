@@ -136,6 +136,12 @@ impl DetailTab {
         let shows_keys_tab = matches!(record.kind, DeviceKind::Keyboard)
             && !caps.pointer
             && (caps.buttons || record.asset.is_some());
+        // Keys goes first for a keyboard: it's the main screen for that device
+        // (and `default_for` picks the first tab), so adding the ring editor
+        // below must not reassign a keyboard's opening tab away from it.
+        if shows_keys_tab {
+            tabs.push(Self::Keys);
+        }
         // A key can be bound to the Actions Ring action from the Keys panel
         // (it's in the generic action catalog, not gated on haptics or a
         // mouse model), so any keyboard that gets a Keys tab needs the ring
@@ -143,9 +149,6 @@ impl DetailTab {
         // in it and no way to configure it (#1833).
         if caps.haptic_panel || (caps.buttons && can_show_mouse_model) || shows_keys_tab {
             tabs.push(Self::ActionsRing);
-        }
-        if shows_keys_tab {
-            tabs.push(Self::Keys);
         }
         if caps.pointer || caps.scroll_inversion || caps.hires_wheel {
             tabs.push(Self::Pointer);
