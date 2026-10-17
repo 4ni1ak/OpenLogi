@@ -98,15 +98,23 @@ pub(super) fn binding_inspector(
                 toggle: MouseModelView::toggle_thumbwheel_tap_picker,
                 ..picker
             };
-            thumbwheel_inspector(
-                data.bindings,
-                data.editing_app,
-                data.overridden,
-                picker,
-                tap_picker,
-                pal,
-                cx,
-            )
+            v_flex()
+                .gap_3()
+                .child(thumbwheel_inspector(
+                    data.bindings,
+                    data.editing_app,
+                    data.overridden,
+                    picker,
+                    pal,
+                ))
+                .child(thumbwheel_tap_section(
+                    data.bindings,
+                    data.editing_app,
+                    data.overridden,
+                    tap_picker,
+                    pal,
+                    cx,
+                ))
         }
         Some(MouseControlId::Button(button)) => button_inspector(button, &data, picker, pal, cx),
     };
@@ -547,9 +555,7 @@ fn thumbwheel_inspector(
     editing_app: Option<&str>,
     overridden: Option<&BTreeMap<ButtonId, Action>>,
     picker: ActionPickerContext<'_>,
-    tap_picker: ActionPickerContext<'_>,
     pal: Palette,
-    cx: &Context<MouseModelView>,
 ) -> gpui::Div {
     let backward = bindings
         .get(&ButtonId::ThumbwheelScrollDown)
@@ -572,28 +578,6 @@ fn thumbwheel_inspector(
     let current_label = current.map_or_else(|| tr!("common.custom"), |p| tr!(p.translation_key()));
     let current_icon = current.map_or("action-icons/chevrons-right.svg", ThumbwheelPreset::icon);
     let observer = picker.view.clone();
-
-    let tap_action = bindings
-        .get(&ButtonId::Thumbwheel)
-        .cloned()
-        .unwrap_or_else(|| default_binding(ButtonId::Thumbwheel));
-    let tap_overridden =
-        overridden.is_some_and(|overrides| overrides.contains_key(&ButtonId::Thumbwheel));
-    let tap_status = match (editing_app, tap_overridden) {
-        (Some(app), true) => tr!("actions.overridden_in_app", app => app.to_string()),
-        (Some(_), false) => tr!("profiles.inherited_from_default"),
-        (None, _) => tr!("pointer.device_default"),
-    };
-    let tap_observer = tap_picker.view.clone();
-    let on_pick_tap: PickFn = Rc::new(move |action, _window, cx| {
-        AppState::apply(cx, |state| {
-            state.commit_binding(ButtonId::Thumbwheel, action)
-        });
-        tap_observer.update(cx, |view, cx| {
-            view.close_thumbwheel_tap_picker();
-            cx.notify();
-        });
-    });
 
     v_flex()
         .gap_3()
@@ -672,6 +656,42 @@ fn thumbwheel_inspector(
                     }),
             )
         })
+}
+
+/// The thumb wheel's capacitive tap, bound like a button below the rotation
+/// preset in the wheel's inspector.
+fn thumbwheel_tap_section(
+    bindings: &BTreeMap<ButtonId, Action>,
+    editing_app: Option<&str>,
+    overridden: Option<&BTreeMap<ButtonId, Action>>,
+    tap_picker: ActionPickerContext<'_>,
+    pal: Palette,
+    cx: &Context<MouseModelView>,
+) -> gpui::Div {
+    let tap_action = bindings
+        .get(&ButtonId::Thumbwheel)
+        .cloned()
+        .unwrap_or_else(|| default_binding(ButtonId::Thumbwheel));
+    let tap_overridden =
+        overridden.is_some_and(|overrides| overrides.contains_key(&ButtonId::Thumbwheel));
+    let tap_status = match (editing_app, tap_overridden) {
+        (Some(app), true) => tr!("actions.overridden_in_app", app => app.to_string()),
+        (Some(_), false) => tr!("profiles.inherited_from_default"),
+        (None, _) => tr!("pointer.device_default"),
+    };
+    let tap_observer = tap_picker.view.clone();
+    let on_pick_tap: PickFn = Rc::new(move |action, _window, cx| {
+        AppState::apply(cx, |state| {
+            state.commit_binding(ButtonId::Thumbwheel, action)
+        });
+        tap_observer.update(cx, |view, cx| {
+            view.close_thumbwheel_tap_picker();
+            cx.notify();
+        });
+    });
+
+    v_flex()
+        .gap_3()
         .child(inspector_heading(
             tr!("pointer.thumb_wheel_tap"),
             Some(tap_status),
@@ -1064,6 +1084,7 @@ mod tests {
         BindingInspectorData {
             selected: Some(MouseControlId::Button(ButtonId::Back)),
             gesture_direction: None,
+            thumbwheel_tap_picker_open: false,
             bindings,
             gesture_maps,
             dpi_gestures: false,

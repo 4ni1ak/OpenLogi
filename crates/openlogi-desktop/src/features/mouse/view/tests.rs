@@ -94,7 +94,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
 
     click_picker_control(cx, "label-card-Button(Forward)");
     click_picker_control(cx, "inspector-current-action");
-    view.read_with(cx, |view, _| assert!(view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(view.pickers.action));
     assert!(cx.debug_bounds("inspector-action-Copy").is_some());
 
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
@@ -109,7 +109,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
 
     click_picker_control(cx, "inspector-action-custom-application-add");
     view.read_with(cx, |view, _| {
-        assert!(view.action_picker_open);
+        assert!(view.pickers.action);
         assert!(view.custom_shortcut_invalid);
         assert!(view.custom_application_invalid);
     });
@@ -135,7 +135,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
             .is_some()
     );
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.pickers.action));
     assert_forward_binding(cx, &Action::CustomShortcut("Cmd+K".parse().unwrap()));
 
     click_picker_control(cx, "inspector-current-action");
@@ -151,7 +151,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     click_picker_control(cx, "inspector-action-custom-application-input");
     cx.simulate_input("/Applications/Calculator.app");
     click_picker_control(cx, "inspector-action-custom-application-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.pickers.action));
     cx.update(|_, cx| {
         let Action::OpenApplication(target) =
             &AppState::try_read(cx).unwrap().button_bindings()[&ButtonId::Forward]
@@ -169,7 +169,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     click_picker_control(cx, "inspector-action-custom-shortcut-input");
     cx.simulate_input("Cmd+K");
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.pickers.action));
     assert_forward_binding(cx, &Action::HoldShortcut("Cmd+K".parse().unwrap()));
 
     click_picker_control(cx, "inspector-current-action");
@@ -185,7 +185,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     cx.simulate_input("Copy");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     click_picker_control(cx, "inspector-action-Copy");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.pickers.action));
     assert_forward_binding(cx, &Action::Copy);
 
     drop(view);
@@ -302,25 +302,25 @@ fn thumbwheel_tap_picker_toggles_independently_of_the_rotation_picker(cx: &mut T
     view.update(cx, |view, _| {
         view.selected = Some(MouseControlId::ThumbwheelRotation);
         view.toggle_action_picker();
-        assert!(view.action_picker_open);
-        assert!(!view.thumbwheel_tap_picker_open);
+        assert!(view.pickers.action);
+        assert!(!view.pickers.thumbwheel_tap);
 
         view.toggle_thumbwheel_tap_picker();
         assert!(
-            view.action_picker_open,
+            view.pickers.action,
             "opening the tap picker must not close the rotation preset picker"
         );
-        assert!(view.thumbwheel_tap_picker_open);
+        assert!(view.pickers.thumbwheel_tap);
 
         view.close_thumbwheel_tap_picker();
         assert!(
-            view.action_picker_open,
+            view.pickers.action,
             "closing the tap picker must not close the rotation preset picker"
         );
-        assert!(!view.thumbwheel_tap_picker_open);
+        assert!(!view.pickers.thumbwheel_tap);
 
         view.select(MouseControlId::Button(ButtonId::Forward));
-        assert!(!view.thumbwheel_tap_picker_open);
+        assert!(!view.pickers.thumbwheel_tap);
     });
     drop(view);
     cx.update(|window, _| window.remove_window());
@@ -336,11 +336,11 @@ fn selecting_another_control_closes_the_action_picker(cx: &mut TestAppContext) {
 
     view.update(cx, |view, _| {
         view.selected = Some(MouseControlId::Button(ButtonId::Back));
-        view.action_picker_open = true;
+        view.pickers.action = true;
 
         view.select(MouseControlId::Button(ButtonId::Forward));
 
-        assert!(!view.action_picker_open);
+        assert!(!view.pickers.action);
     });
     drop(view);
     cx.update(|window, _| window.remove_window());
