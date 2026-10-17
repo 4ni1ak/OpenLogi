@@ -28,11 +28,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, Context, Entity, FontWeight, Hsla,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight, Hsla,
     InteractiveElement, IntoElement, ParentElement, PathBuilder, Render, RenderOnce, Role,
     SharedString, StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, hsla,
     point, prelude::FluentBuilder as _, px, rgb, svg,
 };
+use gpui_base::Button as BaseButton;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Selectable as _, h_flex, input::InputState, v_flex};
 use openlogi_core::binding::{Action, WorkflowStep};
@@ -825,55 +826,85 @@ impl FunctionRowView {
         });
 
         let mut rows = Vec::new();
-        if let KeyTarget::Control(_) = target {
-            // A control's resting state is its firmware function, which is
-            // not an action in the catalog: give it a row of its own so the
-            // key can be returned to native (#1172).
-            let view_for_native = view.clone();
-            let target_for_native = target.clone();
-            rows.push(
-                v_flex().child(
-                    MenuRow::new("panel-native")
-                        .selected(current.is_none())
-                        .role(Role::MenuItem)
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    svg()
-                                        .path("action-icons/keyboard.svg")
-                                        .size_4()
-                                        .flex_none()
-                                        .text_color(pal.text_muted),
-                                )
-                                .child(div().child(tr!("keyboard.native_function"))),
-                        )
-                        .when(current.is_none(), |row| {
-                            row.child(
-                                gpui_component::Icon::new(gpui_component::IconName::Check)
-                                    .size_3()
-                                    .text_color(rgb(ACCENT_BLUE)),
+        // Unbound is not a catalog action. A control rests on its firmware
+        // function (#1172); a function key rests on the key itself. The row
+        // clears the override so either key returns to that native behavior.
+        let view_for_native = view.clone();
+        let target_for_native = target;
+        rows.push(
+            v_flex().child(
+                MenuRow::new("panel-native")
+                    .selected(current.is_none())
+                    .role(Role::MenuItem)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                svg()
+                                    .path("action-icons/keyboard.svg")
+                                    .size_4()
+                                    .flex_none()
+                                    .text_color(pal.text_muted),
                             )
-                        })
-                        .on_click(move |_ev, _window, cx| {
-                            AppState::apply(cx, |state| {
-                                commit_key_action(state, &target_for_native, None)
-                            });
-                            view_for_native.update(cx, |_, vcx| vcx.notify());
-                        }),
-                ),
-            );
-        }
+                            .child(div().child(tr!("keyboard.native_function"))),
+                    )
+                    .when(current.is_none(), |row| {
+                        row.child(
+                            gpui_component::Icon::new(gpui_component::IconName::Check)
+                                .size_3()
+                                .text_color(rgb(ACCENT_BLUE)),
+                        )
+                    })
+                    .on_click(move |_ev, _window, cx| {
+                        AppState::apply(cx, |state| {
+                            commit_key_action(state, &target_for_native, None)
+                        });
+                        view_for_native.update(cx, |_, vcx| vcx.notify());
+                    }),
+            ),
+        );
         rows.extend(panel_action_rows(current.as_ref(), &on_pick, view, &pal));
 
         compact_panel(pal)
             .w(px(PANEL_W))
             .max_h(px(500.))
             .child(title_header(&key_name, app.as_deref(), &pal))
+            .when(
+                matches!(target, KeyTarget::FunctionKey(_)) && current.is_some(),
+                |panel| panel.child(reset_row(target.clone(), view, &pal)),
+            )
             .child(divider(pal))
             .child(editor_scroll_list("key-panel-scroll", rows))
     }
+}
+
+/// "Reset to defaults" — shown only while a function key carries a
+/// non-default binding, so there is nothing else to reset to. Clearing goes
+/// through [`commit_key_action`] with `None`, which clears the trigger.
+/// Mirrors the camera controls panel's reset affordance, reusing its
+/// `tr!("camera.reset_to_defaults")` key rather than adding a new one.
+fn reset_row(target: KeyTarget, view: &Entity<FunctionRowView>, pal: &Palette) -> gpui::Div {
+    let view = view.clone();
+    h_flex().w_full().justify_end().px_2().pb_1().child(
+        BaseButton::new("fkey-reset")
+            .accessibility_label(tr!("camera.reset_to_defaults"))
+            .px_2p5()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.control)
+            .hover(|s| s.bg(pal.control_hover))
+            .focus_visible(|s| s.bg(pal.control_hover))
+            .text_caption()
+            .text_color(pal.text_muted)
+            .child(tr!("camera.reset_to_defaults"))
+            .on_click(move |_: &ClickEvent, _window, cx| {
+                AppState::apply(cx, |state| commit_key_action(state, &target, None));
+                view.update(cx, |_, vcx| vcx.notify());
+            }),
+    )
 }
 
 /// The panel's title — which key is selected, e.g. "F1" or "Screen Capture
