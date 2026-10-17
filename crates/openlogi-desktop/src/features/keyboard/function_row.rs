@@ -830,7 +830,7 @@ impl FunctionRowView {
         // function (#1172); a function key rests on the key itself. The row
         // clears the override so either key returns to that native behavior.
         let view_for_native = view.clone();
-        let target_for_native = target;
+        let target_for_native = target.clone();
         rows.push(
             v_flex().child(
                 MenuRow::new("panel-native")
