@@ -533,11 +533,10 @@ mod tests {
         assert_eq!(parse_dpi_input("999999"), Some(Dpi::new(u16::MAX)));
     }
 
-    /// A digit string long enough to overflow the `u32` the text is first
-    /// parsed into (not just the final `u16`) must still saturate rather than
-    /// silently fail to commit.
+    /// A digit string far beyond any machine integer must still saturate
+    /// rather than silently fail to commit.
     #[test]
-    fn saturates_a_value_that_overflows_the_intermediate_parse() {
+    fn saturates_a_value_that_overflows_any_integer_width() {
         assert_eq!(
             parse_dpi_input("99999999999999999999"),
             Some(Dpi::new(u16::MAX))
