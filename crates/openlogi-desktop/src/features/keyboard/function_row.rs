@@ -33,6 +33,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, hsla,
     point, prelude::FluentBuilder as _, px, rgb, svg,
 };
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Selectable as _, h_flex, input::InputState, v_flex};
 use openlogi_core::binding::{Action, WorkflowStep};
 
@@ -514,9 +515,15 @@ impl RenderOnce for KeyCallout {
         let binding = self.slot.binding;
         let binding_icon = self.slot.binding_icon;
         let highlighted = self.highlighted;
+        let full_label = self.slot.label.clone();
 
         v_flex()
             .id(("key-callout", idx))
+            // The bubble itself truncates the key name to one line (#1687 —
+            // a long translation, e.g. German's compound names, wrapped to
+            // several lines and overflowed into neighbouring callouts); the
+            // tooltip is where the untruncated name stays readable.
+            .tooltip(move |window, cx| Tooltip::new(full_label.clone()).build(window, cx))
             .absolute()
             .top(px(top))
             .left(px(left))
@@ -548,6 +555,9 @@ impl RenderOnce for KeyCallout {
             })
             .child(
                 div()
+                    .max_w(px(KEY_CALLOUT_W - 8.))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_caption()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if highlighted {
@@ -815,46 +825,44 @@ impl FunctionRowView {
         });
 
         let mut rows = Vec::new();
-        if let KeyTarget::Control(_) = target {
-            // A control's resting state is its firmware function, which is
-            // not an action in the catalog: give it a row of its own so the
-            // key can be returned to native (#1172).
-            let view_for_native = view.clone();
-            let target_for_native = target.clone();
-            rows.push(
-                v_flex().child(
-                    MenuRow::new("panel-native")
-                        .selected(current.is_none())
-                        .role(Role::MenuItem)
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    svg()
-                                        .path("action-icons/keyboard.svg")
-                                        .size_4()
-                                        .flex_none()
-                                        .text_color(pal.text_muted),
-                                )
-                                .child(div().child(tr!("keyboard.native_function"))),
-                        )
-                        .when(current.is_none(), |row| {
-                            row.child(
-                                gpui_component::Icon::new(gpui_component::IconName::Check)
-                                    .size_3()
-                                    .text_color(rgb(ACCENT_BLUE)),
+        // Unbound is not a catalog action. A control rests on its firmware
+        // function (#1172); a function key rests on the key itself. The row
+        // clears the override so either key returns to that native behavior.
+        let view_for_native = view.clone();
+        let target_for_native = target.clone();
+        rows.push(
+            v_flex().child(
+                MenuRow::new("panel-native")
+                    .selected(current.is_none())
+                    .role(Role::MenuItem)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                svg()
+                                    .path("action-icons/keyboard.svg")
+                                    .size_4()
+                                    .flex_none()
+                                    .text_color(pal.text_muted),
                             )
-                        })
-                        .on_click(move |_ev, _window, cx| {
-                            AppState::apply(cx, |state| {
-                                commit_key_action(state, &target_for_native, None)
-                            });
-                            view_for_native.update(cx, |_, vcx| vcx.notify());
-                        }),
-                ),
-            );
-        }
+                            .child(div().child(tr!("keyboard.native_function"))),
+                    )
+                    .when(current.is_none(), |row| {
+                        row.child(
+                            gpui_component::Icon::new(gpui_component::IconName::Check)
+                                .size_3()
+                                .text_color(rgb(ACCENT_BLUE)),
+                        )
+                    })
+                    .on_click(move |_ev, _window, cx| {
+                        AppState::apply(cx, |state| {
+                            commit_key_action(state, &target_for_native, None)
+                        });
+                        view_for_native.update(cx, |_, vcx| vcx.notify());
+                    }),
+            ),
+        );
         rows.extend(panel_action_rows(current.as_ref(), &on_pick, view, &pal));
 
         compact_panel(pal)
@@ -943,6 +951,7 @@ fn panel_action_rows(
                     MenuRow::new(format!("panel-power-{idx}"))
                         .selected(selected)
                         .role(Role::MenuItem)
+                        .aria_label(*label)
                         .child(
                             h_flex()
                                 .items_center()
