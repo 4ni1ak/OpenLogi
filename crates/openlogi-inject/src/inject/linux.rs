@@ -837,14 +837,16 @@ enum Spawn {
     Started(PathBuf),
     /// Every candidate was refused for permissions.
     PermissionDenied,
-    /// A candidate was refused for a reason other than permissions.
+    /// No candidate started and at least one was refused for a reason other
+    /// than permissions.
     NotRunnable,
 }
 
-/// Spawn the first candidate the kernel will run, moving past any refused
-/// for permissions — the mode check behind [`is_executable`] cannot tell a
-/// file executable only by another user from one this user can run, so an
-/// earlier `PATH` match must not shadow a runnable later one.
+/// Spawn the first candidate the kernel will run, moving past any it refuses
+/// — the mode check behind [`is_executable`] cannot tell a file executable
+/// only by another user, or a script whose interpreter is missing, from one
+/// this user can run, so an earlier `PATH` match must not shadow a runnable
+/// later one.
 fn spawn_first(candidates: impl IntoIterator<Item = PathBuf>) -> Spawn {
     let mut outcome = Spawn::PermissionDenied;
     for program in candidates {
@@ -869,15 +871,15 @@ fn spawn_first(candidates: impl IntoIterator<Item = PathBuf>) -> Spawn {
             }
             // Any other refusal means the mode bit was misleading — a data
             // file with the bit set, a script with no interpreter, a path
-            // that vanished. Those are the desktop opener's business after all.
+            // that vanished. If no later candidate starts, those are the
+            // desktop opener's business after all.
             Err(error) => {
                 tracing::warn!(
                     %error,
                     program = %program.display(),
-                    "not a runnable program — handing it to the desktop opener"
+                    "not a runnable program"
                 );
                 outcome = Spawn::NotRunnable;
-                break;
             }
         }
     }
@@ -926,6 +928,7 @@ mod tests {
     use openlogi_core::binding::{KeyCombo, Shortcut};
 
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
 
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1053,6 +1056,10 @@ mod tests {
         // Executable for group and other, never for the owner running this.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o011)).expect("set mode");
 
+        if !exec_denied(&path) {
+            return;
+        }
+
         let target = path.to_str().expect("utf-8 temp path");
         assert_eq!(
             classify(target, &is_executable, &on_path),
@@ -1074,6 +1081,9 @@ mod tests {
         std::fs::write(&denied, b"#!/bin/sh\ntrue\n").expect("write file");
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o011))
             .expect("set mode");
+        if !exec_denied(&denied) {
+            return;
+        }
         let runnable = on_path("true").expect("true is on PATH");
 
         assert_eq!(
@@ -1081,6 +1091,43 @@ mod tests {
             Spawn::Started(runnable)
         );
         assert_eq!(spawn_first([denied]), Spawn::PermissionDenied);
+    }
+
+    /// An earlier `PATH` match whose interpreter is missing must not shadow
+    /// a runnable later one; with nothing after it, it still falls back to
+    /// the opener.
+    #[test]
+    fn a_missing_interpreter_moves_on_to_the_next_candidate() {
+        let dir = TempDir::new("interp");
+        let broken = dir.0.join("true");
+        std::fs::write(&broken, b"#!/nonexistent/openlogi-interpreter\n").expect("write file");
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755))
+            .expect("set mode");
+        let runnable = on_path("true").expect("true is on PATH");
+
+        assert_eq!(
+            spawn_first([broken.clone(), runnable.clone()]),
+            Spawn::Started(runnable)
+        );
+        assert_eq!(spawn_first([broken]), Spawn::NotRunnable);
+    }
+
+    /// Whether the kernel refuses to exec `path` for permissions. Root (or
+    /// any process with `CAP_DAC_OVERRIDE`) can run a file with only group
+    /// and other execute bits, so permission-denial tests skip there.
+    fn exec_denied(path: &Path) -> bool {
+        match std::process::Command::new(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                let _ = child.wait();
+                false
+            }
+            Err(error) => error.kind() == std::io::ErrorKind::PermissionDenied,
+        }
     }
 
     /// A fresh `0o700` directory, created exclusively so a pre-planted path or
