@@ -835,11 +835,11 @@ fn selection_card(
                 ),
         )
         .on_click(move |_, window, cx| {
-            if opening {
-                search.update(cx, |search, cx| search.set_value("", window, cx));
-            }
             toggle.update(cx, |view, cx| {
-                if opening {
+                // The rotation and tap pickers share the search and draft
+                // inputs; opening one must not wipe what the other holds.
+                if opening && !view.any_picker_open() {
+                    search.update(cx, |search, cx| search.set_value("", window, cx));
                     view.clear_custom_action_drafts(window, cx);
                 }
                 toggle_flag(view);

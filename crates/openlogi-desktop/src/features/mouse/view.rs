@@ -262,6 +262,10 @@ impl MouseModelView {
         self.pickers.thumbwheel_tap = false;
     }
 
+    pub(super) fn any_picker_open(&self) -> bool {
+        self.pickers.action || self.pickers.thumbwheel_tap
+    }
+
     fn reset_for_device(&mut self, device_key: Option<DeviceKey>) {
         if self.current_device_key == device_key {
             return;
