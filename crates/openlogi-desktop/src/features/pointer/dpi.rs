@@ -497,3 +497,50 @@ fn add_preset_chip() -> impl IntoElement {
             });
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_plain_digit_string() {
+        assert_eq!(parse_dpi_input("1600"), Some(Dpi::new(1600)));
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(parse_dpi_input("  800  "), Some(Dpi::new(800)));
+    }
+
+    #[test]
+    fn rejects_empty_input() {
+        assert_eq!(parse_dpi_input(""), None);
+        assert_eq!(parse_dpi_input("   "), None);
+    }
+
+    #[test]
+    fn rejects_non_numeric_input() {
+        assert_eq!(parse_dpi_input("abc"), None);
+        assert_eq!(parse_dpi_input("16.5"), None);
+        assert_eq!(parse_dpi_input("-100"), None);
+    }
+
+    /// The field itself only lets digits through via `InputState::validate`,
+    /// so this is reachable only by typing an implausibly long run of them —
+    /// but it must still not panic or wrap.
+    #[test]
+    fn saturates_a_value_above_the_wire_format() {
+        assert_eq!(parse_dpi_input("999999"), Some(Dpi::new(u16::MAX)));
+    }
+
+    /// A digit string long enough to overflow the `u32` the text is first
+    /// parsed into (not just the final `u16`) must still saturate rather than
+    /// silently fail to commit.
+    #[test]
+    fn saturates_a_value_that_overflows_the_intermediate_parse() {
+        assert_eq!(
+            parse_dpi_input("99999999999999999999"),
+            Some(Dpi::new(u16::MAX))
+        );
+    }
+}
