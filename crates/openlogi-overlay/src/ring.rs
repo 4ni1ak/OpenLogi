@@ -8,8 +8,8 @@
 use gpui::{
     Bounds, Context, Div, Hsla, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
     Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Window,
-    WindowBackgroundAppearance, WindowKind, WindowOptions, div, point, prelude::FluentBuilder as _,
-    px, svg,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point,
+    prelude::FluentBuilder as _, px, svg,
 };
 use openlogi_core::binding::{Action, ActionRingSlot};
 use openlogi_ipc::ActionRingInvocation;
@@ -287,6 +287,22 @@ pub(crate) fn ring_window_options() -> WindowOptions {
         app_id: Some("openlogi-action-ring".to_string()),
         ..WindowOptions::default()
     }
+}
+
+/// A plain covering window for a layer-shell opening, for compositors without
+/// `zwlr_layer_shell_v1`; `None` when `options` is not a layer-shell surface.
+pub(crate) fn layer_shell_fallback(options: &WindowOptions) -> Option<WindowOptions> {
+    if !matches!(options.kind, WindowKind::LayerShell(_)) {
+        return None;
+    }
+    Some(WindowOptions {
+        window_bounds: options
+            .window_bounds
+            .map(|bounds| WindowBounds::Maximized(bounds.get_bounds())),
+        display_id: options.display_id,
+        window_decorations: options.window_decorations,
+        ..ring_window_options()
+    })
 }
 
 /// Top-left of the ring panel within its window, or nothing while the pointer is unknown.

@@ -101,11 +101,28 @@ fn main() -> Result<()> {
                     // open must not sink the others.
                     let mut primary = None;
                     for (options, panel) in placement.openings() {
-                        let invocation = invocation.clone();
-                        let commands = commands.clone();
-                        match cx.open_window(options, |_, cx| {
-                            cx.new(|_| RingView::new(invocation, commands, &live_session, panel))
-                        }) {
+                        let fallback = ring::layer_shell_fallback(&options);
+                        let open = |cx: &mut gpui::App, options| {
+                            cx.open_window(options, |_, cx| {
+                                cx.new(|_| {
+                                    RingView::new(
+                                        invocation.clone(),
+                                        commands.clone(),
+                                        &live_session,
+                                        panel,
+                                    )
+                                })
+                            })
+                        };
+                        let opened = match (open(cx, options), fallback) {
+                            (Err(error), Some(fallback))
+                                if error.is::<gpui::layer_shell::LayerShellNotSupportedError>() =>
+                            {
+                                open(cx, fallback)
+                            }
+                            (opened, _) => opened,
+                        };
+                        match opened {
                             Ok(handle) => {
                                 if primary.is_none() {
                                     primary = Some(handle);

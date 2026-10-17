@@ -109,12 +109,24 @@ fn positioned_window(cx: &mut gpui::App) -> (WindowOptions, Placement) {
     (options, Placement::Window)
 }
 
-/// Transparent maximized window covering `display`; fullscreen would composite it against black.
+/// Transparent overlay-layer surface covering `display`, so panels and docks
+/// cannot stack above the ring as they can above a toplevel.
 fn covering_window_options(display: &dyn PlatformDisplay) -> WindowOptions {
+    use gpui::layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions};
     WindowOptions {
-        window_bounds: Some(WindowBounds::Maximized(display.bounds())),
+        window_bounds: Some(WindowBounds::Windowed(display.bounds())),
         display_id: Some(display.id()),
         window_decorations: Some(gpui::WindowDecorations::Client),
+        kind: gpui::WindowKind::LayerShell(LayerShellOptions {
+            namespace: "openlogi-action-ring".to_string(),
+            layer: Layer::Overlay,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            // -1 extends the surface under other surfaces' exclusive zones.
+            exclusive_zone: Some(px(-1.0)),
+            exclusive_edge: None,
+            margin: None,
+            keyboard_interactivity: KeyboardInteractivity::None,
+        }),
         ..ring_window_options()
     }
 }
