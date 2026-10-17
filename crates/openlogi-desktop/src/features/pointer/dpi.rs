@@ -1,4 +1,5 @@
-//! Device DPI controls.
+//! Device DPI controls, and the report-rate row below them (see
+//! [`super::report_rate`]).
 //!
 //! The slider range comes from the selected device's HID++ DPI capability
 //! (`0x2201` AdjustableDpi or `0x2202` ExtendedAdjustableDpi, whichever it
@@ -14,30 +15,42 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{InputEvent, InputState},
-    slider::{Slider, SliderEvent, SliderState},
+    slider::{Slider, SliderState},
     v_flex,
 };
 use openlogi_core::hid::{Dpi, DpiCapabilities};
 use tracing::debug;
 
-use crate::state::{AppState, DeviceKey, DeviceRecord, DpiStatus, StateEvent};
+use super::report_rate::{ReportRateFacts, report_rate_section};
+use crate::state::{AppState, DeviceKey, DpiLoad, StateEvent};
+use crate::ui::commit_slider::{CommitSlider, SliderRange};
 use crate::ui::components::{PresetChip, control_input};
 use crate::ui::status::{retry_line, status_line};
 use crate::ui::theme::{self, Palette, Typography as _};
 
 pub struct DpiPanel {
-    slider_state: Option<Entity<SliderState>>,
-    slider_sub: Option<Subscription>,
-    slider_key: Option<String>,
-    slider_shape: Option<SliderShape>,
+    /// Rebuilt whenever the selected device or its reported range changes,
+    /// because a slider's range is fixed when it is built.
+    slider: Option<DpiSlider>,
     /// The numeric field beside the slider, letting an exact value be typed
     /// instead of dragged. Keyed by device like the slider, but reused across
     /// capability re-reads for the same device since only its displayed text
     /// needs to track those, not its identity.
-    numeric_state: Option<Entity<InputState>>,
-    numeric_sub: Option<Subscription>,
-    numeric_key: Option<String>,
+    numeric: Option<DpiNumericInput>,
     _state_obs: Subscription,
+}
+
+struct DpiNumericInput {
+    key: DeviceKey,
+    state: Entity<InputState>,
+    _sub: Subscription,
+}
+
+/// The slider together with what it was built for.
+struct DpiSlider {
+    key: DeviceKey,
+    shape: SliderShape,
+    slider: CommitSlider<Dpi>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +61,11 @@ struct SliderShape {
 }
 
 struct DpiPanelSnapshot {
-    device_key: DeviceKey,
+    /// The active device, or `None` when nothing is selected.
+    device_key: Option<DeviceKey>,
     dpi: Dpi,
     presets: Vec<Dpi>,
-    status: DpiStatus,
+    status: DpiLoad,
     /// Whether the active device currently has a usable route. An offline
     /// device sits in `Unknown` forever (discovery can't start without a
     /// route), so the UI must say "offline" rather than "reading…".
@@ -60,41 +74,27 @@ struct DpiPanelSnapshot {
 
 impl DpiPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        // Repaint when the active device changes or DPI discovery
-        // completes. The slider entity is rebuilt in `render` whenever the
-        // selected device or reported range changes, because SliderState's
-        // range is builder-only.
-        let state_obs = cx.subscribe(
-            &AppState::global(cx),
-            |_panel, _, event: &StateEvent, cx| {
-                let relevant = match event {
-                    StateEvent::InventoryChanged | StateEvent::DeviceSelected(_) => true,
-                    StateEvent::DpiChanged(key) => AppState::try_read(cx)
-                        .and_then(AppState::current_record)
-                        .is_some_and(|record| record.device_key() == *key),
-                    _ => false,
-                };
-                if relevant {
-                    cx.notify();
-                }
-            },
-        );
+        // Repaint when the active device changes, DPI discovery completes,
+        // or the report-rate read lands. The slider entity is rebuilt in
+        // `render` whenever the selected device or reported range changes,
+        // because SliderState's range is builder-only.
+        let state_obs = AppState::repaint_on(cx, |event| {
+            matches!(
+                event,
+                StateEvent::DpiChanged(_) | StateEvent::ReportRateChanged(_)
+            )
+        });
 
         Self {
-            slider_state: None,
-            slider_sub: None,
-            slider_key: None,
-            slider_shape: None,
-            numeric_state: None,
-            numeric_sub: None,
-            numeric_key: None,
+            slider: None,
+            numeric: None,
             _state_obs: state_obs,
         }
     }
 
     fn ensure_slider(
         &mut self,
-        key: &str,
+        key: &DeviceKey,
         capabilities: &DpiCapabilities,
         dpi: Dpi,
         window: &mut Window,
@@ -105,124 +105,54 @@ impl DpiPanel {
             max: capabilities.max(),
             step: capabilities.step_hint(),
         };
-        if self.slider_key.as_deref() == Some(key) && self.slider_shape == Some(shape) {
-            if let Some(slider_state) = &self.slider_state {
-                let target = capabilities.nearest(dpi);
-                slider_state.update(cx, |state, cx| {
-                    // Only re-seat the thumb when `dpi` resolves to a *different
-                    // supported value* than the thumb currently rests on.
-                    // Comparing in the device's supported space (not raw slider
-                    // units) keeps a drag that lands between supported stops —
-                    // possible because the slider step is uniform but the
-                    // supported set may not be — from yanking the thumb back
-                    // every frame.
-                    let thumb = capabilities.nearest(Dpi::from_rounded(state.value().start()));
-                    if thumb != target {
-                        state.set_value(f32::from(target), window, cx);
-                    }
-                });
-            }
-            return;
-        }
-
-        let snapped = capabilities.nearest(dpi);
-        // Order matters: `SliderState` defaults to max=100, and `.min(N)`
-        // clamps the value against the current max. Setting max first keeps
-        // the intermediate state coherent for high-DPI devices.
-        let slider_state = cx.new(|_| {
-            SliderState::new()
-                .max(shape.max.into())
-                .min(shape.min.into())
-                .step(shape.step.into())
-                .default_value(f32::from(snapped))
-        });
-
-        let slider_sub =
-            cx.subscribe(
-                &slider_state,
-                |_panel, _slider, event: &SliderEvent, cx| match event {
-                    // Continuous Change drives the in-process state so the numeric
-                    // label tracks the drag. The HID write happens once on Release
-                    // to keep us from spamming the device with intermediate values.
-                    SliderEvent::Change(value) => {
-                        let dpi = Dpi::from_rounded(value.start());
-                        let dpi = AppState::try_read(cx)
-                            .map_or(dpi, |state| state.normalize_active_dpi(dpi));
-                        debug!(%dpi, "slider change → AppState.dpi");
-                        AppState::update(cx, |state, cx| {
-                            let key = state.current_record().map(DeviceRecord::device_key);
-                            state.set_dpi_preview(dpi);
-                            if let Some(key) = key {
-                                cx.emit(StateEvent::DpiChanged(key));
-                            }
-                        });
-                        cx.notify();
-                    }
-                    SliderEvent::Release(value) => {
-                        let dpi = Dpi::from_rounded(value.start());
-                        let dpi = AppState::try_read(cx)
-                            .map_or(dpi, |state| state.normalize_active_dpi(dpi));
-                        // `commit_dpi` resolves the target at fire-time, so
-                        // gallery-driven device switches route the write to the
-                        // now-current device, not whichever was active when this
-                        // slider entity was constructed.
-                        AppState::update(cx, |state, cx| {
-                            let key = state.current_record().map(DeviceRecord::device_key);
-                            state.commit_dpi(dpi);
-                            if let Some(key) = key {
-                                cx.emit(StateEvent::DpiChanged(key));
-                            }
-                        });
-                    }
-                },
-            );
-
-        self.slider_state = Some(slider_state);
-        self.slider_sub = Some(slider_sub);
-        self.slider_key = Some(key.to_string());
-        self.slider_shape = Some(shape);
-    }
-
-    /// Build/refresh the slider and numeric field for the current snapshot, or
-    /// tear both down where neither applies (loading, offline, failed, …).
-    fn refresh_controls(
-        &mut self,
-        snapshot: &DpiPanelSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let DpiStatus::Ready(info) = &snapshot.status else {
-            self.slider_state = None;
-            self.slider_sub = None;
-            self.slider_key = None;
-            self.slider_shape = None;
-            self.numeric_state = None;
-            self.numeric_sub = None;
-            self.numeric_key = None;
-            return;
-        };
-        self.ensure_slider(
-            snapshot.device_key.as_str(),
-            &info.capabilities,
-            snapshot.dpi,
-            window,
-            cx,
-        );
-        // A device with a single supported DPI has nothing to type either —
-        // `slider_element` shows a fixed-value line instead of a control.
-        if info.capabilities.min() == info.capabilities.max() {
-            self.numeric_state = None;
-            self.numeric_sub = None;
-            self.numeric_key = None;
-        } else {
-            self.ensure_numeric_input(
-                snapshot.device_key.as_str(),
-                &info.capabilities,
-                snapshot.dpi,
+        if let Some(current) = self
+            .slider
+            .as_ref()
+            .filter(|current| current.key == *key && current.shape == shape)
+        {
+            // Only re-seat the thumb when `dpi` resolves to a *different
+            // supported value* than the thumb currently rests on. Comparing in
+            // the device's supported space (not raw slider units) keeps a drag
+            // that lands between supported stops — possible because the slider
+            // step is uniform but the supported set may not be — from yanking
+            // the thumb back every frame.
+            current.slider.sync_snapped(
+                capabilities.nearest(dpi),
+                |thumb| capabilities.nearest(thumb),
                 window,
                 cx,
             );
+            return;
         }
+
+        let slider = CommitSlider::previewing(
+            SliderRange::new(shape.min, shape.max).step(shape.step.into()),
+            capabilities.nearest(dpi),
+            cx,
+            // Dragging drives the in-process state so the numeric label tracks
+            // the thumb. The HID write happens once on release to keep us from
+            // spamming the device with intermediate values.
+            |_, dpi, cx| {
+                let dpi =
+                    AppState::try_read(cx).map_or(dpi, |state| state.normalize_active_dpi(dpi));
+                debug!(%dpi, "slider change → AppState.dpi");
+                AppState::apply(cx, |state| state.set_dpi_preview(dpi));
+            },
+            |_, dpi, cx| {
+                let dpi =
+                    AppState::try_read(cx).map_or(dpi, |state| state.normalize_active_dpi(dpi));
+                // `commit_dpi` resolves the target at fire-time, so
+                // gallery-driven device switches route the write to the
+                // now-current device, not whichever was active when this
+                // slider was built.
+                AppState::apply(cx, |state| state.commit_dpi(dpi));
+            },
+        );
+        self.slider = Some(DpiSlider {
+            key: key.clone(),
+            shape,
+            slider,
+        });
     }
 
     /// Build (or refresh) the numeric field beside the slider. Rebuilt only
@@ -232,40 +162,39 @@ impl DpiPanel {
     /// value landing mid-edit can't overwrite what the user is typing.
     fn ensure_numeric_input(
         &mut self,
-        key: &str,
+        key: &DeviceKey,
         capabilities: &DpiCapabilities,
         dpi: Dpi,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let snapped = capabilities.nearest(dpi);
-        let text = format!("{snapped}");
+        let text = format!("{}", capabilities.nearest(dpi));
 
-        if self.numeric_key.as_deref() == Some(key) {
-            if let Some(numeric_state) = &self.numeric_state {
-                let focused = numeric_state.focus_handle(cx).is_focused(window);
-                if !focused && numeric_state.read(cx).value().as_ref() != text.as_str() {
-                    numeric_state.update(cx, |state, cx| {
-                        state.set_value(text, window, cx);
-                    });
-                }
+        if let Some(current) = self.numeric.as_ref().filter(|current| current.key == *key) {
+            let focused = current.state.focus_handle(cx).is_focused(window);
+            if !focused && current.state.read(cx).value().as_ref() != text.as_str() {
+                current.state.update(cx, |state, cx| {
+                    state.set_value(text, window, cx);
+                });
             }
             return;
         }
 
-        let numeric_state = cx.new(|cx| {
+        let state = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(text)
                 .validate(|text, _cx| text.chars().all(|c| c.is_ascii_digit()))
         });
-        let numeric_sub = cx.subscribe(&numeric_state, |_panel, input, event: &InputEvent, cx| {
+        let sub = cx.subscribe(&state, |_panel, input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 commit_numeric_dpi(&input, cx);
             }
         });
-        self.numeric_state = Some(numeric_state);
-        self.numeric_sub = Some(numeric_sub);
-        self.numeric_key = Some(key.to_string());
+        self.numeric = Some(DpiNumericInput {
+            key: key.clone(),
+            state,
+            _sub: sub,
+        });
     }
 }
 
@@ -283,13 +212,7 @@ fn commit_numeric_dpi(input: &Entity<InputState>, cx: &mut Context<DpiPanel>) {
     };
     let dpi = AppState::try_read(cx).map_or(dpi, |state| state.normalize_active_dpi(dpi));
     debug!(%dpi, "numeric field commit → AppState.dpi");
-    AppState::update(cx, |state, cx| {
-        let key = state.current_record().map(DeviceRecord::device_key);
-        state.commit_dpi(dpi);
-        if let Some(key) = key {
-            cx.emit(StateEvent::DpiChanged(key));
-        }
-    });
+    AppState::apply(cx, |state| state.commit_dpi(dpi));
 }
 
 impl Render for DpiPanel {
@@ -297,7 +220,19 @@ impl Render for DpiPanel {
         let snapshot = dpi_panel_snapshot(cx);
         let pal = theme::palette(cx);
 
-        self.refresh_controls(&snapshot, window, cx);
+        if let (DpiLoad::Ready(info), Some(key)) = (&snapshot.status, &snapshot.device_key) {
+            self.ensure_slider(key, &info.capabilities, snapshot.dpi, window, cx);
+            // A device with a single supported DPI has nothing to type either —
+            // `slider_element` shows a fixed-value line instead of a control.
+            if info.capabilities.min() == info.capabilities.max() {
+                self.numeric = None;
+            } else {
+                self.ensure_numeric_input(key, &info.capabilities, snapshot.dpi, window, cx);
+            }
+        } else {
+            self.slider = None;
+            self.numeric = None;
+        }
 
         // Highlight at most one chip: when several presets snap to the same
         // supported value as the current DPI, only the first is "active".
@@ -318,12 +253,15 @@ impl Render for DpiPanel {
         let range_label = dpi_range_label(&snapshot.status, snapshot.reachable);
         let slider = slider_element(
             &snapshot.status,
-            self.slider_state.as_ref(),
+            self.slider.as_ref().map(|current| current.slider.slider()),
             snapshot.reachable,
             snapshot.device_key.clone(),
             pal,
         );
-        let numeric_input = numeric_input_element(&snapshot.status, self.numeric_state.as_ref());
+        let numeric_input = self
+            .numeric
+            .as_ref()
+            .map(|current| control_input(&current.state).w(px(64.)).into_any_element());
 
         v_flex()
             .gap_3()
@@ -375,6 +313,7 @@ impl Render for DpiPanel {
                             .child(add_preset_chip()),
                     ),
             )
+            .children(report_rate_section(ReportRateFacts::current(cx), pal))
     }
 }
 
@@ -384,25 +323,25 @@ fn dpi_panel_snapshot(cx: &mut Context<DpiPanel>) -> DpiPanelSnapshot {
             let record = s.current_record()?;
             let device_key = record.device_key();
             Some(DpiPanelSnapshot {
-                status: s.dpi_status_for(&device_key),
-                device_key,
+                status: s.dpi_load_for(&device_key),
+                device_key: Some(device_key),
                 dpi: s.dpi(),
                 presets: s.dpi_presets(),
                 reachable: record.route.is_some(),
             })
         })
         .unwrap_or_else(|| DpiPanelSnapshot {
-            device_key: DeviceKey::default(),
+            device_key: None,
             dpi: crate::state::DEFAULT_DPI,
             presets: Vec::new(),
-            status: DpiStatus::Unsupported(tr!("device.no_active_device").to_string()),
+            status: DpiLoad::Unsupported(tr!("device.no_active_device").to_string()),
             reachable: false,
         })
 }
 
-fn dpi_range_label(status: &DpiStatus, reachable: bool) -> AnyElement {
+fn dpi_range_label(status: &DpiLoad, reachable: bool) -> AnyElement {
     match status {
-        DpiStatus::Ready(info) => h_flex()
+        DpiLoad::Ready(info) => h_flex()
             .gap_1()
             .child(format!(
                 "{}–{}",
@@ -412,100 +351,82 @@ fn dpi_range_label(status: &DpiStatus, reachable: bool) -> AnyElement {
             .child(Icon::empty().path("action-icons/dot.svg").size_3())
             .child(tr!("pointer.dpi_step", step => info.capabilities.step_hint()))
             .into_any_element(),
-        DpiStatus::Unknown | DpiStatus::Loading if !reachable => {
+        DpiLoad::Unknown | DpiLoad::Loading if !reachable => {
             tr!("pointer.dpi_range_device_offline").into_any_element()
         }
-        DpiStatus::Unknown | DpiStatus::Loading => {
+        DpiLoad::Unknown | DpiLoad::Loading => {
             tr!("pointer.loading_device_dpi_range").into_any_element()
         }
-        DpiStatus::Failed(message) => {
+        DpiLoad::Failed(message) => {
             tr!("pointer.dpi_read_failed", message => message).into_any_element()
         }
-        DpiStatus::Unsupported(message) => {
+        DpiLoad::Unsupported(message) => {
             tr!("pointer.dpi_range_unavailable", message => message).into_any_element()
         }
     }
 }
 
 fn slider_element(
-    status: &DpiStatus,
+    status: &DpiLoad,
     slider_state: Option<&Entity<SliderState>>,
     reachable: bool,
-    key: DeviceKey,
+    key: Option<DeviceKey>,
     pal: Palette,
 ) -> AnyElement {
     match (status, slider_state) {
         // A device with one supported DPI has nothing to drag — show the value.
-        (DpiStatus::Ready(info), _) if info.capabilities.min() == info.capabilities.max() => {
+        (DpiLoad::Ready(info), _) if info.capabilities.min() == info.capabilities.max() => {
             status_line(
                 tr!("pointer.fixed_dpi_value", dpi => info.capabilities.min()),
                 pal,
             )
             .into_any_element()
         }
-        (DpiStatus::Ready(_), Some(slider_state)) => {
+        (DpiLoad::Ready(_), Some(slider_state)) => {
             Slider::new(slider_state).horizontal().into_any_element()
         }
-        (DpiStatus::Ready(_), None) => {
+        (DpiLoad::Ready(_), None) => {
             status_line(tr!("pointer.preparing_dpi_slider"), pal).into_any_element()
         }
-        (DpiStatus::Unknown | DpiStatus::Loading, _) if !reachable => {
+        (DpiLoad::Unknown | DpiLoad::Loading, _) if !reachable => {
             status_line(tr!("pointer.device_offline_dpi_is_unavailable"), pal).into_any_element()
         }
-        (DpiStatus::Unknown | DpiStatus::Loading, _) => {
+        (DpiLoad::Unknown | DpiLoad::Loading, _) => {
             status_line(tr!("pointer.reading_supported_dpi_values"), pal).into_any_element()
         }
         // Clickable: reselecting is a no-op for a single-device gallery, so the
         // retry must work in place.
-        (DpiStatus::Failed(_), _) => retry_line(
+        (DpiLoad::Failed(_), _) => retry_line(
             "dpi-retry",
             tr!("pointer.couldnt_read_dpi_click_to_retry"),
             pal,
             move |cx| {
-                AppState::retry_dpi_read(cx, key.clone());
+                if let Some(key) = &key {
+                    AppState::apply(cx, |state| state.retry_dpi_read(key));
+                }
             },
         )
         .into_any_element(),
-        (DpiStatus::Unsupported(_), _) => {
+        (DpiLoad::Unsupported(_), _) => {
             status_line(tr!("pointer.adjustable_dpi_unsupported"), pal).into_any_element()
         }
     }
 }
 
-/// The numeric field beside the slider, or `None` where no slider is shown
-/// either (loading, offline, fixed DPI, …) — see [`slider_element`].
-fn numeric_input_element(
-    status: &DpiStatus,
-    numeric_state: Option<&Entity<InputState>>,
-) -> Option<AnyElement> {
-    match (status, numeric_state) {
-        (DpiStatus::Ready(info), Some(state))
-            if info.capabilities.min() != info.capabilities.max() =>
-        {
-            Some(control_input(state).w(px(64.)).into_any_element())
-        }
-        _ => None,
-    }
-}
-
 /// Parse the DPI numeric field's raw text into a device value.
 ///
-/// `None` for empty input — [`DpiPanel::commit_numeric_dpi`] treats that as
-/// "leave the last known-good DPI alone" rather than writing garbage. A value
-/// too large for the wire format's `u16` saturates to its maximum instead of
-/// being rejected outright: the field's own [`InputState::validate`] filter
-/// already keeps the text digits-only, so the only way to reach an
-/// out-of-range number here is typing more digits than any real DPI needs —
-/// and with enough of them the string overflows `u32` before it ever reaches
-/// the `u16` conversion, which is why the overflow case is matched directly
-/// rather than folded into a single `.ok()`.
+/// `None` for empty or non-numeric input — [`commit_numeric_dpi`] treats that
+/// as "leave the last known-good DPI alone" rather than writing garbage. A
+/// digit run too large for the wire format's `u16` saturates to its maximum
+/// instead of being rejected, so the commit still snaps to the device's top
+/// supported value.
 fn parse_dpi_input(text: &str) -> Option<Dpi> {
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    match text.parse::<u32>() {
-        Ok(value) => Some(Dpi::new(u16::try_from(value).unwrap_or(u16::MAX))),
+    match text.parse::<u16>() {
+        Ok(value) => Some(Dpi::new(value)),
         Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => {
             Some(Dpi::new(u16::MAX))
         }
@@ -539,13 +460,7 @@ fn preset_chip(idx: usize, value: Dpi, active: bool, presets: &[Dpi]) -> impl In
                     else {
                         return;
                     };
-                    AppState::update(cx, |state, cx| {
-                        let key = state.current_record().map(DeviceRecord::device_key);
-                        state.commit_dpi(dpi);
-                        if let Some(key) = key {
-                            cx.emit(StateEvent::DpiChanged(key));
-                        }
-                    });
+                    AppState::apply(cx, |state| state.commit_dpi(dpi));
                 }),
         )
         .child(
@@ -558,13 +473,7 @@ fn preset_chip(idx: usize, value: Dpi, active: bool, presets: &[Dpi]) -> impl In
                     if idx < next.len() {
                         next.remove(idx);
                     }
-                    AppState::update(cx, |state, cx| {
-                        let key = state.current_record().map(DeviceRecord::device_key);
-                        state.commit_dpi_presets(next);
-                        if let Some(key) = key {
-                            cx.emit(StateEvent::DpiChanged(key));
-                        }
-                    });
+                    AppState::apply(cx, |state| state.commit_dpi_presets(next));
                 }),
         )
 }
@@ -581,61 +490,10 @@ fn add_preset_chip() -> impl IntoElement {
             // Append the current DPI to the active device's preset list.
             // Duplicates are allowed — the user might want the same value
             // appearing at multiple cycle positions for muscle-memory reasons.
-            AppState::update(cx, |state, cx| {
-                let key = state.current_record().map(DeviceRecord::device_key);
+            AppState::apply(cx, |state| {
                 let mut presets = state.dpi_presets();
                 presets.push(state.dpi());
-                state.commit_dpi_presets(presets);
-                if let Some(key) = key {
-                    cx.emit(StateEvent::DpiChanged(key));
-                }
+                state.commit_dpi_presets(presets)
             });
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_a_plain_digit_string() {
-        assert_eq!(parse_dpi_input("1600"), Some(Dpi::new(1600)));
-    }
-
-    #[test]
-    fn trims_surrounding_whitespace() {
-        assert_eq!(parse_dpi_input("  800  "), Some(Dpi::new(800)));
-    }
-
-    #[test]
-    fn rejects_empty_input() {
-        assert_eq!(parse_dpi_input(""), None);
-        assert_eq!(parse_dpi_input("   "), None);
-    }
-
-    #[test]
-    fn rejects_non_numeric_input() {
-        assert_eq!(parse_dpi_input("abc"), None);
-        assert_eq!(parse_dpi_input("16.5"), None);
-        assert_eq!(parse_dpi_input("-100"), None);
-    }
-
-    /// The field itself only lets digits through via `InputState::validate`,
-    /// so this is reachable only by typing an implausibly long run of them —
-    /// but it must still not panic or wrap.
-    #[test]
-    fn saturates_a_value_above_the_wire_format() {
-        assert_eq!(parse_dpi_input("999999"), Some(Dpi::new(u16::MAX)));
-    }
-
-    /// A digit string long enough to overflow the `u32` the text is first
-    /// parsed into (not just the final `u16`) must still saturate rather than
-    /// silently fail to commit.
-    #[test]
-    fn saturates_a_value_that_overflows_the_intermediate_parse() {
-        assert_eq!(
-            parse_dpi_input("99999999999999999999"),
-            Some(Dpi::new(u16::MAX))
-        );
-    }
 }
