@@ -84,7 +84,7 @@ falls back to X11/XWayland, which only resolves XWayland windows.
   Plasma 6 scripting API.
 - The script and the D-Bus name (`org.openlogi.*`) are placeholders that should
   track the project's namespace; if they change, update the matching constants
-  in `crates/openlogi-hook/src/linux/kwin_script.rs`.
+  in `crates/openlogi-hook/src/linux/foreground/kwin_script.rs`.
 - The D-Bus method is `SetFocusedWindowClass`, not `setFocusedWindowClass`:
   zbus exports Rust's `set_focused_window_class` in PascalCase, and `callDBus`
   matches the member name literally.
