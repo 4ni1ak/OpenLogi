@@ -141,7 +141,11 @@ type Cached = Arc<Shared>;
 /// the companion works.
 const FIRST_PUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Gap between checks while waiting for that first push.
+/// How long [`reload_script`] keeps retrying `loadScript` while KWin finishes
+/// deleting the script it just unloaded.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Gap between checks while waiting for that first push or the reload.
 const FIRST_PUSH_POLL: Duration = Duration::from_millis(25);
 
 /// D-Bus proxy for KWin's scripting interface. Note the lowercase `kwin` in the
@@ -291,7 +295,8 @@ enum ReloadError {
     Bus(#[from] zbus::Error),
     /// `loadScript` answers with a slot index, or `-1` when it refuses — which
     /// it does when that plugin id is already loaded. Reaching this means the
-    /// unload above did not take effect, so the script KWin is running is not
+    /// unload above did not take effect within [`RELOAD_TIMEOUT`], so the
+    /// script KWin is running is not
     /// the one we just asked for and its load-time push is never coming.
     #[error("KWin refused to load the script (already loaded?)")]
     Refused,
@@ -319,8 +324,15 @@ fn reload_script(
     if scripting.is_script_loaded(SCRIPT_PLUGIN_ID)? {
         scripting.unload_script(SCRIPT_PLUGIN_ID)?;
     }
-    if scripting.load_script(&path.to_string_lossy(), SCRIPT_PLUGIN_ID)? < 0 {
-        return Err(ReloadError::Refused);
+    // KWin defers the unloaded script's deletion, so `loadScript` keeps
+    // refusing the plugin id until that lands; retry rather than decline.
+    let path = path.to_string_lossy();
+    let deadline = Instant::now() + RELOAD_TIMEOUT;
+    while scripting.load_script(&path, SCRIPT_PLUGIN_ID)? < 0 {
+        if Instant::now() >= deadline {
+            return Err(ReloadError::Refused);
+        }
+        thread::sleep(FIRST_PUSH_POLL);
     }
     scripting.start()?;
     await_first_push(cached)
