@@ -22,14 +22,13 @@ mod session;
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpui::AppContext as _;
 use tracing::warn;
 
 use openlogi_core::action_ring::DISPLAY_LIFETIME;
 
 use crate::ipc::OverlayCommand;
 use crate::platform::RingPlacement;
-use crate::ring::RingView;
+use crate::ring::open_ring_window;
 use crate::session::{
     ClickAwaySession, claim_the_role, close_ring_windows, spawn_click_away_dismissal,
 };
@@ -101,28 +100,14 @@ fn main() -> Result<()> {
                     // open must not sink the others.
                     let mut primary = None;
                     for (options, panel) in placement.openings() {
-                        let fallback = ring::layer_shell_fallback(&options);
-                        let open = |cx: &mut gpui::App, options| {
-                            cx.open_window(options, |_, cx| {
-                                cx.new(|_| {
-                                    RingView::new(
-                                        invocation.clone(),
-                                        commands.clone(),
-                                        &live_session,
-                                        panel,
-                                    )
-                                })
-                            })
-                        };
-                        let opened = match (open(cx, options), fallback) {
-                            (Err(error), Some(fallback))
-                                if error.is::<gpui::layer_shell::LayerShellNotSupportedError>() =>
-                            {
-                                open(cx, fallback)
-                            }
-                            (opened, _) => opened,
-                        };
-                        match opened {
+                        match open_ring_window(
+                            cx,
+                            options,
+                            &invocation,
+                            &commands,
+                            &live_session,
+                            panel,
+                        ) {
                             Ok(handle) => {
                                 if primary.is_none() {
                                     primary = Some(handle);

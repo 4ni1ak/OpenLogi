@@ -6,10 +6,10 @@
 //! panel is drawn at the pointer inside it.
 
 use gpui::{
-    Bounds, Context, Div, Hsla, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
-    Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point,
-    prelude::FluentBuilder as _, px, svg,
+    AppContext as _, Bounds, Context, Div, Hsla, InteractiveElement, IntoElement, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _,
+    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, div, point, prelude::FluentBuilder as _, px, svg,
 };
 use openlogi_core::binding::{Action, ActionRingSlot};
 use openlogi_ipc::ActionRingInvocation;
@@ -289,9 +289,33 @@ pub(crate) fn ring_window_options() -> WindowOptions {
     }
 }
 
-/// A plain covering window for a layer-shell opening, for compositors without
-/// `zwlr_layer_shell_v1`; `None` when `options` is not a layer-shell surface.
-pub(crate) fn layer_shell_fallback(options: &WindowOptions) -> Option<WindowOptions> {
+/// Open one ring window, retrying a layer-shell opening as a plain window when
+/// the compositor lacks `zwlr_layer_shell_v1`.
+pub(crate) fn open_ring_window(
+    cx: &mut gpui::App,
+    options: WindowOptions,
+    invocation: &ActionRingInvocation,
+    commands: &mpsc::UnboundedSender<OverlayCommand>,
+    live: &Arc<ClickAwaySession>,
+    placement: Placement,
+) -> anyhow::Result<WindowHandle<RingView>> {
+    let fallback = layer_shell_fallback(&options);
+    let open = |cx: &mut gpui::App, options| {
+        cx.open_window(options, |_, cx| {
+            cx.new(|_| RingView::new(invocation.clone(), commands.clone(), live, placement))
+        })
+    };
+    match (open(cx, options), fallback) {
+        (Err(error), Some(fallback))
+            if error.is::<gpui::layer_shell::LayerShellNotSupportedError>() =>
+        {
+            open(cx, fallback)
+        }
+        (opened, _) => opened,
+    }
+}
+
+fn layer_shell_fallback(options: &WindowOptions) -> Option<WindowOptions> {
     if !matches!(options.kind, WindowKind::LayerShell(_)) {
         return None;
     }
