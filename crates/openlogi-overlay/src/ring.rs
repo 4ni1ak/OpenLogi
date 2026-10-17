@@ -8,8 +8,8 @@
 use gpui::{
     AppContext as _, Bounds, Context, Div, Hsla, InteractiveElement, IntoElement, MouseMoveEvent,
     ParentElement, Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement as _,
-    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, div, point, prelude::FluentBuilder as _, px, svg,
+    Styled, Window, WindowBackgroundAppearance, WindowHandle, WindowKind, WindowOptions, div,
+    point, prelude::FluentBuilder as _, px, svg,
 };
 use openlogi_core::binding::{Action, ActionRingSlot};
 use openlogi_ipc::ActionRingInvocation;
@@ -299,23 +299,27 @@ pub(crate) fn open_ring_window(
     live: &Arc<ClickAwaySession>,
     placement: Placement,
 ) -> anyhow::Result<WindowHandle<RingView>> {
-    let fallback = layer_shell_fallback(&options);
     let open = |cx: &mut gpui::App, options| {
         cx.open_window(options, |_, cx| {
             cx.new(|_| RingView::new(invocation.clone(), commands.clone(), live, placement))
         })
     };
-    match (open(cx, options), fallback) {
-        (Err(error), Some(fallback))
-            if error.is::<gpui::layer_shell::LayerShellNotSupportedError>() =>
-        {
-            open(cx, fallback)
-        }
-        (opened, _) => opened,
+    #[cfg(target_os = "linux")]
+    if let Some(fallback) = layer_shell_fallback(&options) {
+        return match open(cx, options) {
+            Err(error) if error.is::<gpui::layer_shell::LayerShellNotSupportedError>() => {
+                open(cx, fallback)
+            }
+            opened => opened,
+        };
     }
+    open(cx, options)
 }
 
+#[cfg(target_os = "linux")]
 fn layer_shell_fallback(options: &WindowOptions) -> Option<WindowOptions> {
+    use gpui::WindowBounds;
+
     if !matches!(options.kind, WindowKind::LayerShell(_)) {
         return None;
     }
