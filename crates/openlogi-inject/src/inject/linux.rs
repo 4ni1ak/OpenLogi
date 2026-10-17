@@ -816,13 +816,72 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// First executable named `name` on `PATH`.
-fn on_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
+/// Every executable named `name` on `PATH`, in `PATH` order.
+fn path_matches(name: &str) -> Vec<PathBuf> {
+    std::env::var_os("PATH").map_or_else(Vec::new, |paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join(name))
-            .find(|candidate| is_executable(candidate))
+            .filter(|candidate| is_executable(candidate))
+            .collect()
     })
+}
+
+/// First executable named `name` on `PATH`.
+fn on_path(name: &str) -> Option<PathBuf> {
+    path_matches(name).into_iter().next()
+}
+
+/// Outcome of trying to spawn a program from a list of candidates.
+#[derive(Debug, PartialEq, Eq)]
+enum Spawn {
+    Started(PathBuf),
+    /// Every candidate was refused for permissions.
+    PermissionDenied,
+    /// A candidate was refused for a reason other than permissions.
+    NotRunnable,
+}
+
+/// Spawn the first candidate the kernel will run, moving past any refused
+/// for permissions — the mode check behind [`is_executable`] cannot tell a
+/// file executable only by another user from one this user can run, so an
+/// earlier `PATH` match must not shadow a runnable later one.
+fn spawn_first(candidates: impl IntoIterator<Item = PathBuf>) -> Spawn {
+    let mut outcome = Spawn::PermissionDenied;
+    for program in candidates {
+        match std::process::Command::new(&program)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Spawn::Started(program);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                tracing::warn!(
+                    %error,
+                    program = %program.display(),
+                    "the configured application is not executable by this user"
+                );
+            }
+            // Any other refusal means the mode bit was misleading — a data
+            // file with the bit set, a script with no interpreter, a path
+            // that vanished. Those are the desktop opener's business after all.
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    program = %program.display(),
+                    "not a runnable program — handing it to the desktop opener"
+                );
+                outcome = Spawn::NotRunnable;
+                break;
+            }
+        }
+    }
+    outcome
 }
 
 /// Run an "Open application" target as a program when that is what it is,
@@ -850,41 +909,15 @@ pub(super) fn launch_program(target: &str) -> bool {
     let Launch::Program(program) = classify(target, &is_executable, &on_path) else {
         return false;
     };
-    match std::process::Command::new(&program)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            true
-        }
-        // Not executable *by this user*: the opener cannot run it either, and
-        // handing a binary to `xdg-open` risks it landing in a text editor.
-        // Report it handled so nothing else is tried, and say why.
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            tracing::warn!(
-                %error,
-                program = %program.display(),
-                "the configured application is not executable by this user — nothing to run"
-            );
-            true
-        }
-        // Any other refusal means the mode bit was misleading — a data file
-        // with the bit set, a script with no interpreter, a path that vanished.
-        // Those are the desktop opener's business after all.
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                program = %program.display(),
-                "not a runnable program — handing it to the desktop opener"
-            );
-            false
-        }
-    }
+    let candidates = if target.contains('/') {
+        vec![program]
+    } else {
+        path_matches(target)
+    };
+    // Not executable *by this user*: the opener cannot run it either, and
+    // handing a binary to `xdg-open` risks it landing in a text editor.
+    // Report it handled so nothing else is tried.
+    !matches!(spawn_first(candidates), Spawn::NotRunnable)
 }
 
 #[cfg(test)]
@@ -897,9 +930,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::{
-        Launch, ScrollOutput, action_scroll, capture_region_mods, classify, combo,
+        Launch, ScrollOutput, Spawn, action_scroll, capture_region_mods, classify, combo,
         hid_usage_to_linux, is_executable, key_ev, key_phase_events, launch_program,
-        modifiers_to_keycodes, on_path, rel_ev, scroll_events, syn,
+        modifiers_to_keycodes, on_path, rel_ev, scroll_events, spawn_first, syn,
     };
     use crate::inject::KeyPhase;
 
@@ -991,9 +1024,8 @@ mod tests {
     /// mode-based classification cannot see (#839 review).
     #[test]
     fn a_refused_spawn_is_reported_as_unhandled() {
-        let dir = std::env::temp_dir().join(format!("openlogi-launch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("not-a-binary");
+        let dir = TempDir::new("launch");
+        let path = dir.0.join("not-a-binary");
         std::fs::write(&path, b"\x7fELF this is not a loadable binary").expect("write file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("set mode");
 
@@ -1007,8 +1039,6 @@ mod tests {
             !launch_program(target),
             "an exec the kernel refuses must fall through to the opener"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A file whose execute bit belongs to someone else classifies as a
@@ -1017,9 +1047,8 @@ mod tests {
     /// binary in a text editor as the best case. Report it handled instead.
     #[test]
     fn an_unexecutable_program_is_not_passed_to_the_opener() {
-        let dir = std::env::temp_dir().join(format!("openlogi-eacces-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("no-permission");
+        let dir = TempDir::new("eacces");
+        let path = dir.0.join("no-permission");
         std::fs::write(&path, b"#!/bin/sh\ntrue\n").expect("write file");
         // Executable for group and other, never for the owner running this.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o011)).expect("set mode");
@@ -1034,8 +1063,56 @@ mod tests {
             launch_program(target),
             "an exec refused for permissions must not fall through to the opener"
         );
+    }
 
-        std::fs::remove_dir_all(&dir).ok();
+    /// An earlier `PATH` match this user cannot run must not shadow a
+    /// runnable later one.
+    #[test]
+    fn a_permission_refusal_moves_on_to_the_next_candidate() {
+        let dir = TempDir::new("shadow");
+        let denied = dir.0.join("true");
+        std::fs::write(&denied, b"#!/bin/sh\ntrue\n").expect("write file");
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o011))
+            .expect("set mode");
+        let runnable = on_path("true").expect("true is on PATH");
+
+        assert_eq!(
+            spawn_first([denied.clone(), runnable.clone()]),
+            Spawn::Started(runnable)
+        );
+        assert_eq!(spawn_first([denied]), Spawn::PermissionDenied);
+    }
+
+    /// A fresh `0o700` directory, created exclusively so a pre-planted path or
+    /// symlink fails the test instead of redirecting it; removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::os::unix::fs::DirBuilderExt as _;
+            use std::sync::atomic::{AtomicU32, Ordering};
+
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let dir = std::env::temp_dir().join(format!(
+                "openlogi-{tag}-{}-{}-{nanos}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
     }
 
     /// The fakes above pin the decision table; this pins the two real probes
