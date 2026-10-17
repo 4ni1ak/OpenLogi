@@ -43,6 +43,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -233,30 +234,47 @@ impl Receiver {
 pub(super) struct KWinScriptSource {
     cached: Cached,
     // Owning the connection is what keeps the bus name claimed and the object
-    // served; it also carries the liveness checks and reloads in `observe`.
-    connection: zbus::blocking::Connection,
-    path: PathBuf,
+    // served; nothing reads it again.
+    _connection: zbus::blocking::Connection,
+    // Dropping the sender is what stops the watchdog thread.
+    _watchdog: mpsc::Sender<()>,
 }
 
-impl KWinScriptSource {
-    /// Whether KWin is still running our script. A failed call (KWin exited
-    /// or restarted) counts as lost too.
-    fn companion_alive(&self) -> bool {
-        KWinScriptingProxy::new(&self.connection)
-            .and_then(|scripting| scripting.is_script_loaded(SCRIPT_PLUGIN_ID))
-            .unwrap_or(false)
-    }
+/// Whether KWin is still running our script. A failed call (KWin exited or
+/// restarted) counts as lost too.
+fn companion_alive(connection: &zbus::blocking::Connection) -> bool {
+    KWinScriptingProxy::new(connection)
+        .and_then(|scripting| scripting.is_script_loaded(SCRIPT_PLUGIN_ID))
+        .unwrap_or(false)
+}
 
-    /// Forget the last pushed window — no further updates can arrive, so
-    /// keeping it would pin that app's bindings — then try to bring the
-    /// companion back.
-    fn recover(&self) {
-        self.cached.set_focus(Focus::Silent);
-        match reload_script(&self.connection, &self.path, &self.cached) {
-            Ok(()) => debug!("kwin-script: companion script reloaded"),
-            Err(error) => debug!(%error, "kwin-script: companion script still unavailable"),
+/// Keep the companion alive for as long as the source exists, whether or not
+/// an observer is running: a stopped script or a KWin restart sends nothing,
+/// and neither does a reloaded script whose load-time push never arrived, so
+/// only polling notices. Each recovery first forgets the last pushed window —
+/// no further updates can arrive for it, so keeping it would pin that app's
+/// bindings for every reader — then reloads the script.
+fn spawn_watchdog(
+    connection: zbus::blocking::Connection,
+    path: PathBuf,
+    cached: Cached,
+) -> mpsc::Sender<()> {
+    let (sender, receiver) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        while let Err(RecvTimeoutError::Timeout) = receiver.recv_timeout(RECONNECT_DELAY) {
+            let silent = cached.lock().focus == Focus::Silent;
+            if !silent && companion_alive(&connection) {
+                continue;
+            }
+            debug!(silent, "kwin-script: companion script lost");
+            cached.set_focus(Focus::Silent);
+            match reload_script(&connection, &path, &cached) {
+                Ok(()) => debug!("kwin-script: companion script reloaded"),
+                Err(error) => debug!(%error, "kwin-script: companion script still unavailable"),
+            }
         }
-    }
+    });
+    sender
 }
 
 impl FrontmostSource for KWinScriptSource {
@@ -265,21 +283,16 @@ impl FrontmostSource for KWinScriptSource {
     }
 
     /// The script pushes on its own schedule via [`Receiver`], which runs on
-    /// zbus's executor thread rather than this one: register the publish
-    /// callback with the current snapshot, then only watch that the companion
-    /// is still running, since a stopped script or KWin restart sends nothing.
+    /// zbus's executor thread rather than this one, and the watchdog keeps the
+    /// companion alive, so there is nothing to poll here: register the publish
+    /// callback with the current snapshot and wait.
     fn observe(
         self: Box<Self>,
         stop: StopToken,
         publish: PublishAppId,
     ) -> Box<dyn FrontmostSource> {
         self.cached.set_publish(Some(publish));
-        while !stop.wait_timeout(RECONNECT_DELAY) {
-            if !self.companion_alive() {
-                debug!("kwin-script: companion script lost");
-                self.recover();
-            }
-        }
+        stop.wait();
         self.cached.set_publish(None);
         self
     }
@@ -420,10 +433,11 @@ pub(super) fn candidate() -> Option<Box<dyn FrontmostSource>> {
         SCRIPT_PLUGIN_ID,
         path.display()
     );
+    let watchdog = spawn_watchdog(connection.clone(), path, Arc::clone(&cached));
     Some(Box::new(KWinScriptSource {
         cached,
-        connection,
-        path,
+        _connection: connection,
+        _watchdog: watchdog,
     }))
 }
 
