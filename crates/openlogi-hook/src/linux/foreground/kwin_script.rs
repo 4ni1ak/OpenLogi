@@ -43,7 +43,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,7 +51,7 @@ use tracing::debug;
 use zbus::blocking::connection::Builder;
 use zbus::{interface, proxy};
 
-use super::{FrontmostSource, PublishAppId, StopToken};
+use super::{FrontmostSource, PublishAppId, RECONNECT_DELAY, StopToken};
 
 /// Bus name and object path the companion script pushes to. Distinct from the
 /// GNOME extension's `org.openlogi.Frontmost`, which is a *served* interface
@@ -111,24 +111,52 @@ impl Focus {
 /// The script pushes on its own schedule, not on a poll the observer worker
 /// drives, so a push has to reach `publish` directly from the receiver rather
 /// than through a loop in [`KWinScriptSource::observe`].
+///
+/// Focus and callback share one lock, and every publish happens while holding
+/// it: otherwise a snapshot read before a push could be published after it and
+/// win the hub's version check with the stale value.
 struct Shared {
-    cached: Mutex<Focus>,
-    publish: Mutex<Option<PublishAppId>>,
+    state: Mutex<SharedState>,
+}
+
+#[derive(Default)]
+struct SharedState {
+    focus: Focus,
+    publish: Option<PublishAppId>,
 }
 
 impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            cached: Mutex::new(Focus::default()),
-            publish: Mutex::new(None),
+            state: Mutex::new(SharedState::default()),
         })
     }
 
+    fn lock(&self) -> MutexGuard<'_, SharedState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn app_id(&self) -> Option<String> {
-        self.cached
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .app_id()
+        self.lock().focus.app_id()
+    }
+
+    /// Replace the focus and forward it to the subscribed observer, if any.
+    fn set_focus(&self, focus: Focus) {
+        let mut state = self.lock();
+        state.focus = focus;
+        if let Some(publish) = &state.publish {
+            publish(state.focus.app_id());
+        }
+    }
+
+    /// Register (or clear) the observer callback, publishing the current
+    /// snapshot under the same lock receiver pushes take.
+    fn set_publish(&self, publish: Option<PublishAppId>) {
+        let mut state = self.lock();
+        if let Some(publish) = &publish {
+            publish(state.focus.app_id());
+        }
+        state.publish = publish;
     }
 }
 
@@ -197,20 +225,7 @@ impl Receiver {
         } else {
             Focus::Window(class.to_owned())
         };
-        *self
-            .cached
-            .cached
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = value;
-        if let Some(publish) = self
-            .cached
-            .publish
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-        {
-            publish(self.cached.app_id());
-        }
+        self.cached.set_focus(value);
     }
 }
 
@@ -218,8 +233,30 @@ impl Receiver {
 pub(super) struct KWinScriptSource {
     cached: Cached,
     // Owning the connection is what keeps the bus name claimed and the object
-    // served; nothing reads it again.
-    _connection: zbus::blocking::Connection,
+    // served; it also carries the liveness checks and reloads in `observe`.
+    connection: zbus::blocking::Connection,
+    path: PathBuf,
+}
+
+impl KWinScriptSource {
+    /// Whether KWin is still running our script. A failed call (KWin exited
+    /// or restarted) counts as lost too.
+    fn companion_alive(&self) -> bool {
+        KWinScriptingProxy::new(&self.connection)
+            .and_then(|scripting| scripting.is_script_loaded(SCRIPT_PLUGIN_ID))
+            .unwrap_or(false)
+    }
+
+    /// Forget the last pushed window — no further updates can arrive, so
+    /// keeping it would pin that app's bindings — then try to bring the
+    /// companion back.
+    fn recover(&self) {
+        self.cached.set_focus(Focus::Silent);
+        match reload_script(&self.connection, &self.path, &self.cached) {
+            Ok(()) => debug!("kwin-script: companion script reloaded"),
+            Err(error) => debug!(%error, "kwin-script: companion script still unavailable"),
+        }
+    }
 }
 
 impl FrontmostSource for KWinScriptSource {
@@ -228,29 +265,22 @@ impl FrontmostSource for KWinScriptSource {
     }
 
     /// The script pushes on its own schedule via [`Receiver`], which runs on
-    /// zbus's executor thread rather than this one, so there is nothing to
-    /// poll here: register the publish callback, then read the snapshot.
-    /// Registering first (rather than after) is what keeps a push racing with
-    /// startup from being missed: at worst it is published twice, once from
-    /// here and once from the receiver, which the hub's version check
-    /// collapses into the latest value.
+    /// zbus's executor thread rather than this one: register the publish
+    /// callback with the current snapshot, then only watch that the companion
+    /// is still running, since a stopped script or KWin restart sends nothing.
     fn observe(
         self: Box<Self>,
         stop: StopToken,
         publish: PublishAppId,
     ) -> Box<dyn FrontmostSource> {
-        *self
-            .cached
-            .publish
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(publish.clone());
-        publish(self.cached.app_id());
-        stop.wait();
-        *self
-            .cached
-            .publish
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.cached.set_publish(Some(publish));
+        while !stop.wait_timeout(RECONNECT_DELAY) {
+            if !self.companion_alive() {
+                debug!("kwin-script: companion script lost");
+                self.recover();
+            }
+        }
+        self.cached.set_publish(None);
         self
     }
 
@@ -346,7 +376,7 @@ fn reload_script(
 fn await_first_push(cached: &Cached) -> Result<(), ReloadError> {
     let deadline = Instant::now() + FIRST_PUSH_TIMEOUT;
     loop {
-        if *cached.cached.lock().unwrap_or_else(PoisonError::into_inner) != Focus::Silent {
+        if cached.lock().focus != Focus::Silent {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -392,7 +422,8 @@ pub(super) fn candidate() -> Option<Box<dyn FrontmostSource>> {
     );
     Some(Box::new(KWinScriptSource {
         cached,
-        _connection: connection,
+        connection,
+        path,
     }))
 }
 
@@ -440,7 +471,7 @@ mod tests {
         let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         let publish: PublishAppId = Arc::new(move |app| sink.lock().unwrap().push(app));
-        *cached.publish.lock().unwrap() = Some(publish);
+        cached.lock().publish = Some(publish);
 
         receiver.set_focused_window_class("org.kde.konsole");
         receiver.set_focused_window_class("");
@@ -449,6 +480,25 @@ mod tests {
             *seen.lock().unwrap(),
             vec![Some("org.kde.konsole".to_owned()), None]
         );
+    }
+
+    /// Registering an observer publishes the current snapshot, and clearing
+    /// the focus after the companion is lost reaches it as "no app".
+    #[test]
+    fn registering_publishes_the_snapshot_and_loss_clears_it() {
+        let (receiver, cached) = receiver();
+        receiver.set_focused_window_class("org.kde.konsole");
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        cached.set_publish(Some(Arc::new(move |app| sink.lock().unwrap().push(app))));
+
+        cached.set_focus(Focus::Silent);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("org.kde.konsole".to_owned()), None]
+        );
+        assert_eq!(frontmost(&cached), None);
     }
 
     /// The script sends `""` when KWin activated no window — focus on the
