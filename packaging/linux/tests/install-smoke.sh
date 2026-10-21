@@ -58,6 +58,8 @@ EOF
 cat >"${MOCK_BIN}/sudo" <<'EOF'
 #!/bin/sh
 printf 'sudo %s\n' "$*" >>"$MOCK_LOG"
+# A privileged rm targets real system paths; record it, never run it.
+[ "${1:-}" = rm ] && exit 0
 "$@"
 EOF
 
