@@ -17,13 +17,8 @@
 use std::io;
 
 use evdev::uinput::{VirtualDevice, VirtualDeviceBuilder};
-
-/// Prefix of every uinput device name OpenLogi creates.
-const PREFIX: &str = "OL ";
-
-/// Prefix the same devices carried in earlier releases. A development agent
-/// can run next to an older installed agent and must not grab its devices.
-const LEGACY_PREFIX: &str = "OpenLogi ";
+// Shared with the permissions probe, which must not link evdev to use it.
+pub use openlogi_core::uinput::is_own_device;
 
 /// A uinput device OpenLogi creates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,13 +55,6 @@ pub fn builder(device: Device) -> io::Result<VirtualDeviceBuilder<'static>> {
     Ok(VirtualDevice::builder()?.name(device.name()))
 }
 
-/// Whether `name` belongs to a uinput device that OpenLogi created, in this
-/// release or an earlier one.
-#[must_use]
-pub fn is_own_device(name: &str) -> bool {
-    name.starts_with(PREFIX) || name.starts_with(LEGACY_PREFIX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,26 +85,6 @@ mod tests {
                      reads as a tablet or touchpad"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn devices_from_earlier_releases_are_recognized_as_own() {
-        assert!(is_own_device("OpenLogi virtual mouse"));
-        assert!(is_own_device("OpenLogi action injector"));
-    }
-
-    #[test]
-    fn physical_and_foreign_devices_are_not_own() {
-        for name in [
-            "Logitech MX Master 3S",
-            "MX Master 3S",
-            "Logitech USB Receiver Mouse",
-            "OLED Touch Panel",
-            "OL",
-            "",
-        ] {
-            assert!(!is_own_device(name), "{name:?} is not an OpenLogi device");
         }
     }
 }

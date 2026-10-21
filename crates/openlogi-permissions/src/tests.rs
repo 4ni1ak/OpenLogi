@@ -132,3 +132,101 @@ mod capability_bits {
         assert!(!has_capability_bit("zz", REL_X));
     }
 }
+
+/// Which `/dev/input` nodes count, over fixture sysfs attributes — the shape of
+/// #1959's report: the receiver's mouse node carries a `uaccess` ACL, and the
+/// agent's pass-through mouse, which mirrors that mouse's vendor and
+/// capabilities, does not.
+mod event_node_selection {
+    use std::io::ErrorKind;
+
+    use crate::linux::{EventProbe, classify_event_nodes};
+
+    const MOUSE_REL: &str = "1943\n";
+    const MOUSE_KEY: &str = "ffff0000 0 0 0 0\n";
+
+    /// One fixture node: its `/dev/input` name, sysfs `device/name`, and
+    /// whether `open()` succeeds.
+    struct Node {
+        node: &'static str,
+        name: &'static str,
+        readable: bool,
+    }
+
+    /// Every node is a Logitech mouse by vendor and capabilities; only the name
+    /// and the access differ.
+    fn classify(nodes: &[Node]) -> EventProbe {
+        let find = |node: &str| nodes.iter().find(|n| n.node == node).expect("fixture node");
+        classify_event_nodes(
+            nodes.iter().map(|n| n.node),
+            |node, attr| {
+                let value = match attr {
+                    "name" => format!("{}\n", find(node).name),
+                    "id/vendor" => "046d\n".to_owned(),
+                    "capabilities/rel" => MOUSE_REL.to_owned(),
+                    "capabilities/key" => MOUSE_KEY.to_owned(),
+                    _ => return None,
+                };
+                Some(value)
+            },
+            |node| {
+                if find(node).readable {
+                    Ok(())
+                } else {
+                    Err(ErrorKind::PermissionDenied)
+                }
+            },
+        )
+    }
+
+    const PHYSICAL: Node = Node {
+        node: "event7",
+        name: "Logitech USB Receiver Mouse",
+        readable: true,
+    };
+    const PASS_THROUGH: Node = Node {
+        node: "event31",
+        name: "OL virtual mouse",
+        readable: false,
+    };
+
+    #[test]
+    fn our_own_pass_through_mouse_is_ignored() {
+        assert_eq!(classify(&[PHYSICAL, PASS_THROUGH]), EventProbe::Readable);
+    }
+
+    #[test]
+    fn a_pass_through_mouse_from_an_earlier_release_is_ignored() {
+        let legacy = Node {
+            name: "OpenLogi virtual mouse",
+            ..PASS_THROUGH
+        };
+        assert_eq!(classify(&[PHYSICAL, legacy]), EventProbe::Readable);
+    }
+
+    #[test]
+    fn an_unreadable_physical_mouse_is_still_denied() {
+        let denied = Node {
+            readable: false,
+            ..PHYSICAL
+        };
+        assert_eq!(classify(&[denied, PASS_THROUGH]), EventProbe::Denied);
+    }
+
+    #[test]
+    fn only_our_own_nodes_is_none_present() {
+        assert_eq!(classify(&[PASS_THROUGH]), EventProbe::NonePresent);
+    }
+
+    /// Non-event entries (`mouse0`, `by-id`) are never candidates, even when
+    /// they would otherwise look like a mouse.
+    #[test]
+    fn non_event_entries_are_skipped() {
+        let mouse0 = Node {
+            node: "mouse0",
+            readable: false,
+            ..PHYSICAL
+        };
+        assert_eq!(classify(&[PHYSICAL, mouse0]), EventProbe::Readable);
+    }
+}
