@@ -90,6 +90,12 @@ optional physical device key.
   one on screen. The state a keyboard reports when it connects is not
   announced. With the setting off the agent shows nothing, and an indicator
   already on screen still closes on its own. Fn Lock is not shown.
+- `backlight_notifications` (default `true`): when a keyboard reports a new
+  backlight level, for example after its backlight keys are pressed, the agent
+  shows the level in the centre of the screen for 1.5 seconds. A change
+  replaces the one on screen. With the setting off the agent shows nothing,
+  and an indicator already on screen still closes on its own. The keyboard
+  still changes its backlight either way.
 - `animate_desktop_switch` (default `true`, macOS only): Previous Desktop and
   Next Desktop slide to the neighbouring Space the way a three-finger swipe
   does. The agent posts the swipe as 20 frames, one every 16.6 ms, and each
