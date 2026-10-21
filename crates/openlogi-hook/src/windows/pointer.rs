@@ -107,8 +107,9 @@ pub(crate) fn pointer_target_is_focused(expected: PointerTarget) -> bool {
         return true;
     }
     // Name both windows, so a log tells another application apart from
-    // another window of the same one.
-    let hovered = match expected {
+    // another window of the same one. Field expressions only run when debug
+    // logging is on, so the class lookups cost nothing otherwise.
+    let hovered_class = || match expected {
         PointerTarget::Window { window_id, .. } => usize::try_from(window_id)
             .ok()
             .and_then(|id| class_name(std::ptr::without_provenance_mut(id))),
@@ -116,7 +117,7 @@ pub(crate) fn pointer_target_is_focused(expected: PointerTarget) -> bool {
     };
     tracing::debug!(
         ?expected,
-        hovered_class = ?hovered,
+        hovered_class = ?hovered_class(),
         foreground = ?focused,
         foreground_class = ?class_name(foreground),
         "window under the pointer is not the foreground window"
