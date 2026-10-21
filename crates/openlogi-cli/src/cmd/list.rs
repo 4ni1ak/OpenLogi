@@ -33,6 +33,7 @@ const NOTHING_FOUND: u8 = 2;
 /// or webcam is present, so scripts can tell "no hardware" apart from a failed
 /// enumeration.
 pub async fn run(_args: ListArgs) -> Result<ExitCode> {
+    let mut standalone_error = None;
     let (inventories, standalone, agent_status) = if let Some(snapshot) = agent_snapshot().await {
         eprintln!("(inventory read from the running agent)");
         (
@@ -49,17 +50,23 @@ pub async fn run(_args: ListArgs) -> Result<ExitCode> {
             .await
             .context("failed to enumerate HID++ devices")?;
         // A standalone scan failure must not hide the HID++ listing above.
-        let standalone = openlogi_hid::enumerate_standalone()
-            .await
-            .unwrap_or_else(|error| {
+        let standalone = match openlogi_hid::enumerate_standalone().await {
+            Ok(devices) => devices,
+            Err(error) => {
                 eprintln!("(standalone device scan failed: {error})");
+                standalone_error = Some(error);
                 Vec::new()
-            });
+            }
+        };
         (inventories, standalone, None)
     };
     let cameras = openlogi_camera::enumerate_cameras();
 
     if inventories.is_empty() && standalone.is_empty() && cameras.is_empty() {
+        // An empty list after a failed scan is a failure, not "no hardware".
+        if let Some(error) = standalone_error {
+            return Err(error).context("failed to enumerate standalone HID devices");
+        }
         println!("No Logitech HID++ devices or webcams found.");
         println!();
         print_empty_notes(agent_status.as_ref());
