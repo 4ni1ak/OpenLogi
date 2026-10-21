@@ -140,6 +140,8 @@ mod capability_bits {
 mod event_node_selection {
     use std::io::ErrorKind;
 
+    use openlogi_core::uinput::Device;
+
     use crate::linux::{EventProbe, classify_event_nodes};
 
     const MOUSE_REL: &str = "1943\n";
@@ -191,22 +193,15 @@ mod event_node_selection {
     };
     const PASS_THROUGH: Node = Node {
         entry: "event31",
-        name: "OL virtual mouse",
+        name: Device::PassThroughMouse.name(),
         readable: false,
     };
 
+    // Earlier releases' device names are covered where they are recognized,
+    // in `openlogi_core::uinput`'s own tests.
     #[test]
     fn our_own_pass_through_mouse_is_ignored() {
         assert_eq!(classify(&[PHYSICAL, PASS_THROUGH]), EventProbe::Readable);
-    }
-
-    #[test]
-    fn a_pass_through_mouse_from_an_earlier_release_is_ignored() {
-        let legacy = Node {
-            name: "OpenLogi virtual mouse",
-            ..PASS_THROUGH
-        };
-        assert_eq!(classify(&[PHYSICAL, legacy]), EventProbe::Readable);
     }
 
     #[test]
