@@ -148,7 +148,7 @@ mod event_node_selection {
     /// One fixture node: its `/dev/input` name, sysfs `device/name`, and
     /// whether `open()` succeeds.
     struct Node {
-        node: &'static str,
+        entry: &'static str,
         name: &'static str,
         readable: bool,
     }
@@ -156,9 +156,14 @@ mod event_node_selection {
     /// Every node is a Logitech mouse by vendor and capabilities; only the name
     /// and the access differ.
     fn classify(nodes: &[Node]) -> EventProbe {
-        let find = |node: &str| nodes.iter().find(|n| n.node == node).expect("fixture node");
+        let find = |node: &str| {
+            nodes
+                .iter()
+                .find(|n| n.entry == node)
+                .expect("fixture node")
+        };
         classify_event_nodes(
-            nodes.iter().map(|n| n.node),
+            nodes.iter().map(|n| n.entry),
             |node, attr| {
                 let value = match attr {
                     "name" => format!("{}\n", find(node).name),
@@ -180,12 +185,12 @@ mod event_node_selection {
     }
 
     const PHYSICAL: Node = Node {
-        node: "event7",
+        entry: "event7",
         name: "Logitech USB Receiver Mouse",
         readable: true,
     };
     const PASS_THROUGH: Node = Node {
-        node: "event31",
+        entry: "event31",
         name: "OL virtual mouse",
         readable: false,
     };
@@ -223,7 +228,7 @@ mod event_node_selection {
     #[test]
     fn non_event_entries_are_skipped() {
         let mouse0 = Node {
-            node: "mouse0",
+            entry: "mouse0",
             readable: false,
             ..PHYSICAL
         };
