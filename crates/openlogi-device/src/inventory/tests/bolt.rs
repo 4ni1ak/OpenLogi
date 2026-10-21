@@ -357,3 +357,48 @@ async fn a_receiver_probe_whose_io_outruns_the_budget_is_failed() {
     assert_eq!(probe.verdict, ProbeVerdict::Failed);
     assert!(probe.inventory.is_none());
 }
+
+/// [`bolt_receiver_with_a_silent_slot`], but slot 1's codename register holds
+/// a 14-byte name and so returns only its first 13 bytes (#1960).
+fn bolt_receiver_with_a_truncated_codename(request: &[u8]) -> Option<Vec<u8>> {
+    if let [_, 0xff, 0x83, 0xb5, 0x61, ..] = *request {
+        let mut report = vec![0x11, 0xff, 0x83, 0xb5, 0x61, 0x01, 14];
+        report.extend_from_slice(b"MX Anywhere 3");
+        return Some(report);
+    }
+    bolt_receiver_with_a_silent_slot(request)
+}
+
+/// The receiver register truncates a long name; the device's own `0x0005`
+/// name, here from a fresh cache entry, is whole and wins.
+#[tokio::test]
+async fn a_bolt_slot_is_named_by_its_marketing_name_over_the_truncated_register() {
+    let info = bolt_receiver_node("truncated-codename");
+    let timeouts = quick_timeouts();
+    let (raw, _handle) =
+        ScriptedRawHidChannel::with_responder(bolt_receiver_with_a_truncated_codename);
+    let channel = scripted_channel(raw.presenting_as(BOLT_RECEIVER_PID)).await;
+    let mut entry = cache_entry();
+    entry.probe = probed(Some(model(SILENT_SLOT_UNIT_ID, Some("SN-1"))), false);
+    entry.probe.marketing_name = Some("MX Anywhere 3S".to_owned());
+    let cache = HashMap::from([(
+        CacheKey::Bolt {
+            unit_id: SILENT_SLOT_UNIT_ID,
+        },
+        entry,
+    )]);
+    let pass = PassContext {
+        cache: &cache,
+        now: Instant::now(),
+        subscriptions: None,
+        timeouts: &timeouts,
+    };
+
+    let probe = probe_one(info, channel, pass).await;
+
+    let inventory = probe.inventory.expect("the receiver answered");
+    assert_eq!(
+        inventory.paired[0].codename.as_deref(),
+        Some("MX Anywhere 3S")
+    );
+}

@@ -278,11 +278,13 @@ impl Receiver {
     }
 
     /// Provides the codename of a specific paired device by its index.
+    ///
+    /// One read carries at most 13 name bytes, so a longer name comes back
+    /// truncated ("MX Anywhere 3S" reads "MX Anywhere 3", #1960). No public
+    /// source documents a read for the rest — Solaar issues this same single
+    /// `0x01` read — so a caller that needs the whole name reads the device's
+    /// own `0x0005` name instead.
     pub async fn get_device_codename(&self, device_index: u8) -> Result<String, ReceiverError> {
-        // For device names longer than 13 characters this may need to be called
-        // multiple times with different parameters. I don't have a device with
-        // such a name to be able to test this.
-
         let response = self
             .chan
             .read_long_sub_register(
@@ -378,8 +380,7 @@ impl Receiver {
 /// Extract the codename chunk from a `DeviceCodename` register read.
 ///
 /// `response[2]` is the device-reported name length. A name longer than the
-/// 13 bytes one response carries is clamped to the chunk present (fetching
-/// the rest takes further reads with different parameters); a length byte
+/// 13 bytes one response carries is clamped to the chunk present; a length byte
 /// pointing past the response must not panic. `None` for non-UTF-8 bytes.
 fn parse_codename(response: &[u8; 16]) -> Option<&str> {
     let end = 3usize.saturating_add(usize::from(response[2]));
