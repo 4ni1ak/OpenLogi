@@ -288,9 +288,9 @@ async fn walk_bolt_slot(
 
     let device = PairedDevice {
         slot,
-        // The receiver register carries only the name's first 13 bytes
-        // (#1960); the device's own `0x0005` name is whole, and the cache
-        // keeps it for a slot that is asleep.
+        // The device's own `0x0005` name comes first, as on Unifying; the cache
+        // keeps it for a slot that is asleep. The receiver register's name is
+        // the fallback, and stays cut at 27 bytes (#1960).
         codename: probe
             .marketing_name
             .clone()

@@ -369,6 +369,53 @@ fn bolt_receiver_with_a_truncated_codename(request: &[u8]) -> Option<Vec<u8>> {
     bolt_receiver_with_a_silent_slot(request)
 }
 
+/// [`bolt_receiver_with_a_silent_slot`], but slot 1's codename register holds
+/// "MX Anywhere 3S" and answers each chunk read the way a Bolt receiver does
+/// (#1962): chunk `0x01` with the length and 13 bytes, chunk `0x02` with the
+/// rest.
+fn bolt_receiver_with_a_two_chunk_codename(request: &[u8]) -> Option<Vec<u8>> {
+    if let [_, 0xff, 0x83, 0xb5, 0x61, chunk, ..] = *request {
+        let mut report = vec![0x11, 0xff, 0x83, 0xb5, 0x61, chunk];
+        match chunk {
+            0x01 => {
+                report.push(14);
+                report.extend_from_slice(b"MX Anywhere 3");
+            }
+            0x02 => report.push(b'S'),
+            _ => return None,
+        }
+        report.resize(20, 0);
+        return Some(report);
+    }
+    bolt_receiver_with_a_silent_slot(request)
+}
+
+/// With no `0x0005` name to prefer, the receiver register's two chunks still
+/// give the whole name.
+#[tokio::test]
+async fn a_bolt_slot_without_a_marketing_name_reads_both_codename_chunks() {
+    let info = bolt_receiver_node("two-chunk-codename");
+    let timeouts = quick_timeouts();
+    let (raw, _handle) =
+        ScriptedRawHidChannel::with_responder(bolt_receiver_with_a_two_chunk_codename);
+    let channel = scripted_channel(raw.presenting_as(BOLT_RECEIVER_PID)).await;
+    let (_, cache) = stale_silent_slot_cache();
+    let pass = PassContext {
+        cache: &cache,
+        now: Instant::now(),
+        subscriptions: None,
+        timeouts: &timeouts,
+    };
+
+    let probe = probe_one(info, channel, pass).await;
+
+    let inventory = probe.inventory.expect("the receiver answered");
+    assert_eq!(
+        inventory.paired[0].codename.as_deref(),
+        Some("MX Anywhere 3S")
+    );
+}
+
 /// The receiver register truncates a long name; the device's own `0x0005`
 /// name, here from a fresh cache entry, is whole and wins.
 #[tokio::test]
