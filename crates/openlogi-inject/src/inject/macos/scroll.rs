@@ -320,15 +320,18 @@ mod tests {
     /// fixed-point distance written after it keeps its fraction.
     #[test]
     fn wheel_event_carries_integer_ticks_beside_fractional_distance() {
-        let ticks = QuantizedScroll { x: -1, y: 2 };
+        // Neither the rounded (-1, 2) nor the truncated (0, 1) distance, so
+        // the test fails if writing the fixed-point fields replaces the
+        // carried ticks with ones derived from the distance.
+        let ticks = QuantizedScroll { x: -2, y: 3 };
         let event = wheel_scroll_event(-0.75, 1.6, ticks, None).expect("a wheel event");
         assert_eq!(
             event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
-            2
+            3
         );
         assert_eq!(
             event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
-            -1
+            -2
         );
         let y =
             event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_FIXED_POINT_DELTA_AXIS_1);
