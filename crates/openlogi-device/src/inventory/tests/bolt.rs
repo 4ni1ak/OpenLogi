@@ -449,3 +449,43 @@ async fn a_bolt_slot_is_named_by_its_marketing_name_over_the_truncated_register(
         Some("MX Anywhere 3S")
     );
 }
+
+/// [`bolt_receiver_with_a_two_chunk_codename`], but the reply to chunk `0x02`
+/// is lost.
+fn bolt_receiver_losing_the_second_codename_chunk(request: &[u8]) -> Option<Vec<u8>> {
+    if let [_, 0xff, 0x83, 0xb5, 0x61, 0x02, ..] = *request {
+        return None;
+    }
+    bolt_receiver_with_a_two_chunk_codename(request)
+}
+
+/// A lost reply to the optional second codename chunk costs a short wait
+/// (plus the next register read's stale-reply grace), not the channel's
+/// five-second default: the receiver probe still finishes inside a budget the
+/// default alone would overrun, and the slot keeps the name's first 13 bytes.
+#[tokio::test]
+async fn a_lost_second_codename_chunk_keeps_the_probe_inside_its_budget() {
+    let info = bolt_receiver_node("lost-codename-chunk");
+    let timeouts = ProbeTimeouts {
+        receiver: Duration::from_secs(3),
+        ..quick_timeouts()
+    };
+    let (raw, _handle) =
+        ScriptedRawHidChannel::with_responder(bolt_receiver_losing_the_second_codename_chunk);
+    let channel = scripted_channel(raw.presenting_as(BOLT_RECEIVER_PID)).await;
+    let (_, cache) = stale_silent_slot_cache();
+    let pass = PassContext {
+        cache: &cache,
+        now: Instant::now(),
+        subscriptions: None,
+        timeouts: &timeouts,
+    };
+
+    let probe = probe_one(info, channel, pass).await;
+
+    let inventory = probe.inventory.expect("the receiver answered");
+    assert_eq!(
+        inventory.paired[0].codename.as_deref(),
+        Some("MX Anywhere 3")
+    );
+}

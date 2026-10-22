@@ -11,6 +11,7 @@
 //! Solaar) and searching registers by fuzzing them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{FutureExt, pin_mut, select};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -285,8 +286,8 @@ impl Receiver {
     /// with no repeated length — captured from a Bolt receiver with an
     /// MX Anywhere 3S paired (#1962). Only those two reads are confirmed, so a
     /// name past their 27 bytes stays truncated rather than guessing a third.
-    /// If the second read fails or does not echo its chunk, the first 13
-    /// bytes are returned, as before.
+    /// If the second read fails, times out after a short wait, or does not
+    /// echo its chunk, the first 13 bytes are returned, as before.
     pub async fn get_device_codename(&self, device_index: u8) -> Result<String, ReceiverError> {
         let sub_register = u8::from(InfoSubRegister::DeviceCodename) + (device_index & 0x0f);
         let first = self
@@ -300,11 +301,12 @@ impl Receiver {
             .await?;
         let second = if codename_continues(&first) {
             self.chan
-                .read_long_sub_register(
+                .read_long_sub_register_with_timeout(
                     RECEIVER_DEVICE_INDEX,
                     Register::ReceiverInfo.into(),
                     sub_register,
                     [0x02, 0x00],
+                    CODENAME_CONTINUATION_TIMEOUT,
                 )
                 .await
                 .ok()
@@ -398,6 +400,16 @@ const FIRST_CHUNK_NAME_BYTES: usize = 13;
 
 /// Name bytes a second `DeviceCodename` chunk carries, after `[sub_reg, chunk]`.
 const SECOND_CHUNK_NAME_BYTES: usize = 14;
+
+/// How long the optional second `DeviceCodename` read may wait. The receiver
+/// answers its own registers in milliseconds, and this read runs in the
+/// sequential register pass before any slot's feature walk, inside the
+/// receiver probe budget. A lost reply costs this wait plus the channel's
+/// [`STALE_REPLY_GRACE`](crate::channel::STALE_REPLY_GRACE) on the next
+/// register read, so it is kept short: the first 13 bytes are still a usable
+/// name, and the five-second default would push a slot falling back on its
+/// cached data past the receiver's budget.
+const CODENAME_CONTINUATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Whether the first `DeviceCodename` chunk reports a name longer than it holds.
 fn codename_continues(first: &[u8; 16]) -> bool {
