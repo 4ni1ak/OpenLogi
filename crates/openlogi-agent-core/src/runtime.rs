@@ -158,7 +158,6 @@ impl ActionExecutor {
             return;
         }
         let Some(target) = target.resolve(action) else {
-            debug!(action = %action.label(), "mouse action target unavailable or no longer matches — skipped");
             return;
         };
 

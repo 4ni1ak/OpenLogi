@@ -352,8 +352,9 @@ pub fn execute(action: &Action) {
 pub enum DesktopSwitch {
     /// Switch at once, with no slide.
     Instant,
-    /// Slide over the way a three-finger swipe does. Only macOS animates an
-    /// injected swipe; elsewhere this switches like [`Self::Instant`].
+    /// Slide over the way a three-finger swipe does. macOS types the user's
+    /// Space shortcut for the Dock's own slide, or posts swipe frames when
+    /// that shortcut is off. Elsewhere this switches like [`Self::Instant`].
     Animated,
 }
 
@@ -473,6 +474,18 @@ fn hold_transition(
             );
         }
     }
+}
+
+/// Run `post` with the synthetic modifiers held chords keep down, under the
+/// lock that orders held-chord edges.
+///
+/// A one-shot keystroke posted through this sees exactly which modifiers held
+/// chords own, restores any it lifts before returning, and never interleaves
+/// with a held transition.
+#[cfg(target_os = "macos")]
+fn with_held_modifiers<R>(post: impl FnOnce(HeldModifiers) -> R) -> R {
+    let output = HELD_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner);
+    post(output.modifiers())
 }
 
 /// Let the frontmost app's menus answer shortcuts the keyboard layout

@@ -24,12 +24,12 @@ use openlogi_core::device::{
     BatteryInfo, Capabilities, ChangedOnLight, DeviceInventory, DeviceKind, LightCapabilities,
     LightState, StandaloneDevice, prettify_codename,
 };
-use openlogi_core::device_order::{DeviceIdentity, PhysicalDeviceKey};
+use openlogi_core::device_order::{DeviceIdentity, DeviceStableId, PhysicalDeviceKey};
 use openlogi_hid::{
     BacklightChange, BacklightState, CaptureChannelSlot, ChannelPool, ChannelRegistry,
-    DeviceIoGate, DeviceRoute, Dpi, EasySwitchHosts, FnLockState, HidppOperation, HostOs,
-    PointerSpeed, ReportRate, ReportRateInfo, WriteError, commands_for_light_settings,
-    is_reserved_keyboard_control,
+    DeviceIoGate, DeviceRoute, DisableKeysMask, Dpi, EasySwitchHosts, FnLockState,
+    ForceSensingInfo, HidppOperation, HostOs, PointerSpeed, ReportRate, ReportRateInfo, WriteError,
+    commands_for_light_settings, is_reserved_keyboard_control,
 };
 #[cfg(test)]
 use openlogi_ipc::ChosenLight;
@@ -68,11 +68,12 @@ use devices::reapply_targets;
 use devices::{
     FollowerCookieState, FollowerCookieWrite, RECONNECT_REAPPLY_CONFIRM_RETRIES,
     VOLATILE_REAPPLY_CONFIRM_RETRIES, any_device_needs_capture_rearm, assignments_changed,
-    build_devices, changed_follower_cookies, config_keeps_os_layout, configured_dpi,
+    build_devices, bump_settings_epoch, carry_lifecycle_budgets, changed_follower_cookies,
+    changed_force_sensing, config_keeps_os_layout, configured_dpi, configured_force_sensing,
     configured_report_rate, configured_wheel_mode, host_switch_links, is_hidpp_device,
     keeps_os_layout, main_wheel_divert, newly_kept_os_layouts, os_layout_appeared, pick_current,
-    plan_reapply, reconnect_follower_cookies, saved_speed, settings_moved, stable_id,
-    wheel_inverted,
+    plan_disabled_keys_recovery, plan_reapply, published_inventories, reconnect_follower_cookies,
+    same_device_lifecycle, saved_speed, settings_moved, stable_id, wheel_inverted,
 };
 
 /// The minimal per-device facts the agent needs: the config key (binding /
@@ -104,6 +105,16 @@ struct AgentDevice {
     codename: Option<String>,
     /// The device's latest battery reading, `None` when it has none.
     battery: Option<BatteryInfo>,
+}
+
+impl AgentDevice {
+    /// A reload may adopt the remembered route into a physical key without
+    /// another inventory pass. Resolve against the supplied config, not the
+    /// key cached when this inventory record was built.
+    fn resolve_config_key(&self, config: &Config) -> Option<PhysicalDeviceKey> {
+        let identity = DeviceIdentity::from_parts(self.serial.as_deref(), self.unit_id);
+        config.resolve_device_key(&stable_id(self), self.online.then_some(&identity))
+    }
 }
 
 /// Cheaply cloneable handles handed to hooks and background managers.
@@ -165,12 +176,16 @@ pub struct SharedHandles {
     /// Precision mode of the mice whose speed `0x2205` scales, and the order
     /// of every path's pointer-speed writes.
     pointer_speeds: Arc<PointerSpeeds>,
+    /// Orders every path's press-force writes per force-sensing device.
+    force_sensing_order: WriteOrder,
     /// Orders the GUI's backlight writes per keyboard.
     backlight_order: WriteOrder,
     /// Orders host renames per device.
     host_name_order: WriteOrder,
     /// Orders the `ChangeHost` cookie writes per linked device.
     follower_cookie_order: WriteOrder,
+    /// Saved policy and manual writes share intent identity, not retry order.
+    disabled_keys_order: WriteOrder<Option<DisableKeysMask>>,
     /// The running inventory watcher's refresh handle, published at arming;
     /// `None` while no watcher runs.
     inventory_refresh: Arc<RwLock<Option<InventoryRefresh>>>,
@@ -313,6 +328,28 @@ impl SharedHandles {
             .await
     }
 
+    /// Write `force` to the force-sensing button of the device at `route`
+    /// and return what it reads back. When a newer press-force write for the
+    /// device is requested before this one gets its turn, this one reads the
+    /// device instead of writing a force that is about to be replaced; its
+    /// `Ok` then carries the device's force, which need not be `force`.
+    /// Waiting for the turn does not count against the write's deadline.
+    pub async fn set_force_sensing(
+        &self,
+        route: &DeviceRoute,
+        force: u16,
+    ) -> Result<ForceSensingInfo, WriteError> {
+        let ticket = self.force_sensing_order.request(route);
+        self.device(route)
+            .run_in_turn(
+                HidppOperation::WriteForceSensing,
+                &ticket,
+                |c| async move { openlogi_hid::set_force_sensing_on(&c, force).await },
+                |c| async move { openlogi_hid::get_force_sensing_on(&c).await },
+            )
+            .await
+    }
+
     /// Write `dpi` to the mouse at `route`. On a DPI mouse the write ends
     /// precision mode, so the pointer moves at the DPI the settings app
     /// shows, and darkens the DPI LED when the precision speed ends with it.
@@ -382,6 +419,54 @@ impl SharedHandles {
             .await
     }
 
+    /// Replace disabled keys, retaining priority over old reconnect attempts
+    /// until config acknowledges the confirmed choice. Failed/cancelled RPCs
+    /// release only their own pending intent.
+    pub async fn set_disable_keys(
+        &self,
+        route: &DeviceRoute,
+        desired: DisableKeysMask,
+    ) -> Result<openlogi_hid::DisableKeysState, WriteError> {
+        let refresh = Arc::clone(&self.inventory_refresh);
+        let pending = self
+            .disabled_keys_order
+            .begin(route, Some(desired))
+            .on_abandoned(move || {
+                let refresh = refresh.read().unwrap_or_else(PoisonError::into_inner);
+                if let Some(refresh) = refresh.as_ref() {
+                    refresh.request_settings_confirmation();
+                }
+            });
+        crate::hardware::write_manual_disable_keys(self.keyboard_device(route), pending, desired)?
+            .wait()
+            .await
+    }
+
+    /// Read after previously admitted Disable Keys workers finish, including
+    /// background policy writes queued by config reload. This does not create
+    /// a new user intent or block independent routes/settings.
+    pub async fn read_disable_keys(
+        &self,
+        route: &DeviceRoute,
+    ) -> Result<openlogi_hid::DisableKeysState, WriteError> {
+        let reservation = self.disabled_keys_order.reserve(route);
+        reservation.wait().await;
+        self.keyboard_device(route)
+            .run(HidppOperation::ReadDisableKeys, |channel| async move {
+                openlogi_hid::get_disable_keys_on(&channel).await
+            })
+            .await
+    }
+
+    fn reapply_disabled_keys(&self, route: &DeviceRoute) -> Option<std::thread::JoinHandle<()>> {
+        let (desired, ticket) = self.disabled_keys_order.policy(route)?;
+        crate::hardware::write_disabled_keys_in_background(
+            self.keyboard_device(route),
+            ticket,
+            desired?,
+        )
+    }
+
     /// Hand requests to the inventory watcher started at arming.
     pub fn publish_inventory_refresh(&self, refresh: InventoryRefresh) {
         write_value(&self.inventory_refresh, Some(refresh), "inventory refresh");
@@ -407,6 +492,16 @@ impl SharedHandles {
             self.keyboard_device(route),
             self.fn_lock_order.request(route),
             fn_lock,
+        );
+    }
+
+    /// [`Self::set_force_sensing`] without waiting, for the config-reload and
+    /// reconnect paths; the outcome is logged.
+    fn write_force_sensing_in_background(&self, route: &DeviceRoute, force: u16) {
+        crate::hardware::write_force_sensing_in_background(
+            self.device(route),
+            self.force_sensing_order.request(route),
+            force,
         );
     }
 }
@@ -436,10 +531,19 @@ pub struct Orchestrator {
     /// atomically with the inventory so no observation pairs a fresh device
     /// set with a stale flag.
     hid_open_failures: bool,
-    /// Config keys of devices first sighted (or targeted after wake) recently,
-    /// with remaining confirming re-apply budget: the first write can race the
-    /// device's own boot or reconnect and be lost.
-    reapply_followup: HashMap<String, u8>,
+    /// Physical identities of devices first sighted (or targeted after wake)
+    /// recently, with remaining confirming re-apply budget: the first write can
+    /// race the device's own boot or reconnect and be lost.
+    reapply_followup: BTreeMap<DeviceStableId, u8>,
+    /// Physical identities of keyboards whose failed or cancelled manual
+    /// Disable Keys request needs bounded recovery. This plan excludes volatile
+    /// settings that are unrelated to the manual request.
+    disabled_keys_recovery: BTreeMap<DeviceStableId, u8>,
+    /// Disable Keys recoveries started on each route, added to the published
+    /// [`PairedDevice::settings_revision`](openlogi_core::device::PairedDevice::settings_revision).
+    /// A recovery changes the keyboard without a `0x4521` report, so a client
+    /// that read the abandoned mask needs this move to read again.
+    settings_epochs: Vec<(DeviceRoute, u64)>,
     /// Last successful aggregate camera-use sample. `None` means the macOS
     /// watcher has not produced its first usable observation yet.
     camera_active: Option<bool>,
@@ -554,9 +658,11 @@ impl Orchestrator {
             fn_lock_order: WriteOrder::default(),
             report_rate_order: WriteOrder::default(),
             pointer_speeds: Arc::default(),
+            force_sensing_order: WriteOrder::default(),
             backlight_order: WriteOrder::default(),
             host_name_order: WriteOrder::default(),
             follower_cookie_order: WriteOrder::default(),
+            disabled_keys_order: WriteOrder::default(),
             inventory_refresh: Arc::new(RwLock::new(None)),
         };
         let orch = Self {
@@ -571,7 +677,9 @@ impl Orchestrator {
             inventory: InventoryState::Pending,
             forced_reapply_budget: None,
             hid_open_failures: false,
-            reapply_followup: HashMap::new(),
+            reapply_followup: BTreeMap::new(),
+            disabled_keys_recovery: BTreeMap::new(),
+            settings_epochs: Vec::new(),
             camera_active: None,
             manual_light_overrides: BTreeMap::new(),
             light_states: BTreeMap::new(),
@@ -969,6 +1077,29 @@ impl Orchestrator {
         standalone: &[StandaloneDevice],
         hid_open_failures: bool,
     ) {
+        self.refresh_inventory_inner(inventories, standalone, hid_open_failures, false);
+    }
+
+    /// Apply the inventory pass whose delayed purpose is confirming volatile
+    /// settings. Only this path consumes one bounded confirmation attempt;
+    /// ordinary HID and hotplug snapshots may arrive much sooner and must not
+    /// exhaust the retry run while a device's feature path is still booting.
+    pub fn refresh_inventory_for_settings_confirmation(
+        &mut self,
+        inventories: &[DeviceInventory],
+        standalone: &[StandaloneDevice],
+        hid_open_failures: bool,
+    ) {
+        self.refresh_inventory_inner(inventories, standalone, hid_open_failures, true);
+    }
+
+    fn refresh_inventory_inner(
+        &mut self,
+        inventories: &[DeviceInventory],
+        standalone: &[StandaloneDevice],
+        hid_open_failures: bool,
+        confirm_reapply: bool,
+    ) {
         // Even an empty snapshot is a *completed* enumeration — the watcher
         // skips failed ticks — so the device set is now known either way (and
         // a recovered backend upgrades `Unavailable` back to live data).
@@ -979,6 +1110,20 @@ impl Orchestrator {
         };
         self.publish_inventory();
         let devices = build_devices(&self.config, inventories, standalone);
+        // Retire departing routes before forgetting them. Offline routes that
+        // remain in inventory still observe config changes without doing I/O.
+        for old in &self.devices {
+            if let Some(route) = &old.route
+                && !devices.iter().any(|dev| same_device_lifecycle(old, dev))
+            {
+                self.shared.disabled_keys_order.retire(route);
+            }
+        }
+        self.disabled_keys_recovery =
+            carry_lifecycle_budgets(&self.devices, &devices, &self.disabled_keys_recovery);
+        for dev in &devices {
+            self.sync_disabled_keys_policy(dev);
+        }
         self.announce_low_batteries(&devices);
         // Before any cookie plan below: a keyboard that goes to sleep or
         // leaves later keeps its byte for the clears and links that name it.
@@ -987,15 +1132,37 @@ impl Orchestrator {
         // wheel mode) live in device RAM and reset on a power cycle. Every
         // reconnect shape re-applies the persisted values (#189): a first
         // sighting, a replug (new route), a wake from device sleep
-        // (offline→online), or — via the forced budget — a system wake or a
-        // device's own `0x1d4b` reconnect broadcast, where none of those
+        // (offline→online), or — via the forced budget — a system wake, a
+        // device's own `0x1d4b` reconnect broadcast, or a channel the
+        // enumerator replaced after retiring it, where none of those
         // transitions are observable.
         let forced = self.forced_reapply_budget.take();
         let next_current = pick_current(&devices, self.config.selected_device());
         let rearm_capture =
             any_device_needs_capture_rearm(&self.devices, &devices, forced.is_some());
+        // Manual cancellation can happen long after the boot/reconnect ladder
+        // drained. Its owner requests only a Disable Keys recovery, and does
+        // not consume a request while a successor still owns the setting.
+        for dev in &devices {
+            if dev.online
+                && let Some(route) = &dev.route
+                && self.shared.disabled_keys_order.schedule_recovery(route)
+            {
+                self.disabled_keys_recovery
+                    .entry(stable_id(dev))
+                    .and_modify(|remaining| {
+                        *remaining = (*remaining).max(VOLATILE_REAPPLY_CONFIRM_RETRIES);
+                    })
+                    .or_insert(VOLATILE_REAPPLY_CONFIRM_RETRIES);
+            }
+        }
+        let disabled_keys_recovery = std::mem::take(&mut self.disabled_keys_recovery);
+        let (disabled_keys_targets, next_disabled_keys_recovery) =
+            plan_disabled_keys_recovery(&devices, &disabled_keys_recovery, confirm_reapply);
+        self.disabled_keys_recovery = next_disabled_keys_recovery;
         let followup = std::mem::take(&mut self.reapply_followup);
-        let (targets, next_followup) = plan_reapply(&self.devices, &devices, &followup, forced);
+        let (targets, next_followup) =
+            plan_reapply(&self.devices, &devices, &followup, forced, confirm_reapply);
         self.reapply_followup = next_followup;
         // A keyboard switched to another platform on the device (a platform
         // key combination) is put back, as Logi Options+ does on its
@@ -1010,9 +1177,10 @@ impl Orchestrator {
                 self.keep_os_layout(&devices[idx]);
             }
         }
-        for idx in targets {
+        for &idx in &targets {
             self.reapply_volatile_settings(&devices[idx], &devices);
         }
+        self.drive_disabled_keys_recovery(&devices, &targets, &disabled_keys_targets);
         let changed = next_current != self.current
             || devices.len() != self.devices.len()
             || devices.iter().zip(&self.devices).any(|(a, b)| {
@@ -1045,24 +1213,57 @@ impl Orchestrator {
         self.rebuild();
     }
 
-    /// Whether volatile-setting writes still need a delayed inventory pass to
-    /// confirm them after device boot or system resume.
+    /// Start each planned Disable Keys recovery and announce it to clients,
+    /// then close the recovery of every online keyboard that no longer needs
+    /// one. A keyboard in `volatile_targets` already queued its write.
+    fn drive_disabled_keys_recovery(
+        &mut self,
+        devices: &[AgentDevice],
+        volatile_targets: &[usize],
+        recovery_targets: &[usize],
+    ) {
+        let mut recovery_started = false;
+        for &idx in recovery_targets {
+            let Some(route) = &devices[idx].route else {
+                continue;
+            };
+            if !volatile_targets.contains(&idx) {
+                let _ = self.shared.reapply_disabled_keys(route);
+            }
+            bump_settings_epoch(&mut self.settings_epochs, route);
+            recovery_started = true;
+        }
+        // Each recovery write above already holds its place in the keyboard's
+        // queue, so a client's next read waits for it and sees the result.
+        if recovery_started {
+            self.publish_inventory();
+        }
+        for dev in devices {
+            if dev.online
+                && !self.disabled_keys_recovery.contains_key(&stable_id(dev))
+                && let Some(route) = &dev.route
+            {
+                self.shared.disabled_keys_order.finish_recovery(route);
+            }
+        }
+    }
+
+    /// Whether device settings still need a delayed inventory confirmation.
     #[must_use]
     pub fn needs_reapply_confirmation(&self) -> bool {
-        !self.reapply_followup.is_empty()
+        !self.reapply_followup.is_empty() || !self.disabled_keys_recovery.is_empty()
     }
 
     /// Show a lock key a keyboard turned on or off, unless the user turned the
     /// indicator off or this platform gives the key no meaning.
     pub fn announce_lock_key(&self, change: LockKeyChange) {
-        let settings = &self.config.app_settings;
-        if !settings.lock_key_notifications || !change.key.is_indicated_here() {
-            return;
-        }
-        debug!(?change, "showing a lock key");
-        self.observable
+        if self
+            .observable
             .lock_keys()
-            .show(change, settings.language.clone());
+            .announce(change, &self.config.app_settings)
+        {
+            debug!(?change, "showing a lock key");
+        }
     }
 
     /// Show a keyboard's new backlight level on `overlay`, unless the user
@@ -1081,23 +1282,19 @@ impl Orchestrator {
     }
 
     /// Post a low-battery notice for each online device whose battery has just
-    /// come to need attention, while the user wants these notices. An offline
-    /// device's reading is only its last known one, and says nothing new.
-    /// While the notices are off, readings are still taken in, muted: a
-    /// recharge in that time ends the device's discharge, and a battery that
-    /// ran low meanwhile is announced on the first reading after they are
-    /// turned on.
+    /// come to need attention, as [`LowBatteryWatch::take_reading`] decides
+    /// under the user's settings. An offline device's reading is only its last
+    /// known one, and says nothing new.
     fn announce_low_batteries(&mut self, devices: &[AgentDevice]) {
-        let announcing = self.config.app_settings.low_battery_notifications;
         for device in devices.iter().filter(|device| device.online) {
             let Some(battery) = device.battery.as_ref() else {
                 continue;
             };
-            if !announcing {
-                self.low_battery.observe_muted(&device.config_key, battery);
-                continue;
-            }
-            if !self.low_battery.observe(&device.config_key, battery) {
+            if !self.low_battery.take_reading(
+                &self.config.app_settings,
+                &device.config_key,
+                battery,
+            ) {
                 continue;
             }
             let name = self
@@ -1127,11 +1324,13 @@ impl Orchestrator {
     }
 
     /// Force a volatile-settings re-apply on the next inventory refresh
-    /// because a device broadcast its own reconnection (`0x1d4b`). The
-    /// firmware is explicitly asking to be reconfigured, and — as after a
-    /// system wake — the snapshot that follows can look identical to the last
-    /// one (a nap short enough that no reconciliation ever observed the
-    /// device offline), so the offline→online trigger cannot be relied on.
+    /// because a device reconnected unobserved: it broadcast its own
+    /// reconnection (`0x1d4b`), the firmware explicitly asking to be
+    /// reconfigured, or the enumerator replaced its dead channel while still
+    /// replaying it as online. As after a system wake, the snapshot that
+    /// follows can look identical to the last one (a nap or a link drop short
+    /// enough that no reconciliation ever observed the device offline), so
+    /// the offline→online trigger cannot be relied on.
     /// The event channel is identity-free by design, so every online device
     /// re-applies; the writes are idempotent and the confirm budget is the
     /// short link-race one, not the boot ladder.
@@ -1202,10 +1401,14 @@ impl Orchestrator {
         if let Some(fn_lock) = self.config.fn_lock(key) {
             self.shared.write_fn_lock_in_background(&route, fn_lock);
         }
+        if let Some(force) = configured_force_sensing(&self.config, dev) {
+            self.shared.write_force_sensing_in_background(&route, force);
+        }
         if let Some(write) = speed_write {
             self.write_pointer_speed(write);
         }
         self.keep_os_layout(dev);
+        let _ = self.shared.reapply_disabled_keys(&route);
         if let Some(capabilities) = dev.light_capabilities
             && let Some(light) = self.effective_light_settings(key)
         {
@@ -1436,8 +1639,9 @@ impl Orchestrator {
     /// Republish the device facts the GUI observes, reading the one field that
     /// holds them so this can never disagree with the `inventory` /
     /// `standalone` / `inventory_health` accessors. Called by every mutator
-    /// that touches the `inventory` field, and it clones only when something
-    /// actually changed.
+    /// that touches the `inventory` field, and after a Disable Keys recovery
+    /// starts. It clones to add recovery epochs, and otherwise only when
+    /// something actually changed.
     fn publish_inventory(&self) {
         let health = self.inventory_health();
         match &self.inventory {
@@ -1445,9 +1649,10 @@ impl Orchestrator {
                 inventories,
                 standalone,
             } => {
+                let inventories = published_inventories(inventories, &self.settings_epochs);
                 self.observable.set_inventory(
                     health,
-                    inventories,
+                    &inventories,
                     standalone,
                     self.hid_open_failures,
                 );
@@ -1607,6 +1812,28 @@ impl Orchestrator {
         self.rebuild();
         self.apply_native_wheel_modes();
         self.apply_changed_fn_locks(&previous);
+        self.apply_changed_force_sensing(&previous);
+        for dev in &self.devices {
+            let was_enabled = dev
+                .resolve_config_key(&previous)
+                .is_some_and(|key| previous.device_enabled(key.as_str()));
+            let enabled = dev
+                .resolve_config_key(&self.config)
+                .is_some_and(|key| self.config.device_enabled(key.as_str()));
+            if was_enabled
+                && !enabled
+                && let Some(route) = &dev.route
+            {
+                self.shared.disabled_keys_order.retire(route);
+            }
+            if self.sync_disabled_keys_policy(dev)
+                && dev.online
+                && let Some(route) = &dev.route
+            {
+                let _ = self.shared.reapply_disabled_keys(route);
+            }
+        }
+
         self.apply_changed_pointer_speeds(&previous);
         self.apply_enabled_os_layouts(&previous);
         let writes = changed_follower_cookies(
@@ -1631,6 +1858,17 @@ impl Orchestrator {
         }
     }
 
+    fn sync_disabled_keys_policy(&self, dev: &AgentDevice) -> bool {
+        let Some(route) = &dev.route else {
+            return false;
+        };
+        self.shared.disabled_keys_order.sync_policy(
+            route,
+            dev.resolve_config_key(&self.config)
+                .and_then(|key| configured_disabled_keys(&self.config, key.as_str())),
+        )
+    }
+
     /// Push a changed Fn-lock setting to the online keyboard it belongs to.
     /// Only the values that differ from `previous` are written, so an
     /// unrelated save never undoes an Fn+Esc the user pressed on the keyboard.
@@ -1650,6 +1888,17 @@ impl Orchestrator {
             if let Some(fn_lock) = fn_lock {
                 self.shared.write_fn_lock_in_background(&route, fn_lock);
             }
+        }
+    }
+
+    /// Push a changed press force to the online, enabled force-sensing
+    /// device it belongs to — [`changed_force_sensing`] picks the writes. The
+    /// GUI also writes directly through [`SharedHandles::set_force_sensing`];
+    /// both writes are ordered per device, so the newest request is the one
+    /// that stays.
+    fn apply_changed_force_sensing(&self, previous: &Config) {
+        for (route, force) in changed_force_sensing(previous, &self.config, &self.devices) {
+            self.shared.write_force_sensing_in_background(&route, force);
         }
     }
 
@@ -1760,6 +2009,15 @@ fn desktop_switch(settings: &AppSettings) -> openlogi_inject::DesktopSwitch {
     }
 }
 
+fn configured_disabled_keys(config: &Config, device_key: &str) -> Option<DisableKeysMask> {
+    if !config.device_enabled(device_key) {
+        return None;
+    }
+    config.disabled_keys(device_key).map(|keys| {
+        keys.iter()
+            .fold(DisableKeysMask::EMPTY, |mask, key| mask | key.mask())
+    })
+}
 /// Replace the value behind an `RwLock`, logging (not panicking) on poison so a
 /// background thread that panicked while holding the lock can't take the agent
 /// down — it just keeps the stale value until the next successful rebuild.

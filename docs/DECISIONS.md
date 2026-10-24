@@ -4,6 +4,121 @@ Durable "why we did it this way" records that are not obvious from the code.
 Add a dated entry when a non-obvious architectural or dependency decision is
 made or revisited.
 
+## 2026-10: Channel files are composed from per-release records
+
+Beta releases share the update host with stable ones. A beta publish must
+change what `beta` offers and leave what `stable` offers as it is. A stable
+hotfix published after a newer beta must not take that beta off the beta
+channel. So each release uploads an immutable feed record to
+`releases/<tag>/feed/`: its own `latest.json` and one single-item appcast per
+architecture. Every publish then composes all channel files again from all
+records (`cargo xtask release channels`).
+
+- **Composed again, not edited in place.** Reading the current channel file,
+  adding an item and writing it back would make each file depend on the order
+  in which tags published. A failed publish would leave it wrong until someone
+  repaired it by hand. Composing from the records gives the same files in any
+  order.
+- **Newest by build version, not by tag version.** A beta's build version is
+  the stable release it was cut from, plus its beta number, so build order
+  follows the commits. Sparkle and Windows Installer compare build versions.
+  The built-in update engine compares release versions, and never offers a
+  lower one. The two orders disagree whenever a beta is numbered past a
+  release cut after it, which happens when the release PR's version goes
+  down in between. The later release can be stable (`0.9.0-beta.5`, then
+  `0.8.19`) or another beta (`0.9.0-beta.3`, then `0.8.19-beta.10`). The
+  channels offer the release cut last, which has the earlier one's changes.
+  Sparkle moves a Mac to it; the built-in engine keeps the higher-numbered
+  beta until a release numbered past it. We accept this: `release channels`
+  warns whenever a beta is numbered past what the beta channel offers, so
+  that a release numbered past the beta can follow.
+- **Items copied byte for byte.** The composer never signs. The EdDSA
+  signatures stay the ones `release appcast` made, and the private key stays
+  in that one step.
+- **One appcast per architecture for both channels.** This is Sparkle's own
+  channel model: the beta item carries
+  `<sparkle:channel>beta</sparkle:channel>`, and Sparkle offers it only to an
+  app that allows the beta channel.
+- **The bucket lists the releases, not GitHub Releases.** The updater can offer
+  only what is on R2, and reading R2 needs no GitHub token. Releases up to
+  `v0.8.17` have no record. Until a stable release has one, the current stable
+  channel files stand in for it; after that they are not read.
+- **A record counts once its manifest is up.** A record's appcasts upload
+  first and its `latest.json` last. A record directory without `latest.json`
+  is an upload that stopped part way, and the composer skips it, so it cannot
+  block later releases. A record with its manifest but a file missing or
+  wrong is an error.
+
+## 2026-10: The mock agent's console drives the agent's own indicator state
+
+`openlogi-agent-mock` reads one command per stdin line while the GUI and
+overlay stay connected. A developer can then see a low battery, an offline or
+failing device, a lock-key or backlight indicator, or an agent restart with no
+hardware. Logi Options+ 2.8 has comparable hooks in its agent: a simulated
+device on its HID write path and a fake battery feature. OpenLogi puts the
+same kind of control in its separate mock binary, so the agent ships none.
+
+- **The agent's state machines, not copies.** A battery reading goes through
+  `LowBatteryWatch::take_reading`, a lock key through
+  `LockKeyIndicator::announce`, and a backlight level through
+  `BacklightOverlayManager`. The orchestrator uses the same calls, so the
+  user's settings, the once-per-discharge rule, and the 1.5-second lifetime
+  behave as they do in the agent. `take_reading` and `announce` replace the
+  separate public calls that the orchestrator used to sequence by itself, so
+  no caller can skip the settings check.
+- **Words for people, values for tests.** Tests build `Command` values and
+  call `MockAgent::apply` with explicit `AppSettings`. No test reads a config
+  file or depends on the command words.
+- **A thread of its own for stdin.** Tokio's `stdin` reads on the blocking
+  pool and cannot cancel the read, so it can hold up runtime shutdown. A std
+  thread reads the lines and one task applies them in order. When stdin
+  closes, the console stops and the mock keeps serving.
+- **Semantic state only.** The console changes what the IPC contract already
+  exposes. It does not model HID channels, reports, or barriers. Those stay
+  the Phase 4 replay scenarios in
+  [MOCK_DEVICE_TESTING.md](MOCK_DEVICE_TESTING.md#phase-4-lifecycle-and-fault-scenarios).
+- **`disconnect` closes connections, not the process.** Each connection
+  waits on a shared signal beside its requests. The overlay's agent-lost path
+  and the GUI's reconnect can then be tried without losing the mock's state.
+
+Verified with unit tests of every command and an in-memory connection that
+`disconnect` closes, and by piping commands into the built binary on macOS.
+Nobody has watched the GUI or the overlay follow the console yet.
+
+## 2026-10: An animated desktop switch types the user's Space shortcut first
+
+0.8.16 shipped the timed DockSwipe slide of the next entry. Users on macOS
+26.6.1 and 27.0.1 report that it is slower than a native Ctrl+←/→ switch
+(#1722) and that it stutters in the middle (#1972). The Dock plays its own
+slide for that shortcut. An animated switch therefore types the user's "Move
+left a space" or "Move right a space" shortcut (symbolic hotkeys 79 and 81),
+as #1847 proposed. This revisits the "Not the shortcut" point below.
+
+- **Typed as a keyboard types it.** Each modifier goes down as a key of its
+  own, and an arrow key carries the numeric-pad flag. WindowServer ignores a
+  synthesized hotkey in any other shape (#1653).
+- **Through the virtual HID keyboard when it is installed.** Each edge goes
+  through the device, as a held chord's edges do. An edge the device does not
+  carry goes out as its `CGEvent`. Every `CGEvent` is built before the first
+  edge goes out.
+- **Held chords stay intact.** The keystroke is typed under the held-chord
+  lock. A held modifier the shortcut does not use is lifted for the keystroke
+  and pressed again after it. A held modifier the shortcut uses stays down.
+- **The slide stays as the fallback.** Its frames are built before the gate.
+  They are posted when the shortcut is off or cannot be read, and when a held
+  chord holds the shortcut's key down. A rebound shortcut is read from its
+  record, so it still switches with the Dock's slide.
+- **Instant stays a DockSwipe.** With `animate_desktop_switch` off, the switch
+  posts the two-frame DockSwipe, because the shortcut always animates.
+
+Verified: unit tests check the order, flags and routing key of every edge.
+#1847's author switched both ways with the Dock's slide on macOS 27.0.1. That
+run used the `CGEvent` edges, because the test process had no virtual
+keyboard. On 0.8.16, #1653's reporter switched Spaces with the slide through
+a Ctrl+←/→ binding on the virtual keyboard. That binding sends the same four
+reports as this keystroke. Not verified on hardware: this keystroke through
+the virtual keyboard, and the fallback slide.
+
 ## 2026-10: Desktop switches slide like an Options+ three-finger swipe, and can switch at once
 
 Previous Desktop and Next Desktop on macOS posted a DockSwipe of two frames,
