@@ -68,6 +68,36 @@ The installer enables and starts `openlogi-agent.service` for the current user
 when systemd is available; failure to reach the user service manager does not
 roll back an otherwise successful package installation.
 
+## Arch Linux (AUR)
+
+The [`openlogi`](https://aur.archlinux.org/packages/openlogi) AUR package
+builds the tagged release from source and installs the binaries, the desktop
+entry, the udev rules, and the agent's user service. Install it with an AUR
+helper:
+
+```sh
+yay -S openlogi    # or: paru -S openlogi
+```
+
+Or build it by hand:
+
+```sh
+git clone https://aur.archlinux.org/openlogi.git
+cd openlogi
+makepkg -si
+```
+
+Then reload the udev rules and start the agent for your user:
+
+```sh
+sudo udevadm control --reload && sudo udevadm trigger
+systemctl --user enable --now openlogi-agent.service
+```
+
+The package is community-maintained and follows each stable release. The
+signed `.pkg.tar.zst` from the installer above is the alternative when you
+don't want to compile.
+
 ## NixOS
 
 The Flake in the repository's `packaging/` directory provides a package and a
