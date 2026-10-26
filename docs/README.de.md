@@ -218,7 +218,7 @@ Unter Arch Linux baut das AUR-Paket [`openlogi`](https://aur.archlinux.org/packa
 yay -S openlogi
 ```
 
-Wie du das Skript vor dem Ausführen prüfst, sowie Hinweise zu das AUR-Paket, Flatpak, NixOS und Distributionen ohne systemd findest du in [INSTALL-linux.md](INSTALL-linux.md).
+Wie du das Skript vor dem Ausführen prüfst, sowie Hinweise zum AUR-Paket, Flatpak, NixOS und Distributionen ohne systemd findest du in [INSTALL-linux.md](INSTALL-linux.md).
 
 ### Windows
 
