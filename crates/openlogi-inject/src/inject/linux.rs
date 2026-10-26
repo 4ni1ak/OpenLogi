@@ -1338,6 +1338,11 @@ mod tests {
                 .expect("spawn /bin/sh")
         };
         assert!(wait_with_retry(spawn("0"), sh, None));
+        // A successful first run must not run the retry: here it would hang
+        // until the helper timeout, so returning at once proves it was skipped.
+        let started = std::time::Instant::now();
+        assert!(wait_with_retry(spawn("0"), sh, Some(&["-c", "sleep 10"])));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(!wait_with_retry(spawn("7"), sh, None));
         assert!(wait_with_retry(spawn("7"), sh, Some(&["-c", "exit 0"])));
         assert!(!wait_with_retry(spawn("7"), sh, Some(&["-c", "exit 7"])));
