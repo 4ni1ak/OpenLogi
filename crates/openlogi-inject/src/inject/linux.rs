@@ -263,6 +263,9 @@ const HELPER_PREFIXES: [&str; 2] = ["/usr/bin", "/usr/local/bin"];
 struct HelperSpec {
     program: &'static str,
     args: &'static [&'static str],
+    /// Arguments to run the same program with once more when `args` exits
+    /// unsuccessfully, before the keyboard fallback.
+    retry_args: Option<&'static [&'static str]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +280,7 @@ fn hyprland_helper(native: NativeAction) -> Option<(HelperSpec, ChordSpec)> {
             HelperSpec {
                 program: "omarchy-menu",
                 args: &["toggle"],
+                retry_args: None,
             },
             ChordSpec {
                 modifiers: &[KeyCode::KEY_LEFTMETA],
@@ -287,6 +291,9 @@ fn hyprland_helper(native: NativeAction) -> Option<(HelperSpec, ChordSpec)> {
             HelperSpec {
                 program: "hyprctl",
                 args: &["dispatch", "workspace", "e+1"],
+                // A Lua config evaluates `dispatch`'s argument as Lua, so the
+                // hyprlang form above fails there.
+                retry_args: Some(&["dispatch", r#"hl.dsp.focus({ workspace = "e+1" })"#]),
             },
             ChordSpec {
                 modifiers: &[KeyCode::KEY_LEFTMETA],
@@ -297,6 +304,9 @@ fn hyprland_helper(native: NativeAction) -> Option<(HelperSpec, ChordSpec)> {
             HelperSpec {
                 program: "hyprctl",
                 args: &["dispatch", "workspace", "e-1"],
+                // A Lua config evaluates `dispatch`'s argument as Lua, so the
+                // hyprlang form above fails there.
+                retry_args: Some(&["dispatch", r#"hl.dsp.focus({ workspace = "e-1" })"#]),
             },
             ChordSpec {
                 modifiers: &[KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTSHIFT],
@@ -311,6 +321,7 @@ fn hyprland_lock_helper() -> HelperSpec {
     HelperSpec {
         program: "omarchy-system-lock",
         args: &[],
+        retry_args: None,
     }
 }
 
@@ -329,7 +340,7 @@ fn generic_linux_lock_fallback_chord() -> ChordSpec {
 }
 
 fn run_helper_or_chord(helper: HelperSpec, fallback: ChordSpec) {
-    if run_fixed_argv(helper.program, helper.args, fallback) {
+    if run_fixed_argv(helper, fallback) {
         return;
     }
     press_key(fallback.modifiers, fallback.key);
@@ -339,7 +350,8 @@ fn run_helper_or_chord(helper: HelperSpec, fallback: ChordSpec) {
 /// shells out through `/bin/sh -c` (that path is only for user
 /// `RunShellCommand`). A concurrent request uses its keyboard fallback instead
 /// of creating another process.
-fn run_fixed_argv(program: &str, args: &[&str], fallback: ChordSpec) -> bool {
+fn run_fixed_argv(helper: HelperSpec, fallback: ChordSpec) -> bool {
+    let program = helper.program;
     let Some(path) = resolve_allowlisted(program) else {
         tracing::debug!(
             program,
@@ -354,9 +366,14 @@ fn run_fixed_argv(program: &str, args: &[&str], fallback: ChordSpec) -> bool {
         );
         return false;
     }
-    match Command::new(&path).args(args).spawn() {
+    match Command::new(&path).args(helper.args).spawn() {
         Ok(child) => {
-            std::thread::spawn(move || wait_for_helper(child, fallback));
+            std::thread::spawn(move || {
+                if !wait_with_retry(child, &path, helper.retry_args) {
+                    press_key(fallback.modifiers, fallback.key);
+                }
+                HELPER_IN_FLIGHT.store(false, Ordering::Release);
+            });
             true
         }
         Err(error) => {
@@ -374,20 +391,34 @@ fn run_fixed_argv(program: &str, args: &[&str], fallback: ChordSpec) -> bool {
 const HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 static HELPER_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-fn wait_for_helper(mut child: Child, fallback: ChordSpec) {
+/// Wait for `child`; when it fails, run `path` once more with `retry_args`.
+/// `true` when either run succeeded.
+fn wait_with_retry(child: Child, path: &Path, retry_args: Option<&[&str]>) -> bool {
+    wait_for_helper(child)
+        || retry_args.is_some_and(|args| {
+            Command::new(path)
+                .args(args)
+                .spawn()
+                .is_ok_and(wait_for_helper)
+        })
+}
+
+/// Wait for one helper run; `false` when it failed, timed out, or could not be
+/// waited on.
+fn wait_for_helper(mut child: Child) -> bool {
     let deadline = Instant::now() + HELPER_TIMEOUT;
-    let succeeded = loop {
+    loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break true,
             Ok(Some(status)) => {
                 tracing::debug!(
                     %status,
-                    "Hyprland helper exited unsuccessfully — using chord fallback"
+                    "Hyprland helper exited unsuccessfully"
                 );
                 break false;
             }
             Ok(None) if Instant::now() >= deadline => {
-                tracing::warn!("Hyprland helper timed out — using chord fallback");
+                tracing::warn!("Hyprland helper timed out");
                 let _ = child.kill();
                 let _ = child.wait();
                 break false;
@@ -396,18 +427,14 @@ fn wait_for_helper(mut child: Child, fallback: ChordSpec) {
             Err(error) => {
                 tracing::warn!(
                     %error,
-                    "failed while waiting for Hyprland helper — using chord fallback"
+                    "failed while waiting for Hyprland helper"
                 );
                 let _ = child.kill();
                 let _ = child.wait();
                 break false;
             }
         }
-    };
-    if !succeeded {
-        press_key(fallback.modifiers, fallback.key);
     }
-    HELPER_IN_FLIGHT.store(false, Ordering::Release);
 }
 
 fn resolve_allowlisted(name: &str) -> Option<PathBuf> {
@@ -1140,6 +1167,9 @@ fn try_mpris_command(command: &str) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::process::Command;
+
     use evdev::{KeyCode, RelativeAxisCode};
     use openlogi_core::binding::{KeyCombo, NativeAction, Shortcut};
 
@@ -1148,7 +1178,7 @@ mod tests {
         generic_linux_lock_fallback_chord, hid_usage_to_linux, hyprland_helper,
         hyprland_lock_fallback_chord, hyprland_lock_helper, hyprland_session_from_signature,
         key_ev, key_phase_events, modifiers_to_keycodes, rel_ev, resolve_allowlisted_under,
-        scroll_events, syn,
+        scroll_events, syn, wait_with_retry,
     };
     use crate::inject::KeyPhase;
 
@@ -1276,6 +1306,10 @@ mod tests {
             .expect("NextDesktop must have a Hyprland helper");
         assert_eq!(next.program, "hyprctl");
         assert_eq!(next.args, ["dispatch", "workspace", "e+1"]);
+        assert_eq!(
+            next.retry_args,
+            Some(&["dispatch", r#"hl.dsp.focus({ workspace = "e+1" })"#][..])
+        );
         assert_eq!(next_fallback.modifiers, [KeyCode::KEY_LEFTMETA]);
         assert_eq!(next_fallback.key, KeyCode::KEY_TAB);
 
@@ -1284,10 +1318,29 @@ mod tests {
         assert_eq!(prev.program, "hyprctl");
         assert_eq!(prev.args, ["dispatch", "workspace", "e-1"]);
         assert_eq!(
+            prev.retry_args,
+            Some(&["dispatch", r#"hl.dsp.focus({ workspace = "e-1" })"#][..])
+        );
+        assert_eq!(
             prev_fallback.modifiers,
             [KeyCode::KEY_LEFTMETA, KeyCode::KEY_LEFTSHIFT]
         );
         assert_eq!(prev_fallback.key, KeyCode::KEY_TAB);
+    }
+
+    #[test]
+    fn a_failed_helper_run_is_retried_once_with_its_retry_args() {
+        let sh = Path::new("/bin/sh");
+        let spawn = |code: &str| {
+            Command::new(sh)
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .expect("spawn /bin/sh")
+        };
+        assert!(wait_with_retry(spawn("0"), sh, None));
+        assert!(!wait_with_retry(spawn("7"), sh, None));
+        assert!(wait_with_retry(spawn("7"), sh, Some(&["-c", "exit 0"])));
+        assert!(!wait_with_retry(spawn("7"), sh, Some(&["-c", "exit 7"])));
     }
 
     #[test]
