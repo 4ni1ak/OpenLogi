@@ -190,6 +190,17 @@ impl Config {
         unit_id: [u8; 4],
         capabilities: Option<Capabilities>,
     ) -> bool {
+        // Take the entries being folded in before the route is cleared from
+        // every other entry: the `unit:<id>` entry's link on this route holds
+        // its per-link overrides, and `fold` must see it to keep them.
+        let legacy = (route_key != canonical.as_str())
+            .then(|| self.devices.remove(route_key))
+            .flatten();
+        let unit_key = superseded_unit_key(canonical, unit_id)
+            .filter(|key| self.devices.contains_key(key.as_str()));
+        let unit = unit_key
+            .as_ref()
+            .and_then(|key| self.devices.remove(key.as_str()));
         let mut changed = false;
         // A route names one device at a time. Re-pairing a different unit into
         // a slot must move the index, not leave the slot pointing at both.
@@ -198,19 +209,18 @@ impl Config {
                 changed = true;
             }
         }
-        let legacy = (route_key != canonical.as_str())
-            .then(|| self.devices.remove(route_key))
-            .flatten();
-        let unit_key = superseded_unit_key(canonical, unit_id);
-        let unit = unit_key
-            .as_ref()
-            .and_then(|key| self.devices.remove(key.as_str()));
         let device = self
             .devices
             .entry(canonical.as_str().to_string())
             .or_default();
         if !device.links.contains_key(route_key) {
             changed = true;
+        }
+        let route_folded = legacy.is_some();
+        // Folded before this sighting's link is created, so a link the folded
+        // entry carries is taken rather than shadowed by an empty one.
+        for entry in legacy.into_iter().chain(unit) {
+            fold(device, entry, route_key);
         }
         let link = device.links.entry(route_key.to_string()).or_default();
         // Only a probe that actually answered may overwrite the record, and
@@ -220,20 +230,13 @@ impl Config {
             link.capabilities = capabilities;
             changed = true;
         }
-        if legacy.is_none() && unit.is_none() {
-            return changed;
-        }
-        let route_folded = legacy.is_some();
-        for entry in legacy.into_iter().chain(unit) {
-            fold(device, entry, route_key);
-        }
         if route_folded {
             self.repoint_references(route_key, canonical.as_str());
         }
-        if let Some(unit_key) = unit_key {
+        if let Some(unit_key) = &unit_key {
             self.repoint_references(unit_key.as_str(), canonical.as_str());
         }
-        true
+        changed || route_folded || unit_key.is_some()
     }
 
     /// Rewrite every reference to `old` — the carousel selection and any
@@ -1135,6 +1138,24 @@ mod tests {
             "the unit entry is consumed, not orphaned"
         );
         assert_eq!(config.selected_device.as_deref(), Some("serial:abcd1234"));
+    }
+
+    #[test]
+    fn folding_the_unit_entry_keeps_its_link_override() {
+        let mut config = saved_before_serial();
+        config
+            .devices
+            .get_mut("unit:01020304")
+            .and_then(|device| device.links.get_mut(LATE_ROUTE))
+            .expect("stage 1 indexed the route")
+            .overrides
+            .dpi = Some(Dpi::new(800));
+        let canonical = PhysicalDeviceKey::parse("serial:abcd1234").expect("valid");
+        config.adopt_route(&canonical, LATE_ROUTE, LATE_UNIT, None);
+
+        let device = &config.devices["serial:abcd1234"];
+        assert_eq!(device.dpi, Some(Dpi::new(1600)));
+        assert_eq!(device.links[LATE_ROUTE].overrides.dpi, Some(Dpi::new(800)));
     }
 
     #[test]
