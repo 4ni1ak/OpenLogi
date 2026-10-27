@@ -34,7 +34,8 @@ use openlogi_ipc::PairingFailure;
 use super::AppView;
 use super::status::{loading_body, notice_body};
 use super::widgets::{
-    add_device_button, connectivity_dot, kind_label, route_label, settings_button,
+    add_device_button, connection_summary, connectivity_dot, kind_label, receiver_slot_label,
+    settings_button,
 };
 use crate::features::lighting::visual as light_visual;
 use crate::services::assets::GlowGeometry;
@@ -297,10 +298,15 @@ fn transport_glance(
         connection_summary(record)
     )
     .into();
-    div()
+    h_flex()
         .id((ElementId::from("transport-glance"), record.record_key()))
         .flex_none()
+        .items_center()
+        .gap_1()
         .child(svg().path(path).size_4().flex_none().text_color(color))
+        .when_some(receiver_slot_label(record), |glance, slot| {
+            glance.child(div().text_caption().text_color(pal.text_muted).child(slot))
+        })
         .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
 }
 
@@ -364,6 +370,7 @@ pub(super) fn device_menu(
     // A live device would simply re-register on the next inventory snapshot,
     // so deletion is only offered once it is offline.
     let deletable = record.persistent && !record.online;
+    let has_stale_pairings = !record.stale_pairings.is_empty();
     move |menu, _window, _cx| {
         let menu = menu.item(
             PopupMenuItem::new(tr!("common.rename_dialog"))
@@ -383,6 +390,26 @@ pub(super) fn device_menu(
                     }
                 }),
         );
+        let menu = if has_stale_pairings {
+            menu.item(
+                PopupMenuItem::new(tr!("device.remove_old_pairings_dialog"))
+                    .icon(IconName::Delete)
+                    .on_click({
+                        let record_key = record_key.clone();
+                        let display_name = display_name.clone();
+                        move |_, window, cx| {
+                            open_stale_pairings_confirmation(
+                                window,
+                                cx,
+                                record_key.clone(),
+                                display_name.clone(),
+                            );
+                        }
+                    }),
+            )
+        } else {
+            menu
+        };
         if !deletable {
             return menu;
         }
@@ -440,6 +467,35 @@ fn open_delete_confirmation(window: &mut Window, cx: &mut App, record_key: Strin
     });
 }
 
+/// Confirm before removing the leftover slots folded into a card. Only the
+/// receiver's old pairings go; the device, its card, and its settings stay.
+fn open_stale_pairings_confirmation(
+    window: &mut Window,
+    cx: &mut App,
+    record_key: String,
+    name: String,
+) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        alert
+            .title(tr!("device.remove_old_pairings_confirmation", name => name.clone()))
+            .description(tr!("device.remove_old_pairings_description", name => name.clone()))
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(tr!("device.remove_old_pairings"))
+                    .ok_variant(ButtonVariant::Danger)
+                    .cancel_text(tr!("common.cancel"))
+                    .show_cancel(true),
+            )
+            .on_ok({
+                let record_key = record_key.clone();
+                move |_event, _window, cx| {
+                    AppState::apply(cx, |state| state.remove_stale_pairings(&record_key));
+                    true
+                }
+            })
+    });
+}
+
 /// Say why a device the user asked to forget is still here: its receiver kept
 /// the pairing, so deleting only its settings would bring the card back.
 pub(super) fn open_removal_failed(
@@ -449,6 +505,26 @@ pub(super) fn open_removal_failed(
     failure: &UnpairFailure,
 ) {
     let title = tr!("device.delete_device_failed", name => name.to_string());
+    open_unpair_failed(window, cx, title, failure);
+}
+
+/// Say why a leftover slot the user asked to remove is still paired.
+pub(super) fn open_stale_pairing_removal_failed(
+    window: &mut Window,
+    cx: &mut App,
+    name: &str,
+    failure: &UnpairFailure,
+) {
+    let title = tr!("device.remove_old_pairings_failed", name => name.to_string());
+    open_unpair_failed(window, cx, title, failure);
+}
+
+fn open_unpair_failed(
+    window: &mut Window,
+    cx: &mut App,
+    title: SharedString,
+    failure: &UnpairFailure,
+) {
     let description = match failure {
         UnpairFailure::AgentUnreachable => tr!("agent.cant_reach_the_background_service"),
         UnpairFailure::Refused(PairingFailure::ReceiverBusy) => {
@@ -538,18 +614,6 @@ fn connection_view(
                 .flex_none(),
         )
         .child(div().min_w_0().truncate().child(connection_summary(record)))
-}
-
-fn connection_summary(record: &DeviceRecord) -> String {
-    let route = route_label(record.route.as_ref());
-    if matches!(
-        record.route,
-        Some(DeviceRoute::Bolt { .. } | DeviceRoute::Unifying { .. })
-    ) {
-        format!("{route} · {} {}", tr!("device.channel"), record.slot)
-    } else {
-        route
-    }
 }
 
 /// The device photo, scaled to fit its container (object-fit contain), or a

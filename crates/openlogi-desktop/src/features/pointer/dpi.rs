@@ -1,5 +1,7 @@
 //! Device DPI controls, and the report-rate row below them (see
-//! [`super::report_rate`]).
+//! [`super::report_rate`]). A mouse that scales its pointer with HID++
+//! `0x2205` instead of adjustable DPI gets the pointer-speed row in place of
+//! the DPI controls (see [`super::pointer_speed`]).
 //!
 //! The slider range comes from the selected device's HID++ DPI capability
 //! (`0x2201` AdjustableDpi or `0x2202` ExtendedAdjustableDpi, whichever it
@@ -21,6 +23,7 @@ use gpui_component::{
 use openlogi_core::hid::{Dpi, DpiCapabilities};
 use tracing::debug;
 
+use super::pointer_speed::{PointerSpeedFacts, PointerSpeedSlider, pointer_speed_section};
 use super::report_rate::{ReportRateFacts, report_rate_section};
 use crate::state::{AppState, DeviceKey, DpiLoad, StateEvent};
 use crate::ui::commit_slider::{CommitSlider, SliderRange};
@@ -37,6 +40,8 @@ pub struct DpiPanel {
     /// capability re-reads for the same device since only its displayed text
     /// needs to track those, not its identity.
     numeric: Option<DpiNumericInput>,
+    /// The pointer-speed slider of a mouse without adjustable DPI.
+    pointer_speed: Option<PointerSpeedSlider>,
     _state_obs: Subscription,
 }
 
@@ -81,13 +86,16 @@ impl DpiPanel {
         let state_obs = AppState::repaint_on(cx, |event| {
             matches!(
                 event,
-                StateEvent::DpiChanged(_) | StateEvent::ReportRateChanged(_)
+                StateEvent::DpiChanged(_)
+                    | StateEvent::ReportRateChanged(_)
+                    | StateEvent::PointerSpeedChanged(_)
             )
         });
 
         Self {
             slider: None,
             numeric: None,
+            pointer_speed: None,
             _state_obs: state_obs,
         }
     }
@@ -217,6 +225,27 @@ fn commit_numeric_dpi(input: &Entity<InputState>, cx: &mut Context<DpiPanel>) {
 
 impl Render for DpiPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pal = theme::palette(cx);
+        let main = if let Some(facts) = PointerSpeedFacts::current(cx) {
+            self.slider = None;
+            self.numeric = None;
+            PointerSpeedSlider::sync(&mut self.pointer_speed, &facts, window, cx);
+            pointer_speed_section(facts, self.pointer_speed.as_ref(), pal)
+        } else {
+            self.pointer_speed = None;
+            self.dpi_section(window, cx)
+        };
+        v_flex()
+            .gap_3()
+            .w_full()
+            .child(main)
+            .children(report_rate_section(ReportRateFacts::current(cx), pal))
+    }
+}
+
+impl DpiPanel {
+    /// The DPI value, slider, range and presets.
+    fn dpi_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let snapshot = dpi_panel_snapshot(cx);
         let pal = theme::palette(cx);
 
@@ -313,7 +342,7 @@ impl Render for DpiPanel {
                             .child(add_preset_chip()),
                     ),
             )
-            .children(report_rate_section(ReportRateFacts::current(cx), pal))
+            .into_any_element()
     }
 }
 
@@ -399,7 +428,6 @@ fn slider_element(
         (DpiLoad::Failed(_), _) => retry_line(
             "dpi-retry",
             tr!("pointer.couldnt_read_dpi_click_to_retry"),
-            pal,
             move |cx| {
                 if let Some(key) = &key {
                     AppState::apply(cx, |state| state.retry_dpi_read(key));
