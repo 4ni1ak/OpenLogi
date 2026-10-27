@@ -93,6 +93,14 @@ pub enum MouseButton {
     Back,
     /// Extra "forward" side button (button 5).
     Forward,
+    /// Extra button 6.
+    Button6,
+    /// Extra button 7.
+    Button7,
+    /// Extra button 8.
+    Button8,
+    /// Extra button 9.
+    Button9,
 }
 
 /// A named shortcut whose chord is the same *concept* on every OS but not
@@ -228,6 +236,10 @@ impl Action {
             Action::MiddleClick => Effect::Click(MouseButton::Middle),
             Action::MouseBack => Effect::Click(MouseButton::Back),
             Action::MouseForward => Effect::Click(MouseButton::Forward),
+            Action::MouseButton6 => Effect::Click(MouseButton::Button6),
+            Action::MouseButton7 => Effect::Click(MouseButton::Button7),
+            Action::MouseButton8 => Effect::Click(MouseButton::Button8),
+            Action::MouseButton9 => Effect::Click(MouseButton::Button9),
 
             Action::Copy => Effect::Shortcut(Shortcut::Copy),
             Action::Paste => Effect::Shortcut(Shortcut::Paste),

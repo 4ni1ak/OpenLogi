@@ -27,6 +27,7 @@
 //! # Available actions
 //!
 //! LeftClick RightClick MiddleClick MouseBack MouseForward
+//! MouseButton6 MouseButton7 MouseButton8 MouseButton9 (not on Windows)
 //! Copy Paste Cut Undo Redo SelectAll Find Save
 //! BrowserBack BrowserForward NewTab CloseTab ReopenTab NextTab PrevTab ReloadPage
 //! MissionControl AppExpose PreviousDesktop NextDesktop ShowDesktop LaunchpadShow

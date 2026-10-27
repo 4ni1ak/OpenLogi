@@ -112,7 +112,7 @@ fn representative_smartshift_status() -> SmartShiftStatus {
 /// unreleased version and leave this pin alone (`crates/openlogi-ipc/AGENTS.md`).
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 41);
+    assert_eq!(PROTOCOL_VERSION, 42);
 }
 
 #[test]
@@ -1150,6 +1150,17 @@ fn pointer_speed_and_precision_mode() {
     );
     // Appended at the end of `Action`, so every earlier index is unchanged.
     assert_wire(&Action::TogglePrecisionMode, "36");
+}
+
+/// Mouse buttons 6-9 are appended after `TogglePrecisionMode`, not beside
+/// `MouseForward`, so no earlier action index moves.
+#[test]
+fn extra_mouse_button_actions() {
+    use openlogi_core::binding::Action;
+    assert_wire(&Action::MouseButton6, "37");
+    assert_wire(&Action::MouseButton7, "38");
+    assert_wire(&Action::MouseButton8, "39");
+    assert_wire(&Action::MouseButton9, "3a");
 }
 
 /// The press force of a force-sensing button (the MX Master 4's Haptic Sense

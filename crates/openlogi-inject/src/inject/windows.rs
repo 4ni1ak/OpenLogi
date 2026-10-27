@@ -212,6 +212,18 @@ fn post_click(button: MouseButton) {
         // Extra buttons share the X flag pair; mouseData carries which one.
         MouseButton::Back => (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, i32::from(XBUTTON1)),
         MouseButton::Forward => (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, i32::from(XBUTTON2)),
+        // SendInput carries flags for buttons 1-5 only; the picker hides 6-9
+        // here, so only a hand-edited config reaches this.
+        MouseButton::Button6
+        | MouseButton::Button7
+        | MouseButton::Button8
+        | MouseButton::Button9 => {
+            tracing::debug!(
+                ?button,
+                "mouse buttons past 5 cannot be synthesized on Windows"
+            );
+            return;
+        }
     };
     send_inputs(&[mouse_input(down, data), mouse_input(up, data)]);
 }

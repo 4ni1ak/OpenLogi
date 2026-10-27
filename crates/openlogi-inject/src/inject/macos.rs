@@ -146,6 +146,10 @@ fn dispatch_click(button: MouseButton) {
         // "button 5").
         MouseButton::Back => post_other_button(3),
         MouseButton::Forward => post_other_button(4),
+        MouseButton::Button6 => post_other_button(5),
+        MouseButton::Button7 => post_other_button(6),
+        MouseButton::Button8 => post_other_button(7),
+        MouseButton::Button9 => post_other_button(8),
     }
 }
 

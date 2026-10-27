@@ -61,7 +61,11 @@ pub(crate) fn action_icon_path(action: &Action) -> &'static str {
     match action {
         Action::None => "action-icons/ban.svg",
         Action::LeftClick | Action::RightClick => "action-icons/mouse-pointer-click.svg",
-        Action::MiddleClick => "action-icons/mouse.svg",
+        Action::MiddleClick
+        | Action::MouseButton6
+        | Action::MouseButton7
+        | Action::MouseButton8
+        | Action::MouseButton9 => "action-icons/mouse.svg",
         Action::MouseBack => "action-icons/circle-arrow-left.svg",
         Action::MouseForward => "action-icons/circle-arrow-right.svg",
         Action::Copy => "action-icons/copy.svg",

@@ -60,6 +60,9 @@ pub(super) fn execute(action: &Action) {
     }
 }
 
+/// The evdev code after `BTN_TASK`, emitted for extra mouse button 9.
+const BTN_9: KeyCode = KeyCode::new(0x118);
+
 fn mouse_button_code(button: MouseButton) -> KeyCode {
     match button {
         MouseButton::Left => KeyCode::BTN_LEFT,
@@ -67,6 +70,13 @@ fn mouse_button_code(button: MouseButton) -> KeyCode {
         MouseButton::Middle => KeyCode::BTN_MIDDLE,
         MouseButton::Back => KeyCode::BTN_SIDE,
         MouseButton::Forward => KeyCode::BTN_EXTRA,
+        // The evdev mouse-button codes after BTN_EXTRA, in order, so X11
+        // (libinput: BTN_SIDE + n -> button 8 + n) sees a contiguous run.
+        // 0x118 has no named constant but is still in the BTN_MOUSE range.
+        MouseButton::Button6 => KeyCode::BTN_FORWARD,
+        MouseButton::Button7 => KeyCode::BTN_BACK,
+        MouseButton::Button8 => KeyCode::BTN_TASK,
+        MouseButton::Button9 => BTN_9,
     }
 }
 
@@ -562,10 +572,11 @@ const KEY_CAPABILITIES: &[KeyCode] = &[
     // Multimedia
     KeyCode::KEY_PLAYPAUSE, KeyCode::KEY_NEXTSONG, KeyCode::KEY_PREVIOUSSONG,
     KeyCode::KEY_VOLUMEUP,  KeyCode::KEY_VOLUMEDOWN, KeyCode::KEY_MUTE,
-    // Mouse buttons (injected as EV_KEY with BTN_* codes). The side pair
+    // Mouse buttons (injected as EV_KEY with BTN_* codes). The extra buttons
     // must be registered here or the kernel silently drops their events.
     KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE,
-    KeyCode::BTN_SIDE, KeyCode::BTN_EXTRA,
+    KeyCode::BTN_SIDE, KeyCode::BTN_EXTRA, KeyCode::BTN_FORWARD,
+    KeyCode::BTN_BACK, KeyCode::BTN_TASK,  BTN_9,
 ];
 
 fn build() -> io::Result<VirtualDevice> {

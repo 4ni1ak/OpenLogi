@@ -422,6 +422,8 @@ fn persisted_action_variant_names_are_stable() {
             },
         )
         .collect();
+    // Absent from the Windows catalog; pinned in their own test instead.
+    actual.retain(|name| !name.starts_with("MouseButton"));
     actual.sort();
     let mut expected = [
         "AppExpose",
@@ -543,6 +545,48 @@ fn category_mouse_variants() {
     assert_eq!(Action::LeftClick.category(), Category::Mouse);
     assert_eq!(Action::RightClick.category(), Category::Mouse);
     assert_eq!(Action::MiddleClick.category(), Category::Mouse);
+    for action in [
+        Action::MouseButton6,
+        Action::MouseButton7,
+        Action::MouseButton8,
+        Action::MouseButton9,
+    ] {
+        assert_eq!(action.category(), Category::Mouse);
+    }
+}
+
+#[test]
+fn extra_mouse_buttons_roundtrip_toml_as_bare_names() {
+    let toml = "bindings.Back = \"MouseButton6\"\nbindings.Forward = { Click = \"MouseButton9\" }";
+    let parsed = toml::from_str::<BindingWrapper>(toml).expect("deserialize");
+    assert_eq!(
+        parsed.bindings[&ButtonId::Back],
+        Binding::Single(Action::MouseButton6)
+    );
+    assert_eq!(
+        parsed.bindings[&ButtonId::Forward],
+        Binding::Gesture(BTreeMap::from([(
+            GestureDirection::Click,
+            Action::MouseButton9
+        )]))
+    );
+    for (name, action) in [
+        ("MouseButton6", Action::MouseButton6),
+        ("MouseButton7", Action::MouseButton7),
+        ("MouseButton8", Action::MouseButton8),
+        ("MouseButton9", Action::MouseButton9),
+    ] {
+        assert_eq!(
+            toml::Value::try_from(&action).expect("serialize action"),
+            toml::Value::String(name.into())
+        );
+        assert_eq!(roundtrip(&action), action);
+    }
+    // Windows has no way to emit them, so only its picker omits them.
+    assert_eq!(
+        Action::catalog().contains(&Action::MouseButton6),
+        !cfg!(target_os = "windows")
+    );
 }
 
 #[test]

@@ -219,6 +219,20 @@ pub enum Action {
     /// returns to the sensor's default DPI. A DPI LED (HID++ `0x1300`) is
     /// lit while the mode is on. Does nothing on other devices.
     TogglePrecisionMode,
+
+    // ── Mouse (appended) ─────────────────────────────────────────────────────
+    /// Extra mouse button 6, emitted as the real button event for apps that
+    /// bind it (CAD, games, Blender). Appended rather than placed beside
+    /// [`Action::MouseForward`] because the variant index is the IPC wire
+    /// format. macOS and Linux only: Windows `SendInput` has no flag for a
+    /// button past 5, so the picker hides these there.
+    MouseButton6,
+    /// Extra mouse button 7; see [`Action::MouseButton6`].
+    MouseButton7,
+    /// Extra mouse button 8; see [`Action::MouseButton6`].
+    MouseButton8,
+    /// Extra mouse button 9; see [`Action::MouseButton6`].
+    MouseButton9,
 }
 
 /// Which of a held chord's keys stay down for the lifetime of the press.
@@ -263,7 +277,8 @@ pub enum WorkflowStep {
 /// X-macro table of every payload-free [`Action`] variant.
 ///
 /// Each row is `Variant "Label" "i18n.key" Category Icon`, optionally followed
-/// by `not_pickable` for a row [`Action::catalog`] must omit. This is the single
+/// by `not_pickable` for a row [`Action::catalog`] must omit, or
+/// `not_on_windows` for a row it omits on Windows only. This is the single
 /// place a plain action is declared; payload-carrying variants (`SetDpiPreset`,
 /// `CustomShortcut`, …) build their label/category/icon from their payload and
 /// keep hand-written arms alongside the generated ones instead.
@@ -285,6 +300,10 @@ macro_rules! for_each_unit_action {
             MiddleClick "Middle Click" "actions.middle_click" Mouse Mouse,
             MouseBack "Back (Button 4)" "actions.back_button_4" Mouse MouseBack,
             MouseForward "Forward (Button 5)" "actions.forward_button_5" Mouse MouseForward,
+            MouseButton6 "Button 6" "actions.button_6" Mouse Mouse not_on_windows,
+            MouseButton7 "Button 7" "actions.button_7" Mouse Mouse not_on_windows,
+            MouseButton8 "Button 8" "actions.button_8" Mouse Mouse not_on_windows,
+            MouseButton9 "Button 9" "actions.button_9" Mouse Mouse not_on_windows,
             // Editing
             Copy "Copy" "common.copy" Editing Copy,
             Paste "Paste" "common.paste" Editing Paste,
@@ -443,6 +462,9 @@ macro_rules! derive_action_core {
     };
     (@item $variant:ident not_pickable) => {
         None
+    };
+    (@item $variant:ident not_on_windows) => {
+        (!cfg!(target_os = "windows")).then_some(Action::$variant)
     };
 }
 
