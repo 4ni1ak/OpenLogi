@@ -208,12 +208,14 @@ pub struct Capabilities {
     /// `force_sensing`: crosses the IPC and the persisted identity.
     #[serde(default)]
     pub disable_keys: bool,
-    /// A divertable dedicated gesture button (`0x00c3`, or the M720's
-    /// multiplatform `0x00d0`) was found in the device's `0x1b04` control
-    /// table. Appended after `disable_keys`: crosses the IPC and the
-    /// persisted identity.
+    /// Whether the device's `0x1b04` control table lists a divertable
+    /// dedicated gesture button (`0x00c3`, or the M720's multiplatform
+    /// `0x00d0`). `None` until a complete control walk answers, including for
+    /// data saved before this field existed, so only a measured `Some(false)`
+    /// hides the button. Appended after `disable_keys`: crosses the IPC and
+    /// the persisted identity.
     #[serde(default)]
-    pub gesture_button: bool,
+    pub gesture_button: Option<bool>,
 }
 
 impl Capabilities {
@@ -255,7 +257,7 @@ impl Capabilities {
             force_sensing: ids.contains(&0x19c0),
             disable_keys: ids.contains(&0x4521),
             // Set by the `0x1b04` control walk.
-            gesture_button: false,
+            gesture_button: None,
         }
     }
 
@@ -270,7 +272,6 @@ impl Capabilities {
             DeviceKind::Mouse | DeviceKind::Trackball => Self {
                 buttons: true,
                 pointer: true,
-                gesture_button: true,
                 ..Self::default()
             },
             DeviceKind::Keyboard => Self {
@@ -774,7 +775,7 @@ mod tests {
                     pointer_scaling: false,
                     force_sensing: false,
                     disable_keys: false,
-                    gesture_button: false,
+                    gesture_button: None,
                 }),
                 settings_revision: 0,
             }],
@@ -896,7 +897,7 @@ mod tests {
                 pointer_scaling: false,
                 force_sensing: false,
                 disable_keys: false,
-                gesture_button: false,
+                gesture_button: None,
             }
         );
         assert!(!Capabilities::from_feature_ids(&[0x0003, 0x1b04]).thumbwheel);
@@ -923,7 +924,7 @@ mod tests {
                 pointer_scaling: false,
                 force_sensing: false,
                 disable_keys: false,
-                gesture_button: false,
+                gesture_button: None,
             }
         );
         // No driving features → nothing offered.

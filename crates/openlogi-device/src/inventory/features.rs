@@ -563,7 +563,7 @@ async fn probe_extra_capabilities(
         caps.haptic_panel = haptic_panel;
         caps.dpi_gestures = dpi_gestures;
         caps.virtual_thumbwheel = virtual_thumbwheel;
-        caps.gesture_button = gesture_button;
+        caps.gesture_button = Some(gesture_button);
     }
     force_sensing_read
 }
@@ -729,7 +729,7 @@ mod tests {
                 assert!(!probe.capabilities_incomplete);
                 assert_eq!(
                     caps.gesture_button,
-                    divertable && cid != 0x00c4,
+                    Some(divertable && cid != 0x00c4),
                     "CID {cid:04x}, flags {flags:04x}"
                 );
             }

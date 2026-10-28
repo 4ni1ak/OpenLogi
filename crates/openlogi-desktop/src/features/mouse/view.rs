@@ -513,7 +513,7 @@ fn model_layout(
         target_h,
         max_image_w,
         capabilities.thumbwheel,
-        capabilities.gesture_button,
+        capabilities.gesture_button != Some(false),
         label_distribution,
     );
     if !has_labels {
