@@ -16,7 +16,7 @@
 
 use std::rc::Rc;
 
-use super::function_row::{FunctionRowView, KeyTarget, commit_key_action};
+use super::function_row::{FunctionRowView, KeyTarget, bound_action, commit_key_action};
 use crate::features::binding_editor::{
     PickFn, application_editor, compact_panel, divider, editor_scroll_list, title,
 };
@@ -152,7 +152,10 @@ fn application_editor_card(
     let key_name = target.label();
     let view_pick = view.clone();
     let on_pick: PickFn = Rc::new(move |action, _window, cx| {
-        AppState::apply(cx, |state| commit_key_action(state, &target, Some(action)));
+        AppState::apply(cx, |state| {
+            let action = keep_application_name(bound_action(state, &target), action);
+            commit_key_action(state, &target, Some(action))
+        });
         view_pick.update(cx, |v, vcx| v.close_editor(vcx));
     });
     let view_invalid = view.clone();
@@ -191,6 +194,19 @@ fn application_editor_card(
                     ),
                 ),
         )
+}
+
+/// The shared editor only knows the path, so re-adding the bound path would
+/// drop the target's saved display name. Keep the bound target in that case.
+fn keep_application_name(bound: Option<Action>, picked: Action) -> Action {
+    match (bound, &picked) {
+        (Some(Action::OpenApplication(bound)), Action::OpenApplication(target))
+            if bound.path() == target.path() =>
+        {
+            Action::OpenApplication(bound)
+        }
+        _ => picked,
+    }
 }
 
 /// Cancel (back to list) + Save (commit the drafted text).

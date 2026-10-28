@@ -495,6 +495,18 @@ fn open_application_editor_binds_the_selected_key(cx: &mut gpui::TestAppContext)
         );
     });
 
+    // Re-adding the unchanged path keeps a saved display name.
+    let named = Action::OpenApplication(
+        ApplicationTarget::new("/Applications/Calculator.app", "Calculator").expect("valid"),
+    );
+    cx.update(|_, cx| {
+        AppState::apply(cx, |state| {
+            commit_key_action(state, &f1, Some(named.clone()))
+        });
+    });
+    click(cx, "key-editor-custom-application-add");
+    assert_eq!(f1_binding(cx, &f1), Some(named));
+
     drop(view);
     cx.update(|window, _| window.remove_window());
     cx.run_until_parked();

@@ -316,7 +316,7 @@ struct KeySlot {
 /// The action `target` is bound to in the selected device's open profile
 /// (a control) or the global F-row map (a function key). `None` when the key
 /// is on its native function.
-fn bound_action(state: &AppState, target: &KeyTarget) -> Option<Action> {
+pub(super) fn bound_action(state: &AppState, target: &KeyTarget) -> Option<Action> {
     match target {
         KeyTarget::Control(button) => state
             .button_bindings()
