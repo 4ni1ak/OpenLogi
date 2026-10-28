@@ -208,6 +208,12 @@ pub struct Capabilities {
     /// `force_sensing`: crosses the IPC and the persisted identity.
     #[serde(default)]
     pub disable_keys: bool,
+    /// A divertable dedicated gesture button (`0x00c3`, or the M720's
+    /// multiplatform `0x00d0`) was found in the device's `0x1b04` control
+    /// table. Appended after `disable_keys`: crosses the IPC and the
+    /// persisted identity.
+    #[serde(default)]
+    pub gesture_button: bool,
 }
 
 impl Capabilities {
@@ -248,6 +254,8 @@ impl Capabilities {
             // force; the feature table alone cannot say.
             force_sensing: ids.contains(&0x19c0),
             disable_keys: ids.contains(&0x4521),
+            // Set by the `0x1b04` control walk.
+            gesture_button: false,
         }
     }
 
@@ -262,6 +270,7 @@ impl Capabilities {
             DeviceKind::Mouse | DeviceKind::Trackball => Self {
                 buttons: true,
                 pointer: true,
+                gesture_button: true,
                 ..Self::default()
             },
             DeviceKind::Keyboard => Self {
@@ -765,6 +774,7 @@ mod tests {
                     pointer_scaling: false,
                     force_sensing: false,
                     disable_keys: false,
+                    gesture_button: false,
                 }),
                 settings_revision: 0,
             }],
@@ -886,6 +896,7 @@ mod tests {
                 pointer_scaling: false,
                 force_sensing: false,
                 disable_keys: false,
+                gesture_button: false,
             }
         );
         assert!(!Capabilities::from_feature_ids(&[0x0003, 0x1b04]).thumbwheel);
@@ -912,6 +923,7 @@ mod tests {
                 pointer_scaling: false,
                 force_sensing: false,
                 disable_keys: false,
+                gesture_button: false,
             }
         );
         // No driving features → nothing offered.
