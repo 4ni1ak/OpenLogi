@@ -1,6 +1,9 @@
 //! The controls panel's hardware boundary. Tests substitute the UVC transfers,
 //! not the panel's load lifecycle, rows, or persistence.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
 use openlogi_camera::{AutoToggle, CameraControl, CameraState, ControlError};
 use tracing::debug;
 
@@ -50,6 +53,60 @@ impl Uvc for SystemUvc {
     }
 }
 
+/// The panel's single path to the camera's writes. Every write holds `lock`,
+/// and so does a background load from its cancellation check through its
+/// re-apply, so a superseded load cannot land a write after a newer edit.
+pub(super) struct Hardware {
+    uvc: Arc<dyn Uvc>,
+    lock: Mutex<()>,
+}
+
+impl Hardware {
+    pub(super) fn new(uvc: Arc<dyn Uvc>) -> Self {
+        Self {
+            uvc,
+            lock: Mutex::new(()),
+        }
+    }
+
+    pub(super) fn apply_settings(
+        &self,
+        uid: &str,
+        autos: &[(AutoToggle, bool)],
+        values: &[(CameraControl, i32)],
+    ) -> Result<(), ControlError> {
+        let _writing = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.uvc.apply_settings(uid, autos, values)
+    }
+
+    pub(super) fn set_control(
+        &self,
+        uid: &str,
+        control: CameraControl,
+        value: i32,
+    ) -> Result<(), ControlError> {
+        let _writing = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.uvc.set_control(uid, control, value)
+    }
+}
+
+/// Set when the panel drops the load that owns it: the camera changed, or the
+/// panel went away. The load checks it before writing.
+#[derive(Default)]
+pub(super) struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub(super) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// The settings saved for a camera, gathered on the UI thread so the load can
 /// run without touching `AppState`.
 #[derive(Default)]
@@ -95,7 +152,11 @@ pub(super) struct Loaded {
 /// between states and the pre-write snapshot untrustworthy: the device is
 /// re-read, and a re-read that also fails yields no state rather than the stale
 /// pre-write one.
-pub(super) fn load(uvc: &dyn Uvc, uid: &str, saved: &Saved) -> Loaded {
+///
+/// A load whose `canceled` flag is set by the time it would write returns
+/// without writing; nothing reads its result.
+pub(super) fn load(hw: &Hardware, uid: &str, saved: &Saved, canceled: &AtomicBool) -> Loaded {
+    let uvc = hw.uvc.as_ref();
     let Ok(mut state) = uvc.read_camera_state(uid) else {
         debug!("camera state read failed");
         return Loaded {
@@ -130,6 +191,13 @@ pub(super) fn load(uvc: &dyn Uvc, uid: &str, saved: &Saved) -> Loaded {
     if apply_autos.is_empty() && apply_values.is_empty() {
         return Loaded {
             state: Some(state),
+            reapply_failed: false,
+        };
+    }
+    let _writing = hw.lock.lock().unwrap_or_else(PoisonError::into_inner);
+    if canceled.load(Ordering::Acquire) {
+        return Loaded {
+            state: None,
             reapply_failed: false,
         };
     }

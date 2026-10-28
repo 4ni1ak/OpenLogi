@@ -33,7 +33,7 @@ mod hardware;
 mod rows;
 #[cfg(test)]
 mod tests;
-use hardware::{Loaded, Saved, SystemUvc, Uvc};
+use hardware::{Cancel, Hardware, Loaded, Saved, SystemUvc, Uvc};
 use rows::{
     control_label, control_row, from_slider, profiles_row, reset_button, section_indices, to_slider,
 };
@@ -79,7 +79,7 @@ struct BuiltinProfile {
 }
 
 pub struct CameraControlsPanel {
-    uvc: Arc<dyn Uvc>,
+    hw: Arc<Hardware>,
     /// Persistence key (`camera:vid:pid:serial:…` or legacy `camera-<uid>`)
     /// the rows were built for; `None` until a load lands.
     key: Option<String>,
@@ -133,6 +133,8 @@ struct Pending {
     uid: String,
     /// `true` while the read runs; `false` while waiting out [`RETRY_INTERVAL`].
     reading: bool,
+    /// Stops a superseded load's re-apply from writing after newer edits.
+    _cancel: Cancel,
     _task: Task<()>,
 }
 
@@ -149,7 +151,7 @@ impl CameraControlsPanel {
             )
         });
         Self {
-            uvc,
+            hw: Arc::new(Hardware::new(uvc)),
             key: None,
             uid: None,
             pending: None,
@@ -203,12 +205,14 @@ impl CameraControlsPanel {
                 .filter_map(|c| state.camera_control(key, c).map(|v| (c, v)))
                 .collect(),
         });
-        let uvc = self.uvc.clone();
+        let hw = self.hw.clone();
         let read_uid = uid.to_string();
+        let cancel = Cancel::default();
+        let canceled = cancel.flag();
         let task = cx.spawn(async move |panel, cx| {
             let loaded = cx
                 .background_executor()
-                .spawn(async move { hardware::load(uvc.as_ref(), &read_uid, &saved) })
+                .spawn(async move { hardware::load(&hw, &read_uid, &saved, &canceled) })
                 .await;
             panel
                 .update(cx, |panel, cx| panel.finish_load(loaded, cx))
@@ -218,6 +222,7 @@ impl CameraControlsPanel {
             key: key.to_string(),
             uid: uid.to_string(),
             reading: true,
+            _cancel: cancel,
             _task: task,
         });
     }
@@ -250,6 +255,7 @@ impl CameraControlsPanel {
                 key,
                 uid,
                 reading: false,
+                _cancel: Cancel::default(),
                 _task: task,
             });
             cx.notify();
@@ -321,9 +327,9 @@ impl CameraControlsPanel {
         });
         let written = match takeover {
             Some((toggle, _)) => self
-                .uvc
+                .hw
                 .apply_settings(uid, &[(toggle, false)], &[(control, v)]),
-            None => self.uvc.set_control(uid, control, v),
+            None => self.hw.set_control(uid, control, v),
         };
         if let Err(e) = written {
             debug!(?control, value = v, error = %e, "camera control write failed");
@@ -458,7 +464,7 @@ impl CameraControlsPanel {
         {
             values.push((slider.control, slider.value(cx)));
         }
-        if let Err(e) = self.uvc.apply_settings(&uid, &[(toggle, on)], &values) {
+        if let Err(e) = self.hw.apply_settings(&uid, &[(toggle, on)], &values) {
             debug!(?toggle, on, error = %e, "camera auto write failed");
             // Turning auto off batches the slider value, so a partial write can
             // land the mode but not the value; resync from live hardware.
@@ -489,7 +495,7 @@ impl CameraControlsPanel {
             .iter()
             .map(|s| (s.control, s.range.default))
             .collect();
-        if let Err(e) = self.uvc.apply_settings(&uid, &autos, &values) {
+        if let Err(e) = self.hw.apply_settings(&uid, &autos, &values) {
             debug!(error = %e, "camera reset failed");
             // Partial writes may have landed; rebuild from live hardware
             // rather than persisting a mixed reset.
@@ -540,7 +546,7 @@ impl CameraControlsPanel {
             autos.push((toggle, self.autos[pos].default));
             Some(pos)
         });
-        if let Err(e) = self.uvc.apply_settings(&uid, &autos, &[(control, default)]) {
+        if let Err(e) = self.hw.apply_settings(&uid, &autos, &[(control, default)]) {
             debug!(?control, value = default, error = %e, "camera control reset failed");
             // Auto default + value default aren't atomic; resync from live
             // hardware so a partial reset can't desync the row.
@@ -625,7 +631,7 @@ impl CameraControlsPanel {
             return;
         }
 
-        if let Err(e) = self.uvc.apply_settings(&uid, &autos, &values) {
+        if let Err(e) = self.hw.apply_settings(&uid, &autos, &values) {
             debug!(profile = id, error = %e, "camera profile apply failed");
             // Some writes may have landed; resync from live state and drop the
             // active profile so a later edit can't persist a half-applied one.

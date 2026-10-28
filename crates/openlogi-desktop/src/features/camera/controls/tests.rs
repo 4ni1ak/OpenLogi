@@ -309,3 +309,21 @@ fn a_failed_write_rebuilds_from_a_fresh_background_read(cx: &mut TestAppContext)
     cx.run_until_parked();
     assert_eq!(shown(&view, cx)[2], ("ExposureAuto".into(), 0));
 }
+
+#[test]
+fn a_canceled_load_does_not_write_its_saved_settings() {
+    use std::sync::atomic::AtomicBool;
+
+    let uvc = Arc::new(FakeUvc::default());
+    uvc.queue(brio(100, 500, false));
+    let hw = Hardware::new(uvc.clone());
+    let saved = Saved {
+        autos: Vec::new(),
+        values: vec![(CameraControl::Brightness, 200)],
+    };
+
+    let loaded = hardware::load(&hw, UID, &saved, &AtomicBool::new(true));
+
+    assert!(loaded.state.is_none());
+    assert_eq!(uvc.calls(), vec![format!("read {UID}")]);
+}
