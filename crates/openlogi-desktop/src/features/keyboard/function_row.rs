@@ -94,6 +94,8 @@ pub struct FunctionRowView {
     text_state: Option<Entity<InputState>>,
     /// Draft copy of the Workflow steps under edit.
     workflow_draft: Vec<WorkflowStep>,
+    /// Whether the Open Application editor rejected a blank path.
+    application_invalid: bool,
     _state_obs: Subscription,
 }
 
@@ -108,6 +110,7 @@ impl FunctionRowView {
             active_editor: None,
             text_state: None,
             workflow_draft: Vec::new(),
+            application_invalid: false,
             _state_obs: state_obs,
         }
     }
@@ -119,6 +122,7 @@ impl FunctionRowView {
             self.active_editor = None;
             self.text_state = None;
             self.workflow_draft.clear();
+            self.application_invalid = false;
         }
         self.selected_key = idx;
         cx.notify();
@@ -141,6 +145,7 @@ impl FunctionRowView {
         self.active_editor = Some(kind);
         self.text_state = None;
         self.workflow_draft.clear();
+        self.application_invalid = false;
         cx.notify();
     }
 
@@ -148,6 +153,12 @@ impl FunctionRowView {
         self.active_editor = None;
         self.text_state = None;
         self.workflow_draft.clear();
+        self.application_invalid = false;
+        cx.notify();
+    }
+
+    pub(crate) fn mark_application_invalid(&mut self, cx: &mut Context<Self>) {
+        self.application_invalid = true;
         cx.notify();
     }
 
@@ -227,6 +238,7 @@ impl Render for FunctionRowView {
             self.active_editor = None;
             self.text_state = None;
             self.workflow_draft.clear();
+            self.application_invalid = false;
         }
         let selected = self.selected_key;
         let hovered = self.hovered_key;
@@ -791,6 +803,7 @@ impl FunctionRowView {
                 kind,
                 self.text_state.clone(),
                 self.workflow_draft.clone(),
+                self.application_invalid,
                 view,
                 pal,
             );
@@ -903,6 +916,11 @@ fn panel_action_rows(
 
     let power_user_actions: &[(PowerUserKind, SharedString, &'static str)] = &[
         (
+            PowerUserKind::OpenApplication,
+            tr!("action_ring.open_application_or_folder"),
+            "action-icons/grid-3x3.svg",
+        ),
+        (
             PowerUserKind::TypeText,
             tr!("actions.type_text"),
             "action-icons/keyboard.svg",
@@ -931,19 +949,7 @@ fn panel_action_rows(
                 |(idx, (kind, label, icon_path))| {
                     let kind = *kind;
                     let view = view.clone();
-                    let selected = matches!(
-                        (current, kind),
-                        (Some(Action::TypeText(_)), PowerUserKind::TypeText)
-                            | (
-                                Some(Action::RunAppleScript(_)),
-                                PowerUserKind::RunAppleScript
-                            )
-                            | (
-                                Some(Action::RunShellCommand(_)),
-                                PowerUserKind::RunShellCommand
-                            )
-                            | (Some(Action::Workflow(_)), PowerUserKind::Workflow)
-                    );
+                    let selected = power_user_selected(current, kind);
                     MenuRow::new(format!("panel-power-{idx}"))
                         .selected(selected)
                         .role(Role::MenuItem)
@@ -975,6 +981,27 @@ fn panel_action_rows(
             )),
     );
     children
+}
+
+/// Whether `current` is the action the `kind` editor makes, so its row reads
+/// as the key's binding.
+fn power_user_selected(current: Option<&Action>, kind: PowerUserKind) -> bool {
+    matches!(
+        (current, kind),
+        (
+            Some(Action::OpenApplication(_)),
+            PowerUserKind::OpenApplication
+        ) | (Some(Action::TypeText(_)), PowerUserKind::TypeText)
+            | (
+                Some(Action::RunAppleScript(_)),
+                PowerUserKind::RunAppleScript
+            )
+            | (
+                Some(Action::RunShellCommand(_)),
+                PowerUserKind::RunShellCommand
+            )
+            | (Some(Action::Workflow(_)), PowerUserKind::Workflow)
+    )
 }
 
 /// The keyboard image, or a labeled placeholder when no asset resolved. The
