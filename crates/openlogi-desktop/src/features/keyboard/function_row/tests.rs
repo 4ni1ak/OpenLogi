@@ -497,7 +497,7 @@ fn open_application_editor_binds_the_selected_key(cx: &mut gpui::TestAppContext)
 
     // Re-adding the unchanged path keeps a saved display name.
     let named = Action::OpenApplication(
-        ApplicationTarget::new("/Applications/Calculator.app", "Calculator").expect("valid"),
+        ApplicationTarget::new("/Applications/Calculator.app", "My calculator").expect("valid"),
     );
     cx.update(|_, cx| {
         AppState::apply(cx, |state| {
