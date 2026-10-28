@@ -1,6 +1,7 @@
 //! The controls panel's hardware boundary. Tests substitute the UVC transfers,
 //! not the panel's load lifecycle, rows, or persistence.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -53,20 +54,27 @@ impl Uvc for SystemUvc {
     }
 }
 
-/// The panel's single path to the camera's writes. Every write holds `lock`,
-/// and so does a background load from its cancellation check through its
-/// re-apply, so a superseded load cannot land a write after a newer edit.
+/// The panel's camera access. A background load holds its camera's lock from
+/// the first read through the re-apply, so a newer load of the same camera
+/// reads only after an older one finished writing. Edits never take a lock:
+/// a camera's edits open only once its newest load has landed, by when every
+/// older load of it is canceled and will not write.
 pub(super) struct Hardware {
     uvc: Arc<dyn Uvc>,
-    lock: Mutex<()>,
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Hardware {
     pub(super) fn new(uvc: Arc<dyn Uvc>) -> Self {
         Self {
             uvc,
-            lock: Mutex::new(()),
+            locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn camera_lock(&self, uid: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(locks.entry(uid.to_string()).or_default())
     }
 
     pub(super) fn apply_settings(
@@ -75,7 +83,6 @@ impl Hardware {
         autos: &[(AutoToggle, bool)],
         values: &[(CameraControl, i32)],
     ) -> Result<(), ControlError> {
-        let _writing = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.uvc.apply_settings(uid, autos, values)
     }
 
@@ -85,7 +92,6 @@ impl Hardware {
         control: CameraControl,
         value: i32,
     ) -> Result<(), ControlError> {
-        let _writing = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.uvc.set_control(uid, control, value)
     }
 }
@@ -157,6 +163,8 @@ pub(super) struct Loaded {
 /// without writing; nothing reads its result.
 pub(super) fn load(hw: &Hardware, uid: &str, saved: &Saved, canceled: &AtomicBool) -> Loaded {
     let uvc = hw.uvc.as_ref();
+    let camera = hw.camera_lock(uid);
+    let _loading = camera.lock().unwrap_or_else(PoisonError::into_inner);
     let Ok(mut state) = uvc.read_camera_state(uid) else {
         debug!("camera state read failed");
         return Loaded {
@@ -194,7 +202,6 @@ pub(super) fn load(hw: &Hardware, uid: &str, saved: &Saved, canceled: &AtomicBoo
             reapply_failed: false,
         };
     }
-    let _writing = hw.lock.lock().unwrap_or_else(PoisonError::into_inner);
     if canceled.load(Ordering::Acquire) {
         return Loaded {
             state: None,
