@@ -70,6 +70,10 @@ pub(crate) struct ArmedReporting {
     pub(crate) cid: u16,
     pub(crate) original: reprog_controls::CidReporting,
     policy: ReprogRestorePolicy,
+    /// Hand back the diversion found at arming instead of clearing it: the
+    /// host kernel diverted this control and listens to it, see
+    /// [`ArmedReporting::kernel_diversion_on`].
+    restore_as_found: bool,
 }
 
 /// How a capture session diverts one pointer control: what the firmware
@@ -107,6 +111,7 @@ impl ArmedReporting {
             cid,
             original,
             policy: ReprogRestorePolicy::Pointer(divert),
+            restore_as_found: false,
         }
     }
 
@@ -117,6 +122,7 @@ impl ArmedReporting {
             cid,
             original,
             policy: ReprogRestorePolicy::Keyboard,
+            restore_as_found: false,
         }
     }
 
@@ -129,8 +135,32 @@ impl ArmedReporting {
         }
     }
 
+    /// Keep a diversion found at arming on `route` when the host kernel owns
+    /// it. Linux 7.3+ `hid-logitech-hidpp` diverts the Bluetooth Signature
+    /// M650's Back/Forward at connect and maps the diverted reports to
+    /// `BTN_BACK`/`BTN_FORWARD`, because the native reports have broken
+    /// timing. Clearing that diversion would undo the kernel's fix until the
+    /// mouse reconnects. Elsewhere a found diversion is a leftover with no
+    /// listener, so [`Self::undivert_change`] still clears it.
+    pub(crate) fn kernel_diversion_on(self, route: &DeviceRoute) -> Self {
+        Self {
+            restore_as_found: self.original.diverted && kernel_diverts(route, self.cid),
+            ..self
+        }
+    }
+
     /// Compute the `setCidReporting` change that restores this control.
     pub(crate) fn undivert_change(self) -> reprog_controls::CidReportingChange {
+        if self.restore_as_found {
+            return reprog_controls::CidReportingChange {
+                diverted: Some(true),
+                raw_xy: Some(self.original.raw_xy),
+                raw_wheel: (self.policy == ReprogRestorePolicy::Pointer(PointerDivert::RawWheel))
+                    .then_some(self.original.raw_wheel),
+                remap: self.original.remap,
+                ..Default::default()
+            };
+        }
         match self.policy {
             ReprogRestorePolicy::Pointer(PointerDivert::Plain | PointerDivert::RawXy) => {
                 undivert_change(self.original)
@@ -161,6 +191,19 @@ impl ArmedReporting {
         };
         (!holds(change, current)).then_some(change)
     }
+}
+
+/// Whether the host kernel diverts `cid` on `route` itself and turns its
+/// diverted reports into input events: the Bluetooth Signature M650's
+/// Back/Forward under `HIDPP_QUIRK_HIDPP_REPROG_CONTROLS_BTNS` (Linux 7.3+).
+fn kernel_diverts(route: &DeviceRoute, cid: u16) -> bool {
+    cfg!(target_os = "linux")
+        && *route
+            == (DeviceRoute::Direct {
+                vendor_id: 0x046d,
+                product_id: 0xb02a,
+            })
+        && matches!(cid, 0x0053 | 0x0056)
 }
 
 /// Whether `current` already has every flag that `change` writes. The remap
