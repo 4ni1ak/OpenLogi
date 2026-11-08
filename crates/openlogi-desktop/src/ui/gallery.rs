@@ -1,18 +1,20 @@
 //! Debug-only gallery for reviewing shared controls without app runtime state.
 
+use super::theme::FocusRingStyle as _;
 use gpui::{
-    App, AppContext as _, Bounds, Context, InteractiveElement, IntoElement, ParentElement, Render,
-    Role, SharedString, Size, StatefulInteractiveElement as _, Styled, Window, WindowBounds,
-    WindowOptions, div, px, rems,
+    App, AppContext as _, Context, InteractiveElement, IntoElement, ParentElement, Render, Role,
+    SharedString, Size, StatefulInteractiveElement as _, Styled, Window, WindowOptions, div,
+    prelude::FluentBuilder as _, px, rems,
 };
-use gpui_base::Button as BaseButton;
-use gpui_component::{
+use gpui_kit::base::Button as BaseButton;
+use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Root, Selectable as _, Sizable as _, Theme,
     ThemeMode, ThemeRegistry,
-    button::{Button, ButtonVariants as _},
+    button::{Button, ButtonGroup, ButtonVariants as _},
     h_flex,
     scroll::ScrollableElement as _,
     slider::Slider,
+    tag::Tag,
     v_flex,
 };
 use openlogi_core::brand::APP_ID;
@@ -23,17 +25,23 @@ use super::battery::BatteryIndicator;
 use super::carousel::Carousel;
 use super::choice_card::ChoiceCard;
 use super::commit_slider::{CommitSlider, SliderRange};
-use super::components::{MenuRow, PanelCard, Pill, PresetChip, ProfileTab, Toggle, toggle_row};
+use super::components::{
+    MenuRow, PanelCard, Pill, PresetChip, ProfileTab, Toggle, stacked_row, toggle_row,
+};
+use super::slider_row::{SliderRow, disabled_track};
 use super::status::{retry_line, status_line};
-use super::theme::{self, ContentWidth, OPENLOGI_DARK, OPENLOGI_LIGHT, Palette, Typography as _};
+use super::theme::{
+    self, ContentWidth, OPENLOGI_DARK, OPENLOGI_LIGHT, Palette, PressableStyle as _,
+    SelectableStyle as _, Typography as _,
+};
 
 const TITLE: &str = "OpenLogi Component Gallery";
 
 /// Run the isolated development gallery application.
 pub(crate) fn run() {
-    let app = gpui_platform::application().with_assets(crate::app_assets::AppAssets);
+    let app = gpui_kit::application().with_assets(crate::app_assets::AppAssets);
     app.run(|cx| {
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         theme::register_builtin_themes(cx);
         install_openlogi_themes(cx);
 
@@ -44,13 +52,15 @@ pub(crate) fn run() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, Size::new(px(1100.), px(800.)), cx);
+        let fit = crate::windows::WindowFit::on_primary_display(
+            Size::new(px(1100.), px(800.)),
+            Size::new(px(760.), px(600.)),
+            cx,
+        );
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(Size::new(px(760.), px(600.))),
             app_id: Some(APP_ID.into()),
             titlebar: Some(crate::windows::titlebar_options(TITLE)),
-            ..WindowOptions::default()
+            ..WindowOptions::from(fit)
         };
         let opened = cx.open_window(options, |window, cx| {
             theme::apply_scale(window, UiScale::Normal);
@@ -94,6 +104,7 @@ struct ComponentGallery {
     scale: UiScale,
     choice_selected: usize,
     toggle_selected: bool,
+    segment_selected: usize,
     menu_selected: usize,
     profile_selected: usize,
     preset_selected: bool,
@@ -101,7 +112,15 @@ struct ComponentGallery {
     carousel_selected: usize,
     slider: CommitSlider<u8>,
     slider_committed: u8,
+    row_slider: CommitSlider<u8>,
+    row_committed: u8,
+    compact_slider: CommitSlider<u8>,
+    entry_slider: CommitSlider<u8>,
+    entry_auto: bool,
 }
+
+/// Where the gallery's slider row starts, and what it marks as the default.
+const ROW_DEFAULT: u8 = 14;
 
 impl ComponentGallery {
     fn new(cx: &mut Context<Self>) -> Self {
@@ -112,11 +131,26 @@ impl ComponentGallery {
             cx,
             |this: &mut Self, value, _| this.slider_committed = value,
         );
+        let row_slider = CommitSlider::new(
+            SliderRange::new(1, 100),
+            ROW_DEFAULT,
+            cx,
+            |this: &mut Self, value, _| this.row_committed = value,
+        );
+        let compact_slider = CommitSlider::new(SliderRange::new(1, 20), 10, cx, |_, _, _| {});
+        // A release takes the value over from Auto, as on the camera page.
+        let entry_slider = CommitSlider::new(
+            SliderRange::new(0, 255),
+            128,
+            cx,
+            |this: &mut Self, _, _| this.entry_auto = false,
+        );
         Self {
             mode: ThemeMode::Light,
             scale: UiScale::Normal,
             choice_selected: 0,
             toggle_selected: true,
+            segment_selected: 1,
             menu_selected: 0,
             profile_selected: 1,
             preset_selected: true,
@@ -124,6 +158,11 @@ impl ComponentGallery {
             carousel_selected: 1,
             slider,
             slider_committed,
+            row_slider,
+            row_committed: ROW_DEFAULT,
+            compact_slider,
+            entry_slider,
+            entry_auto: true,
         }
     }
 
@@ -205,6 +244,7 @@ impl ComponentGallery {
             .child(self.preset_panel(pal, cx))
             .child(self.pill_panel(pal, cx))
             .child(self.slider_panel(pal))
+            .child(self.slider_row_panel(pal, cx))
             .child(Self::battery_panel(pal))
             .child(gallery_panel(
                 "Status and retry",
@@ -260,11 +300,6 @@ impl ComponentGallery {
     }
 
     fn toggle_panel(&self, pal: Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let label = if self.toggle_selected {
-            "Enabled"
-        } else {
-            "Disabled"
-        };
         gallery_panel(
             "Toggle",
             IconName::Settings,
@@ -273,7 +308,7 @@ impl ComponentGallery {
                 .child(
                     Toggle::new("gallery-toggle")
                         .selected(self.toggle_selected)
-                        .label(Some(SharedString::from(label)))
+                        .accessibility_label("Toggle")
                         .on_change(cx.listener(|this, selected: &bool, _, cx| {
                             this.toggle_selected = *selected;
                             cx.notify();
@@ -282,6 +317,7 @@ impl ComponentGallery {
                 .child(
                     Toggle::new("gallery-toggle-disabled")
                         .selected(true)
+                        .accessibility_label("Disabled toggle")
                         .label(Some(SharedString::from("Unavailable")))
                         .disabled(true),
                 )
@@ -299,6 +335,30 @@ impl ComponentGallery {
                             this.toggle_selected = *selected;
                             cx.notify();
                         })),
+                ))
+                .child(stacked_row(
+                    "gallery-stacked-row",
+                    pal,
+                    SharedString::from("Stacked setting"),
+                    SharedString::from(
+                        "A control too wide to share a narrow column with this caption sits \
+                         under it at the leading edge.",
+                    ),
+                    ButtonGroup::new("gallery-stacked-row-segment")
+                        .outline()
+                        .children(["Small", "Medium", "Large"].into_iter().enumerate().map(
+                            |(index, label)| {
+                                let selected = self.segment_selected == index;
+                                Button::new(("gallery-stacked-row-segment", index))
+                                    .label(label)
+                                    .selected(selected)
+                                    .selected_segment(selected, cx)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.segment_selected = index;
+                                        cx.notify();
+                                    }))
+                            },
+                        )),
                 )),
             pal,
         )
@@ -448,6 +508,92 @@ impl ComponentGallery {
         )
     }
 
+    fn slider_row_panel(&self, pal: Palette, cx: &mut Context<Self>) -> gpui::Div {
+        let shown = self.row_slider.shown(self.row_committed);
+        gallery_panel(
+            "SliderRow",
+            IconName::Settings,
+            v_flex()
+                .gap_4()
+                .child(
+                    SliderRow::new(
+                        "Sensitivity",
+                        Slider::new(self.row_slider.slider()).horizontal(),
+                    )
+                    .value(shown.to_string(), ["100"])
+                    .when(shown == ROW_DEFAULT, |row| row.marker("Default"))
+                    .description(
+                        "The value column keeps the width of the widest value, so dragging \
+                         moves neither the number nor the label.",
+                    )
+                    .hint(format!("1–100 · committed {}", self.row_committed)),
+                )
+                .child(
+                    SliderRow::new("Scrolling force", disabled_track(pal))
+                        .value("50%", ["100%"])
+                        .description("Applies in ratchet mode only.")
+                        .disabled(true),
+                )
+                .child(self.entry_row(pal, cx))
+                .child(
+                    SliderRow::new(
+                        "Compact, for Settings",
+                        Slider::new(self.compact_slider.slider()).horizontal(),
+                    )
+                    .value(self.compact_slider.value(cx).to_string(), ["20"])
+                    .description(
+                        "The type step of the kit's SettingItem, so a row in a SettingGroup \
+                         matches the switches beside it.",
+                    )
+                    .compact(),
+                ),
+            pal,
+        )
+    }
+
+    /// A value typed in exactly, with a chip before it that hands the value
+    /// to the device, as on the camera page.
+    fn entry_row(&self, pal: Palette, cx: &mut Context<Self>) -> SliderRow {
+        let auto = self.entry_auto;
+        SliderRow::new(
+            "Value entry",
+            div()
+                .w_full()
+                .when(auto, |track| track.opacity(0.55))
+                .child(Slider::new(self.entry_slider.slider()).horizontal()),
+        )
+        .value(self.entry_slider.value(cx).to_string(), ["0", "255"])
+        .marker(
+            BaseButton::new("gallery-row-auto")
+                .role(Role::CheckBox)
+                .selected(auto)
+                .accessibility_label("Auto")
+                .px_1p5()
+                .py_0p5()
+                .rounded_full()
+                .bg(pal.control)
+                .selected_border(auto, pal)
+                .selected_fill(auto)
+                .text_caption()
+                .text_color(if auto {
+                    pal.text_primary
+                } else {
+                    pal.text_muted
+                })
+                .pressable_fill(auto, pal)
+                .focus_visible(move |style| style.focus_ring(pal))
+                .child("Auto")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.entry_auto = !this.entry_auto;
+                    cx.notify();
+                })),
+        )
+        .value_entry("gallery-row-entry", "Set value", |_, _, _| {})
+        .description("The value opens an exact entry; Auto mutes it until the thumb moves.")
+        .hint(format!("0–255 · {}", if auto { "auto" } else { "manual" }))
+        .disabled(auto)
+    }
+
     fn battery_panel(pal: Palette) -> gpui::Div {
         let battery = |percentage, level, status| BatteryInfo {
             percentage,
@@ -496,13 +642,16 @@ impl ComponentGallery {
     fn carousel(&self, pal: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.carousel_selected;
         let view = cx.entity();
-        div().w_full().child(PanelCard::new(
+        div().w_full().child(
+            PanelCard::new(
             "Carousel",
             Icon::new(IconName::GalleryVerticalEnd).text_color(pal.text_muted),
-            div().w_full().h(rems(13.)).child(
+            // Enough cards to overflow, so the faded edge shows on the panel.
+            div().w_full().child(
                 Carousel::new("gallery-carousel", rems(12.))
-                    .len(4)
+                    .len(6)
                     .selected(selected)
+                    .surface(pal.panel)
                     .render_item(move |index, selected, _, cx| {
                         let pal = theme::palette(cx);
                         let view = view.clone();
@@ -538,7 +687,11 @@ impl ComponentGallery {
                         cx.notify();
                     })),
             ),
-        ))
+        )
+        // A title suffix, as the Pointer tab's momentum-scrolling card shows
+        // its platform notice.
+        .title_suffix(Tag::secondary().small().child("Tag")),
+        )
     }
 }
 
@@ -601,8 +754,8 @@ fn choice_card(id: &'static str, label: &'static str, selected: bool, pal: Palet
             pal.border
         })
         .bg(pal.control)
-        .hover(move |style| style.bg(pal.control_hover))
-        .focus_visible(move |style| style.border_color(theme::accent()))
+        .pressable_fill(false, pal)
+        .focus_visible(move |style| style.focus_ring(pal))
         .gap_1()
         // A preview strip above the label: the stacked shape the settings
         // pickers rely on.
@@ -618,7 +771,7 @@ mod tests {
 
     #[gpui::test]
     fn gallery_renders_without_application_state(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         cx.update(theme::register_builtin_themes);
         cx.update(install_openlogi_themes);
         let (view, cx) = cx.add_window_view(|_, cx| ComponentGallery::new(cx));

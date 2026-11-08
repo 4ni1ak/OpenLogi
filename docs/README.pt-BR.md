@@ -170,6 +170,7 @@ A cobertura de recursos depende do que cada dispositivo informa; o app mostra s�
 
 > [!IMPORTANT]
 > Feche o **Logi Options+** (e o Solaar no Linux) primeiro. Só um aplicativo pode controlar um receptor por vez.
+> No macOS, o **Karabiner-Elements** também bloqueia um teclado Bluetooth que ele modifica. Desative **Modify events** para esse teclado em Karabiner-Elements → Settings → Devices.
 
 | Plataforma | Sistema | Arquitetura |
 | --- | --- | --- |
@@ -211,7 +212,13 @@ Ou instale o pacote certo para a sua distribuição com um único comando. Ele v
 curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install.sh | sh
 ```
 
-Para ler o script antes de executá-lo, e para Flatpak, NixOS e distribuições sem systemd, veja [INSTALL-linux.md](INSTALL-linux.md).
+No Arch Linux, o pacote do AUR [`openlogi`](https://aur.archlinux.org/packages/openlogi) compila a versão a partir do código-fonte:
+
+```sh
+yay -S openlogi
+```
+
+Para ler o script antes de executá-lo, e para o pacote do AUR, Flatpak, NixOS e distribuições sem systemd, veja [INSTALL-linux.md](INSTALL-linux.md).
 
 ### Windows
 
@@ -235,10 +242,24 @@ Veja [DEVELOPMENT.md](DEVELOPMENT.md), incluindo [segurança do hook de entrada 
 
 ## Agradecimentos
 
-- **Windows, câmeras e i18n** por [@davidbudnick](https://github.com/davidbudnick): RGB do teclado, suporte a Windows, suporte às webcams Logitech
-- **Port para Linux** por [@cserby](https://github.com/cserby): suporte a Linux
-- [Solaar](https://github.com/pwr-Solaar/Solaar), de [@pwr](https://github.com/pwr): implementação de HID++ de código aberto
-- [Mouser](https://github.com/TomBadash/Mouser), de [@TomBadash](https://github.com/TomBadash): alternativa local ao Options+, sem conta
+### Contribuidores
+
+<a href="https://github.com/AprilNEA/OpenLogi/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=AprilNEA/OpenLogi" alt="Contribuidores">
+</a>
+
+Logo e ícone do app por [@kubai087](https://github.com/kubai087).
+
+### Créditos
+
+- [Solaar](https://github.com/pwr-Solaar/Solaar), por documentar abertamente o protocolo HID++ e o comportamento dos dispositivos da Logitech.
+- [Mouser](https://github.com/TomBadash/Mouser), de [@TomBadash](https://github.com/TomBadash), por inspirar uma abordagem local e sem conta para substituir o Options+.
+
+### Infraestrutura
+
+<a href="https://namespace.so/github-actions?utm_source=oss&utm_campaign=openlogi" target="_blank" rel="noopener noreferrer">
+    <img src="https://namespace.so/oss/badge.svg" alt="CI powered by Namespace" height="32">
+</a>
 
 ## Licença
 
@@ -247,15 +268,9 @@ O código deste repositório é licenciado, à sua escolha, sob qualquer uma das
 - Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE))
 - Licença MIT ([LICENSE-MIT](../LICENSE-MIT))
 
-### Código de terceiros
-
-`crates/openlogi-hidpp` é um fork vendorizado do [`hidpp`](https://crates.io/crates/hidpp),
-de [@lus](https://github.com/lus), licenciado sob 0BSD.
-
 ### Logo e ativos de marca
 
-Obrigado a [@kubai087](https://github.com/kubai087) por desenhar o logo do OpenLogi. O
-logo e o ícone do app (os ativos de marca em [`design/`](../design/)) são © 2026 AprilNEA,
+O logo e o ícone do app OpenLogi (os ativos de marca em [`design/`](../design/)) são © 2026 AprilNEA,
 todos os direitos reservados, e não são cobertos pelas licenças MIT/Apache acima; veja
 [`design/LICENSE`](../design/LICENSE). Fazer fork do código não dá direito ao nome, logo
 ou ícone do OpenLogi; por favor, não os use para representar seus próprios projetos,

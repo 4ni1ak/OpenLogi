@@ -9,10 +9,10 @@
 //! exposes exact device-supported values once the list is known.
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement,
-    Render, Styled, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, div, px,
 };
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -28,6 +28,7 @@ use super::report_rate::{ReportRateFacts, report_rate_section};
 use crate::state::{AppState, DeviceKey, DpiLoad, StateEvent};
 use crate::ui::commit_slider::{CommitSlider, SliderRange};
 use crate::ui::components::{PresetChip, control_input};
+use crate::ui::slider_row::SliderRow;
 use crate::ui::status::{retry_line, status_line};
 use crate::ui::theme::{self, Palette, Typography as _};
 
@@ -60,7 +61,7 @@ struct DpiNumericInput {
 /// typed text before the blur commits it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FieldText {
-    /// The device's DPI. Unfocused renders keep it current.
+    /// The device's DPI. Renders keep it current, including after Enter.
     #[default]
     Device,
     /// The user's edit, not committed yet by Enter or blur.
@@ -193,10 +194,10 @@ impl DpiPanel {
 
     /// Build (or refresh) the numeric field beside the slider. Rebuilt only
     /// when the active device changes. Otherwise a render puts `dpi` in the
-    /// field, as the slider thumb follows external changes, but only while
-    /// the field shows the device's value and is not focused. A value that
-    /// lands mid-edit, or the render between focus loss and the blur, must
-    /// not replace what the user typed.
+    /// field as the slider thumb follows external changes, including a
+    /// rejected write after Enter leaves focus here. Only an uncommitted
+    /// draft protects the text from a value that lands mid-edit or the
+    /// render between focus loss and blur.
     fn ensure_numeric_input(
         &mut self,
         key: &DeviceKey,
@@ -208,9 +209,7 @@ impl DpiPanel {
         let text = capabilities.nearest(dpi).to_string();
 
         if let Some(current) = self.numeric.as_ref().filter(|current| current.key == *key) {
-            let focused = current.state.focus_handle(cx).is_focused(window);
             if current.text == FieldText::Device
-                && !focused
                 && current.state.read(cx).value().as_ref() != text.as_str()
             {
                 current.state.update(cx, |state, cx| {
@@ -358,43 +357,34 @@ impl DpiPanel {
             snapshot.device_key.clone(),
             pal,
         );
-        let numeric_input = self
-            .numeric
-            .as_ref()
-            .map(|current| control_input(&current.state).w(px(64.)).into_any_element());
+        // The column holds the device's highest DPI; until the range is read,
+        // the value shown is all there is to measure.
+        let widest = match &snapshot.status {
+            DpiLoad::Ready(info) => info.capabilities.max(),
+            _ => snapshot.dpi,
+        };
+        let numeric_input = self.numeric.as_ref().map(|current| {
+            control_input(&current.state)
+                .aria_label(tr!("pointer.dpi"))
+                .w_20()
+                .flex_shrink_0()
+                .into_any_element()
+        });
 
         v_flex()
             .gap_3()
             .w_full()
             .child(
-                h_flex()
-                    .justify_between()
-                    .items_baseline()
-                    .child(
-                        div()
-                            .text_body()
-                            .text_color(pal.text_muted)
-                            .child(tr!("pointer.dpi")),
-                    )
-                    .child(
-                        div()
-                            .text_body()
-                            .text_color(pal.text_primary)
-                            .child(format!("{}", snapshot.dpi)),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().child(slider))
-                    .children(numeric_input),
-            )
-            .child(
-                div()
-                    .text_caption()
-                    .text_color(pal.text_muted)
-                    .child(range_label),
+                SliderRow::new(
+                    tr!("pointer.dpi"),
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().child(slider))
+                        .children(numeric_input),
+                )
+                .value(snapshot.dpi.to_string(), [widest.to_string()])
+                .hint(range_label),
             )
             .child(
                 v_flex()
@@ -422,8 +412,15 @@ fn dpi_panel_snapshot(cx: &mut Context<DpiPanel>) -> DpiPanelSnapshot {
         .and_then(|s| {
             let record = s.current_record()?;
             let device_key = record.device_key();
+            // A device without adjustable DPI is never read, so its load
+            // stays `Unknown`, which would show "reading…" for good.
+            let status = if s.current_dpi_supported() {
+                s.dpi_load_for(&device_key)
+            } else {
+                DpiLoad::Unsupported(tr!("pointer.adjustable_dpi_unsupported").to_string())
+            };
             Some(DpiPanelSnapshot {
-                status: s.dpi_load_for(&device_key),
+                status,
                 device_key: Some(device_key),
                 dpi: s.dpi(),
                 presets: s.dpi_presets(),
@@ -539,6 +536,7 @@ const CHIP_H: f32 = 28.;
 /// the device and updates `AppState.dpi`; the small × removes the preset.
 fn preset_chip(idx: usize, value: Dpi, active: bool, presets: &[Dpi]) -> impl IntoElement {
     let presets_for_remove: Vec<Dpi> = presets.to_vec();
+    let remove_label = tr!("common.remove_named_item", name => format!("{value} DPI"));
     PresetChip::new(("dpi-preset-chip", idx))
         .selected(active)
         .child(
@@ -564,9 +562,11 @@ fn preset_chip(idx: usize, value: Dpi, active: bool, presets: &[Dpi]) -> impl In
         )
         .child(
             Button::new(("dpi-preset-remove", idx))
-                .xsmall()
+                .small()
                 .ghost()
                 .icon(IconName::Close)
+                .accessibility_label(remove_label.clone())
+                .tooltip(remove_label)
                 .on_click(move |_event, _window, cx| {
                     let mut next = presets_for_remove.clone();
                     if idx < next.len() {
@@ -601,10 +601,12 @@ fn add_preset_chip() -> impl IntoElement {
 mod tests {
     use std::sync::Arc;
 
-    use gpui::{FocusHandle, InteractiveElement as _, TestAppContext, VisualTestContext};
+    use gpui::{
+        FocusHandle, Focusable as _, InteractiveElement as _, TestAppContext, VisualTestContext,
+    };
     use openlogi_core::config::Config;
     use openlogi_core::device::DeviceInventory;
-    use openlogi_core::hid::DpiInfo;
+    use openlogi_core::hid::{DpiInfo, WriteError};
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
@@ -684,7 +686,7 @@ mod tests {
     /// out of [`supported`]. Returns the commands sent from then on, and the
     /// other reads, kept unanswered so that no retry fires during a test.
     fn install_mice(cx: &mut TestAppContext) -> (UnboundedReceiver<Command>, Vec<Command>) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         cx.update(theme::register_builtin_themes);
         let mut receiver = cx.update(|cx| {
             let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -789,6 +791,39 @@ mod tests {
         cx.run_until_parked();
     }
 
+    fn press_enter(cx: &mut VisualTestContext) {
+        // Dispatch the native key event. `simulate_keystrokes` also inserts
+        // a simulated IME newline after the input propagates Enter.
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("enter").expect("valid Enter key"),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.run_until_parked();
+    }
+
+    fn reject_dpi_write(
+        cx: &mut VisualTestContext,
+        receiver: &mut UnboundedReceiver<Command>,
+        error: WriteError,
+    ) {
+        let mut writes = std::iter::from_fn(|| receiver.try_recv().ok()).filter_map(|command| {
+            if let Command::SetDpi(request) = command {
+                Some(request)
+            } else {
+                None
+            }
+        });
+        let request = writes.next().expect("Enter sent a DPI write");
+        assert!(writes.next().is_none(), "only one write is pending");
+        cx.update(|_, cx| {
+            AppState::apply(cx, |state| {
+                state.apply_dpi_written(&request.key, request.write, request.dpi, Err(error))
+            });
+        });
+        draw(cx);
+    }
+
     /// Send `event` from the field without a draw, as a late callback does.
     fn emit(cx: &mut VisualTestContext, field: &Entity<InputState>, event: InputEvent) {
         cx.update(|_, cx| field.update(cx, |_, cx| cx.emit(event)));
@@ -847,14 +882,7 @@ mod tests {
         let mouse = selected_mouse(cx);
 
         type_in(cx, &field, "1733");
-        emit(
-            cx,
-            &field,
-            InputEvent::PressEnter {
-                secondary: false,
-                shift: false,
-            },
-        );
+        press_enter(cx);
 
         assert_eq!(dpi_writes(&mut receiver), [(mouse, Dpi::new(1750))]);
         assert_eq!(field_text(cx, &field), "1750");
@@ -864,6 +892,80 @@ mod tests {
             dpi_writes(&mut receiver).is_empty(),
             "a blur without a new edit writes nothing"
         );
+    }
+
+    /// Enter leaves focus in the field, but the device's reply still owns
+    /// the committed value. A rejected request must not remain on screen.
+    #[gpui::test]
+    fn a_rejected_enter_shows_the_actual_dpi_while_focused(cx: &mut TestAppContext) {
+        let (mut receiver, _reads) = install_mice(cx);
+        let (cx, field, elsewhere) = open_panel(cx);
+        type_in(cx, &field, "1733");
+        press_enter(cx);
+        assert_eq!(field_text(cx, &field), "1750");
+
+        reject_dpi_write(
+            cx,
+            &mut receiver,
+            WriteError::DpiNotApplied {
+                requested: Dpi::new(1750),
+                actual: Dpi::new(1200),
+            },
+        );
+
+        assert!(cx.update(|window, cx| field.focus_handle(cx).is_focused(window)));
+        assert_eq!(
+            cx.read(|cx| AppState::try_read(cx).unwrap().dpi()),
+            Dpi::new(1200)
+        );
+        assert_eq!(field_text(cx, &field), "1200");
+        focus(cx, &elsewhere);
+        assert!(
+            dpi_writes(&mut receiver).is_empty(),
+            "a reply is not an edit"
+        );
+    }
+
+    #[gpui::test]
+    fn an_unsupported_enter_restores_the_last_known_dpi(cx: &mut TestAppContext) {
+        let (mut receiver, _reads) = install_mice(cx);
+        let (cx, field, _) = open_panel(cx);
+        type_in(cx, &field, "1750");
+        press_enter(cx);
+
+        reject_dpi_write(
+            cx,
+            &mut receiver,
+            WriteError::DpiUnsupported {
+                requested: Dpi::new(1750),
+            },
+        );
+
+        assert_eq!(field_text(cx, &field), SAVED.to_string());
+        assert!(dpi_writes(&mut receiver).is_empty());
+    }
+
+    #[gpui::test]
+    fn a_write_reply_preserves_a_newer_draft(cx: &mut TestAppContext) {
+        let (mut receiver, _reads) = install_mice(cx);
+        let (cx, field, elsewhere) = open_panel(cx);
+        let mouse = selected_mouse(cx);
+        type_in(cx, &field, "1750");
+        press_enter(cx);
+        type_in(cx, &field, "2333");
+
+        reject_dpi_write(
+            cx,
+            &mut receiver,
+            WriteError::DpiNotApplied {
+                requested: Dpi::new(1750),
+                actual: Dpi::new(1200),
+            },
+        );
+
+        assert_eq!(field_text(cx, &field), "2333");
+        focus(cx, &elsewhere);
+        assert_eq!(dpi_writes(&mut receiver), [(mouse, Dpi::new(2350))]);
     }
 
     /// A blur that lands after the selection moved to another mouse, before

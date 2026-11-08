@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
 use hidpp::{
-    channel::HidppChannel,
+    channel::{HidppChannel, LONG_REPORT_LENGTH},
     device::Device,
     feature::CreatableFeature,
     feature::FeatureType,
     feature::adc_measurement::AdcMeasurementFeature,
     feature::battery_status::BatteryStatusFeature,
+    feature::battery_voltage::BatteryVoltageFeature,
     feature::device_information::{
         DeviceEntityFirmwareInfo, DeviceEntityType, DeviceInformationFeature,
     },
     feature::feature_set::FeatureSetFeature,
+    feature::root::RootFeature,
     feature::unified_battery::{BatteryInfo as UnifiedBatteryInfo, UnifiedBatteryFeature},
-    protocol::v20::Hidpp20Error,
+    nibble::U4,
+    protocol::v20::{self, ErrorType, Hidpp20Error},
 };
 
 use crate::backend::HidBackend;
@@ -24,6 +27,8 @@ use crate::write::{HidppOperation, WriteError, classify_hidpp_error, open_featur
 /// version. Returned by [`dump_features`] for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureEntry {
+    /// Position of the entry in the device's feature table.
+    pub index: u8,
     /// HID++ feature ID.
     pub id: u16,
     /// Feature version reported by the device.
@@ -61,46 +66,211 @@ impl From<CidInfo> for ReprogControlEntry {
 /// feature IDs a given peripheral actually exposes (e.g. whether a mouse
 /// speaks `0x2201 AdjustableDpi`, `0x2202 ExtendedAdjustableDpi`, or both —
 /// `write::dpi` drives either).
+///
+/// Index `0` is the root feature. Most devices list it in their FeatureSet
+/// table, and the dump keeps that row. [`FeatureSetFeature`] reserves the
+/// index, though, and some firmware refuses it: the Yeti X answers
+/// `InvalidArgument` (#786). A refused root row is left out, so each
+/// [`FeatureEntry::index`] stays the device's own index. Any other error
+/// fails the dump.
 pub async fn dump_features(
     backend: &dyn HidBackend,
     route: &DeviceRoute,
 ) -> Result<Vec<FeatureEntry>, WriteError> {
     let index = route.device_index();
     with_route(backend, route, move |channel| async move {
-        let mut device = Device::new(Arc::clone(&channel), index)
-            .await
-            .map_err(|_| WriteError::DeviceUnreachable { index })?;
-        // The root feature exposes the FeatureSet (0x0001) at a fixed
-        // address; we look it up directly rather than going through
-        // `enumerate_features` so the iteration is observable.
-        let feature_set_info = device
-            .root()
-            .get_feature(FeatureSetFeature::ID)
-            .await
-            .map_err(|e| {
-                classify_hidpp_error(e, HidppOperation::DumpFeatures, FeatureSetFeature::ID)
-            })?
-            .ok_or(WriteError::FeatureUnsupported {
-                feature_hex: FeatureSetFeature::ID,
-            })?;
-        let feature_set = device.add_feature::<FeatureSetFeature>(feature_set_info.index);
-        let count = feature_set.count().await.map_err(|e| {
-            classify_hidpp_error(e, HidppOperation::DumpFeatures, FeatureSetFeature::ID)
-        })?;
-        let mut entries = Vec::with_capacity(usize::from(count));
-        for i in 0..=count {
-            let info = feature_set.get_feature(i).await.map_err(|e| {
-                classify_hidpp_error(e, HidppOperation::DumpFeatures, FeatureSetFeature::ID)
-            })?;
-            entries.push(FeatureEntry {
-                id: info.id,
-                version: info.version,
-                typ: info.typ,
-            });
-        }
-        Ok(entries)
+        dump_features_on_channel(&channel, index).await
     })
     .await
+}
+
+/// [`dump_features`] against an already-open channel, the shape the tests
+/// drive a scripted device through.
+pub(crate) async fn dump_features_on_channel(
+    channel: &Arc<HidppChannel>,
+    index: u8,
+) -> Result<Vec<FeatureEntry>, WriteError> {
+    let mut device = Device::new(Arc::clone(channel), index)
+        .await
+        .map_err(|_| WriteError::DeviceUnreachable { index })?;
+    // The root feature exposes the FeatureSet (0x0001) at a fixed
+    // address; we look it up directly rather than going through
+    // `enumerate_features` so the iteration is observable.
+    let feature_set_info = device
+        .root()
+        .get_feature(FeatureSetFeature::ID)
+        .await
+        .map_err(|e| classify_hidpp_error(e, HidppOperation::DumpFeatures, FeatureSetFeature::ID))?
+        .ok_or(WriteError::FeatureUnsupported {
+            feature_hex: FeatureSetFeature::ID,
+        })?;
+    let feature_set = device.add_feature::<FeatureSetFeature>(feature_set_info.index);
+    let count = feature_set.count().await.map_err(|e| {
+        classify_hidpp_error(e, HidppOperation::DumpFeatures, FeatureSetFeature::ID)
+    })?;
+    let mut entries = Vec::with_capacity(usize::from(count) + 1);
+    for i in 0..=count {
+        let info = match feature_set.get_feature(i).await {
+            Ok(info) => info,
+            Err(Hidpp20Error::Feature(ErrorType::InvalidArgument)) if i == 0 => continue,
+            Err(e) => {
+                return Err(classify_hidpp_error(
+                    e,
+                    HidppOperation::DumpFeatures,
+                    FeatureSetFeature::ID,
+                ));
+            }
+        };
+        entries.push(FeatureEntry {
+            index: i,
+            id: info.id,
+            version: info.version,
+            typ: info.typ,
+        });
+    }
+    Ok(entries)
+}
+
+/// Parameter bytes one long HID++ 2.0 report carries, and the length of
+/// every [`RawFeatureReply::Payload`].
+pub const RAW_FEATURE_PARAMS: usize = LONG_REPORT_LENGTH - 4;
+
+/// One raw call to a HID++ 2.0 feature, for [`raw_feature_calls`]: a
+/// function number and the parameters of a long report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawFeatureCall {
+    function: U4,
+    params: [u8; RAW_FEATURE_PARAMS],
+}
+
+impl RawFeatureCall {
+    /// The call of `function` with `params`, or `None` past function 15: a
+    /// HID++ 2.0 function number is four bits, and a larger one would go out
+    /// as a different function.
+    #[must_use]
+    pub fn new(function: u8, params: [u8; RAW_FEATURE_PARAMS]) -> Option<Self> {
+        if function > 0x0f {
+            return None;
+        }
+        Some(Self {
+            function: U4::from_lo(function),
+            params,
+        })
+    }
+
+    /// The function number, 0–15.
+    #[must_use]
+    pub fn function(&self) -> u8 {
+        self.function.to_lo()
+    }
+
+    /// The parameter bytes, as sent.
+    #[must_use]
+    pub fn params(&self) -> &[u8; RAW_FEATURE_PARAMS] {
+        &self.params
+    }
+}
+
+/// What one raw call to a HID++ 2.0 feature got back. For
+/// [`raw_feature_calls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawFeatureReply {
+    /// The response payload; a short response is zero-padded to
+    /// [`RAW_FEATURE_PARAMS`] bytes.
+    Payload([u8; RAW_FEATURE_PARAMS]),
+    /// The error the feature answered with.
+    Error(ErrorType),
+}
+
+/// What [`raw_feature_calls`] got back from one feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawFeatureAnswers {
+    /// The feature's index in the device's feature table.
+    pub index: u8,
+    /// One reply per call, in call order, up to the first call that got
+    /// none.
+    pub replies: Vec<RawFeatureReply>,
+    /// Why the call after the last reply got no answer; the calls after it
+    /// were not sent. `None` when every call was answered.
+    pub failure: Option<WriteError>,
+}
+
+/// Call feature `feature_id` of the device on `route` once for each of
+/// `calls`, in order, over one channel, and return what they got back.
+/// `None` when the device has no such feature. Each call goes out as a long
+/// report.
+///
+/// A call that gets no answer stops the rest, and the answers before it are
+/// kept: earlier calls may already have changed the device.
+///
+/// For `openlogi diag hidpp`, to learn an undocumented feature's functions
+/// from their answers. Nothing checks what a function does: a call can write
+/// as easily as read, so the caller picks the functions.
+pub async fn raw_feature_calls(
+    backend: &dyn HidBackend,
+    route: &DeviceRoute,
+    feature_id: u16,
+    calls: &[RawFeatureCall],
+) -> Result<Option<RawFeatureAnswers>, WriteError> {
+    let index = route.device_index();
+    with_route(backend, route, move |channel| async move {
+        raw_feature_calls_on_channel(&channel, index, feature_id, calls).await
+    })
+    .await
+}
+
+/// [`raw_feature_calls`] against an already-open channel, the shape the
+/// tests drive a scripted device through.
+pub(crate) async fn raw_feature_calls_on_channel(
+    channel: &Arc<HidppChannel>,
+    index: u8,
+    feature_id: u16,
+    calls: &[RawFeatureCall],
+) -> Result<Option<RawFeatureAnswers>, WriteError> {
+    let device = Device::new(Arc::clone(channel), index)
+        .await
+        .map_err(|_| WriteError::DeviceUnreachable { index })?;
+    // The root answers a lookup of itself with index 0, which reads as
+    // absent, but it lives at index 0 on every HID++ 2.0 device.
+    let feature_index = if feature_id == RootFeature::ID {
+        0
+    } else {
+        let Some(info) = device
+            .root()
+            .get_feature(feature_id)
+            .await
+            .map_err(|e| classify_hidpp_error(e, HidppOperation::ResolveFeature, feature_id))?
+        else {
+            return Ok(None);
+        };
+        info.index
+    };
+    let mut answers = RawFeatureAnswers {
+        index: feature_index,
+        replies: Vec::with_capacity(calls.len()),
+        failure: None,
+    };
+    for call in calls {
+        let header = v20::MessageHeader {
+            device_index: index,
+            feature_index,
+            function_id: call.function,
+            software_id: channel.get_sw_id(),
+        };
+        let reply = match channel
+            .send_v20(v20::Message::Long(header, call.params))
+            .await
+        {
+            Ok(response) => RawFeatureReply::Payload(response.extend_payload()),
+            Err(Hidpp20Error::Feature(error)) => RawFeatureReply::Error(error),
+            Err(error) => {
+                answers.failure = Some(WriteError::Hidpp(format!("{error:?}")));
+                break;
+            }
+        };
+        answers.replies.push(reply);
+    }
+    Ok(Some(answers))
 }
 
 /// Enumerate the device's HID++ `0x1b04` reprogrammable controls. This is a
@@ -143,68 +313,108 @@ pub async fn dump_reprog_controls(
     .await
 }
 
+/// The battery features [`read_battery_raw`] reads, in the order it tries
+/// them: unified `0x1004`, legacy `0x1000`, voltage `0x1001`, then the `0x1F20`
+/// ADC. A device exposing none of them has no battery this command can read.
+pub const RAW_BATTERY_FEATURES: [u16; 4] = [
+    UnifiedBatteryFeature::ID,
+    BatteryStatusFeature::ID,
+    BatteryVoltageFeature::ID,
+    AdcMeasurementFeature::ID,
+];
+
 /// Diagnostic read of the device's raw battery report — the unified `0x1004`
-/// fields, the legacy `0x1000` `discharge_level`/`next_level`/`status`, or the
-/// `0x1F20` ADC voltage and charging state. For
+/// fields, the legacy `0x1000` `discharge_level`/`next_level`/`status`, the
+/// `0x1001` measured voltage and charging flags, or the `0x1F20` ADC voltage
+/// and charging state. For
 /// `openlogi diag battery`: surfaces exactly what the firmware reports so a
 /// claim like "MX2S shows 0% while charging" can be confirmed against the wire
 /// instead of guessed (the GUI only ever shows the mapped value).
+///
+/// Fails with [`WriteError::FeatureUnsupported`] naming `0x1004`, the preferred
+/// feature, when the device exposes none of [`RAW_BATTERY_FEATURES`].
 pub async fn read_battery_raw(
     backend: &dyn HidBackend,
     route: &DeviceRoute,
 ) -> Result<String, WriteError> {
     let index = route.device_index();
     with_route(backend, route, move |channel| async move {
-        let mut device = Device::new(Arc::clone(&channel), index)
-            .await
-            .map_err(|_| WriteError::DeviceUnreachable { index })?;
-
-        match super::open_feature_with_version::<UnifiedBatteryFeature>(&mut device).await {
-            Ok((feature, version)) => {
-                let info = feature
-                    .get_battery_info()
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-                return Ok(unified_battery_line(version, info));
-            }
-            Err(WriteError::FeatureUnsupported { .. }) => {}
-            Err(e) => return Err(e),
-        }
-
-        match open_feature::<BatteryStatusFeature>(&mut device).await {
-            Ok(feature) => {
-                let info = feature
-                    .get_battery_level_status()
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-                return Ok(format!(
-                    "0x1000 BatteryStatus: discharge_level={} next_level={} status={:?}",
-                    info.discharge_level, info.next_level, info.status
-                ));
-            }
-            Err(WriteError::FeatureUnsupported { .. }) => {}
-            Err(e) => return Err(e),
-        }
-
-        match open_feature::<AdcMeasurementFeature>(&mut device).await {
-            Ok(feature) => {
-                let measurement = feature
-                    .get_adc_measurement()
-                    .await
-                    .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
-                return Ok(format!("0x1F20 AdcMeasurement: {measurement:?}"));
-            }
-            Err(WriteError::FeatureUnsupported { .. }) => {}
-            Err(e) => return Err(e),
-        }
-
-        // Reached only when none of the read features is present; report the
-        // preferred feature rather than implying 0x1F20 was specifically absent.
-        Err(WriteError::FeatureUnsupported {
-            feature_hex: 0x1004,
-        })
+        read_battery_raw_on_channel(&channel, index).await
     })
     .await
+}
+
+/// [`read_battery_raw`] against an already-open channel, the shape the tests
+/// drive a scripted device through.
+pub(crate) async fn read_battery_raw_on_channel(
+    channel: &Arc<HidppChannel>,
+    index: u8,
+) -> Result<String, WriteError> {
+    let mut device = Device::new(Arc::clone(channel), index)
+        .await
+        .map_err(|_| WriteError::DeviceUnreachable { index })?;
+
+    match super::open_feature_with_version::<UnifiedBatteryFeature>(&mut device).await {
+        Ok((feature, version)) => {
+            let info = feature
+                .get_battery_info()
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+            return Ok(unified_battery_line(version, info));
+        }
+        Err(WriteError::FeatureUnsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+
+    match open_feature::<BatteryStatusFeature>(&mut device).await {
+        Ok(feature) => {
+            let info = feature
+                .get_battery_level_status()
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+            return Ok(format!(
+                "0x1000 BatteryStatus: discharge_level={} next_level={} status={:?}",
+                info.discharge_level, info.next_level, info.status
+            ));
+        }
+        Err(WriteError::FeatureUnsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+
+    // The measured voltage, not the percentage the inventory interpolates from
+    // it: checking that estimate against the wire is what this command is for.
+    match open_feature::<BatteryVoltageFeature>(&mut device).await {
+        Ok(feature) => {
+            let info = feature
+                .get_battery_info()
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+            return Ok(format!(
+                "0x1001 BatteryVoltage: voltage_mv={} critical={} status={:?}",
+                info.voltage_mv, info.critical, info.status
+            ));
+        }
+        Err(WriteError::FeatureUnsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+
+    match open_feature::<AdcMeasurementFeature>(&mut device).await {
+        Ok(feature) => {
+            let measurement = feature
+                .get_adc_measurement()
+                .await
+                .map_err(|e| WriteError::Hidpp(format!("{e:?}")))?;
+            return Ok(format!("0x1F20 AdcMeasurement: {measurement:?}"));
+        }
+        Err(WriteError::FeatureUnsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+
+    // Reached only when none of the read features is present; report the
+    // preferred feature rather than implying 0x1F20 was specifically absent.
+    Err(WriteError::FeatureUnsupported {
+        feature_hex: UnifiedBatteryFeature::ID,
+    })
 }
 
 /// The [`read_battery_raw`] line for a `0x1004` status at feature `version`.

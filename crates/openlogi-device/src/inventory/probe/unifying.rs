@@ -12,7 +12,7 @@ use std::{
 
 use futures_concurrency::future::Join as _;
 use hidpp::{
-    channel::HidppChannel,
+    channel::{HidppChannel, SEND_RESPONSE_TIMEOUT},
     receiver::unifying::{
         DeviceConnection as UnifyingDeviceConnection, Event as UnifyingEvent,
         Receiver as UnifyingReceiver,
@@ -28,7 +28,9 @@ use super::{
 };
 use crate::backend::NodeInfo;
 use crate::host_lock::ReceiverRegisterPhase;
-use crate::inventory::cache::{CacheKey, CacheOutcome, Cached, is_stale, probe_or_reuse};
+use crate::inventory::cache::{
+    CacheKey, CacheOutcome, Cached, ProbeTarget, is_stale, probe_or_reuse,
+};
 use crate::inventory::events::EventSubscriptionHandle;
 use crate::inventory::features::ProbedFeatures;
 use crate::inventory::mappings::{map_unifying_kind, resolve_device_kind};
@@ -130,7 +132,7 @@ pub(super) async fn probe_unifying_receiver(
     };
     let slot_results = connections
         .iter()
-        .map(|conn| probe_unifying_slot(&channel, conn, receiver_uid, pass))
+        .map(|conn| probe_unifying_slot(&channel, conn, receiver_uid, &registers, pass))
         .collect::<Vec<_>>()
         .join()
         .await;
@@ -303,10 +305,15 @@ where
 /// working `get_device_pairing_information` call; we derive a stable cache key
 /// from the receiver UID + slot so the feature-table walk is amortised at ~30s
 /// and two receivers sharing a slot number don't collide in the cache.
+///
+/// `registers` is the receiver's register phase, held by the caller to the
+/// end of the walk: a HID++ 1.0 slot is probed through its registers, and a
+/// codename read is register I/O too.
 pub(in crate::inventory) async fn probe_unifying_slot(
     channel: &Arc<HidppChannel>,
     event: &UnifyingDeviceConnection,
     receiver_uid: &str,
+    registers: &ReceiverRegisterPhase,
     pass: PassContext<'_>,
 ) -> Option<(PairedDevice, CacheOutcome)> {
     let slot = event.index;
@@ -331,7 +338,10 @@ pub(in crate::inventory) async fn probe_unifying_slot(
         probe_budget,
         probe_or_reuse(
             channel,
-            slot,
+            ProbeTarget {
+                index: slot,
+                registers: Some(registers),
+            },
             Some(id.clone()),
             cached,
             event.online,
@@ -350,14 +360,20 @@ pub(in crate::inventory) async fn probe_unifying_slot(
     };
 
     // HID++ 2.0's marketing name is the same identity we need for display and
-    // avoids another receiver-register round trip. Keep the legacy codename
-    // read only for a completed feature walk that did not expose a name; never
-    // put it in front of the feature probe, where one missing receiver ACK can
-    // otherwise starve a healthy Lightspeed mouse forever.
+    // avoids another receiver-register round trip. An offline slot reads the
+    // name the receiver stores for it: the read goes to the receiver, not over
+    // the link it just reported as down, and without it a stale pairing shows
+    // as a bare "Slot N" (#447). An online slot keeps the legacy codename read
+    // only for a completed probe that did not expose a name — a HID++ 1.0
+    // device never does; never put it in front of the feature probe, where one
+    // missing receiver ACK can otherwise starve a healthy Lightspeed mouse
+    // forever.
     let codename = if let Some(name) = probe.marketing_name.clone() {
         Some(name)
-    } else if probe.capabilities.is_some() {
-        read_codename(channel, slot).await
+    } else if !event.online {
+        read_codename(channel, slot, RECEIVER_OPERATION_TIMEOUT).await
+    } else if probe.completed() {
+        read_codename(channel, slot, SEND_RESPONSE_TIMEOUT).await
     } else {
         None
     };
@@ -405,6 +421,8 @@ pub(in crate::inventory) fn assemble_unifying_device(
     online: bool,
     settings_revision: u64,
 ) -> PairedDevice {
+    let capabilities = probe.capabilities();
+    let hidpp10 = probe.is_hidpp10();
     PairedDevice {
         slot,
         codename,
@@ -413,8 +431,9 @@ pub(in crate::inventory) fn assemble_unifying_device(
         online,
         battery: probe.battery,
         model_info: probe.model_info,
-        capabilities: probe.capabilities,
+        capabilities,
         settings_revision,
+        hidpp10,
     }
 }
 
@@ -423,9 +442,24 @@ pub(in crate::inventory) fn assemble_unifying_device(
 /// from Bolt's `0x60`: the long-register response is `[sub, len, data..]` with
 /// no chunk byte — wire-verified `40 0c "MX Master 2S"`. The name lives on the
 /// receiver, so it reads even while the device is offline (e.g. moved to BT).
-async fn read_codename(channel: &HidppChannel, slot: u8) -> Option<String> {
+///
+/// `reply_timeout` bounds the wait for the reply. An offline slot's name is
+/// read on every reconciliation, so it gets the receiver's short budget: a
+/// receiver that drops the reply then costs that budget, not a full request
+/// timeout under the register phase.
+async fn read_codename(
+    channel: &HidppChannel,
+    slot: u8,
+    reply_timeout: Duration,
+) -> Option<String> {
     let response = channel
-        .read_long_sub_register(0xFF, 0xB5, 0x40 + slot - 1, [0x00, 0x00])
+        .read_long_sub_register_with_timeout(
+            0xFF,
+            0xB5,
+            0x40 + slot - 1,
+            [0x00, 0x00],
+            reply_timeout,
+        )
         .await
         .ok()?;
     parse_codename(&response)

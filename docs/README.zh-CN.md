@@ -171,6 +171,7 @@ OpenLogi 能做、而 Options+ 做不到的事：
 
 > [!IMPORTANT]
 > 先退出 **Logi Options+**（Linux 上还有 Solaar）。同一个接收器同时只能由一个应用占用。
+> 在 macOS 上，**Karabiner-Elements** 也会独占它修改的蓝牙键盘。请在 Karabiner-Elements → Settings → Devices 中为该键盘关闭 **Modify events**。
 
 | 平台 | 系统 | 架构 |
 | --- | --- | --- |
@@ -212,7 +213,13 @@ brew install --cask openlogi
 curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install.sh | sh
 ```
 
-想先审阅脚本再运行，或使用 Flatpak、NixOS、无 systemd 的发行版，见 [INSTALL-linux.md](INSTALL-linux.md)。
+在 Arch Linux 上，AUR 软件包 [`openlogi`](https://aur.archlinux.org/packages/openlogi) 会从源码构建发布版本：
+
+```sh
+yay -S openlogi
+```
+
+想先审阅脚本再运行，或使用 AUR 软件包、Flatpak、NixOS、无 systemd 的发行版，见 [INSTALL-linux.md](INSTALL-linux.md)。
 
 ### Windows
 
@@ -236,10 +243,24 @@ curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install
 
 ## 致谢
 
-- **Windows、摄像头与 i18n**：[@davidbudnick](https://github.com/davidbudnick) —— 键盘 RGB 支持、Windows 支持、Logitech 摄像头支持
-- **Linux 移植**：[@cserby](https://github.com/cserby) —— Linux 支持
-- [Solaar](https://github.com/pwr-Solaar/Solaar)，作者 [@pwr](https://github.com/pwr) —— 开源 HID++ 实现
-- [Mouser](https://github.com/TomBadash/Mouser)，作者 [@TomBadash](https://github.com/TomBadash) —— 本地、无需账号的 Options+ 替代品
+### 贡献者
+
+<a href="https://github.com/AprilNEA/OpenLogi/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=AprilNEA/OpenLogi" alt="贡献者">
+</a>
+
+Logo 与应用图标由 [@kubai087](https://github.com/kubai087) 设计。
+
+### 参考与鸣谢
+
+- [Solaar](https://github.com/pwr-Solaar/Solaar)，公开整理并记录了 Logitech 的 HID++ 协议与设备行为。
+- [@TomBadash](https://github.com/TomBadash) 的 [Mouser](https://github.com/TomBadash/Mouser)，启发了本地、免账号替代 Options+ 的思路。
+
+### 基础设施
+
+<a href="https://namespace.so/github-actions?utm_source=oss&utm_campaign=openlogi" target="_blank" rel="noopener noreferrer">
+    <img src="https://namespace.so/oss/badge.svg" alt="CI powered by Namespace" height="32">
+</a>
 
 ## 许可证
 
@@ -248,13 +269,9 @@ curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install
 - Apache License 2.0（[LICENSE-APACHE](../LICENSE-APACHE)）
 - MIT 许可证（[LICENSE-MIT](../LICENSE-MIT)）
 
-### 第三方代码
-
-`crates/openlogi-hidpp` 是 [`hidpp`](https://crates.io/crates/hidpp)（作者 [@lus](https://github.com/lus)）的 vendored fork，采用 0BSD 许可证。
-
 ### Logo 与品牌资产
 
-感谢 [@kubai087](https://github.com/kubai087) 为 OpenLogi 设计的 Logo，该 Logo —— 即 [`design/`](../design/) 下的品牌资产 —— © 2026 AprilNEA 保留所有权利，不在上述 MIT/Apache 许可范围内，许可证详见 [`design/LICENSE`](../design/LICENSE)。
+OpenLogi 的 Logo 与应用图标（即 [`design/`](../design/) 下的品牌资产）© 2026 AprilNEA 保留所有权利，不在上述 MIT/Apache 许可范围内，许可证详见 [`design/LICENSE`](../design/LICENSE)。
 Fork 代码并不授予 OpenLogi 名称、Logo 或图标的使用权，未经事先书面许可，请勿用它们代表你自己的项目、Fork 或分发版本。
 
 ---

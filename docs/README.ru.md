@@ -170,6 +170,7 @@
 
 > [!IMPORTANT]
 > Сначала закройте **Logi Options+** (а в Linux — и Solaar). Приёмник может принадлежать только одному приложению одновременно.
+> В macOS **Karabiner-Elements** тоже блокирует Bluetooth-клавиатуру, которую изменяет. Отключите **Modify events** для этой клавиатуры в Karabiner-Elements → Settings → Devices.
 
 | Платформа | Система | Архитектура |
 | --- | --- | --- |
@@ -211,7 +212,13 @@ brew install --cask openlogi
 curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install.sh | sh
 ```
 
-Как просмотреть скрипт перед запуском, а также Flatpak, NixOS и дистрибутивы без systemd — в [INSTALL-linux.md](INSTALL-linux.md).
+В Arch Linux пакет AUR [`openlogi`](https://aur.archlinux.org/packages/openlogi) собирает релиз из исходного кода:
+
+```sh
+yay -S openlogi
+```
+
+Как просмотреть скрипт перед запуском, а также пакет AUR, Flatpak, NixOS и дистрибутивы без systemd — в [INSTALL-linux.md](INSTALL-linux.md).
 
 ### Windows
 
@@ -235,10 +242,24 @@ curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install
 
 ## Благодарности
 
-- **Windows, камеры и i18n** — [@davidbudnick](https://github.com/davidbudnick): RGB клавиатуры, поддержка Windows, веб-камеры Logitech
-- **Порт на Linux** — [@cserby](https://github.com/cserby)
-- [Solaar](https://github.com/pwr-Solaar/Solaar) от [@pwr](https://github.com/pwr) — открытая реализация HID++
-- [Mouser](https://github.com/TomBadash/Mouser) от [@TomBadash](https://github.com/TomBadash) — локальная замена Options+ без аккаунта
+### Участники
+
+<a href="https://github.com/AprilNEA/OpenLogi/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=AprilNEA/OpenLogi" alt="Участники">
+</a>
+
+Логотип и иконка приложения: [@kubai087](https://github.com/kubai087).
+
+### Проекты и источники
+
+- [Solaar](https://github.com/pwr-Solaar/Solaar), за открытую документацию протокола Logitech HID++ и поведения устройств.
+- [Mouser](https://github.com/TomBadash/Mouser) от [@TomBadash](https://github.com/TomBadash), за идею локального подхода без аккаунта взамен Options+.
+
+### Инфраструктура
+
+<a href="https://namespace.so/github-actions?utm_source=oss&utm_campaign=openlogi" target="_blank" rel="noopener noreferrer">
+    <img src="https://namespace.so/oss/badge.svg" alt="CI powered by Namespace" height="32">
+</a>
 
 ## Лицензия
 
@@ -247,15 +268,9 @@ curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install
 - Apache License, Version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](../LICENSE-MIT))
 
-### Сторонний код
-
-`crates/openlogi-hidpp` — вендорский форк [`hidpp`](https://crates.io/crates/hidpp)
-от [@lus](https://github.com/lus), лицензия 0BSD.
-
 ### Логотип и бренд
 
-Спасибо [@kubai087](https://github.com/kubai087) за дизайн логотипа OpenLogi.
-Логотип и иконка приложения (бренд-ассеты в
+Логотип и иконка приложения OpenLogi (бренд-ассеты в
 [`design/`](../design/)) © 2026 AprilNEA, все права защищены, и не покрываются
 лицензиями MIT/Apache выше; см. [`design/LICENSE`](../design/LICENSE). Форк кода
 не даёт прав на имя, логотип или иконку OpenLogi; не используйте их для своих
