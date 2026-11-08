@@ -171,6 +171,7 @@ Les fonctionnalités disponibles dépendent de ce que chaque appareil signale ; 
 
 > [!IMPORTANT]
 > Quittez d'abord **Logi Options+** (et Solaar sous Linux). Un récepteur ne peut appartenir qu'à une seule application à la fois.
+> Sous macOS, **Karabiner-Elements** verrouille aussi un clavier Bluetooth qu'il modifie. Désactivez **Modify events** pour ce clavier dans Karabiner-Elements → Settings → Devices.
 
 | Plateforme | Système | Architecture |
 | --- | --- | --- |
@@ -212,7 +213,13 @@ Ou installez le paquet adapté à votre distribution en une seule commande. Le s
 curl -fsSL https://github.com/AprilNEA/OpenLogi/releases/latest/download/install.sh | sh
 ```
 
-Pour examiner le script avant de l'exécuter, ainsi que pour Flatpak, NixOS et les distributions sans systemd, voir [INSTALL-linux.md](INSTALL-linux.md).
+Sous Arch Linux, le paquet AUR [`openlogi`](https://aur.archlinux.org/packages/openlogi) compile la version depuis les sources :
+
+```sh
+yay -S openlogi
+```
+
+Pour examiner le script avant de l'exécuter, ainsi que pour le paquet AUR, Flatpak, NixOS et les distributions sans systemd, voir [INSTALL-linux.md](INSTALL-linux.md).
 
 ### Windows
 
@@ -236,10 +243,24 @@ Voir [DEVELOPMENT.md](DEVELOPMENT.md), notamment la [sécurité du hook d'entré
 
 ## Remerciements
 
-- **Windows, caméras et i18n** par [@davidbudnick](https://github.com/davidbudnick) — RGB clavier, prise en charge de Windows, prise en charge des webcams Logitech
-- **Portage Linux** par [@cserby](https://github.com/cserby) — prise en charge de Linux
-- [Solaar](https://github.com/pwr-Solaar/Solaar) par [@pwr](https://github.com/pwr) — implémentation open source de HID++
-- [Mouser](https://github.com/TomBadash/Mouser) par [@TomBadash](https://github.com/TomBadash) — un remplacement d'Options+ local et sans compte
+### Contributeurs
+
+<a href="https://github.com/AprilNEA/OpenLogi/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=AprilNEA/OpenLogi" alt="Contributeurs">
+</a>
+
+Logo et icône d'application par [@kubai087](https://github.com/kubai087).
+
+### Crédits
+
+- [Solaar](https://github.com/pwr-Solaar/Solaar) pour avoir documenté ouvertement le protocole HID++ et le comportement des périphériques Logitech.
+- [Mouser](https://github.com/TomBadash/Mouser) par [@TomBadash](https://github.com/TomBadash) pour avoir inspiré une approche locale et sans compte face à Options+.
+
+### Infrastructure
+
+<a href="https://namespace.so/github-actions?utm_source=oss&utm_campaign=openlogi" target="_blank" rel="noopener noreferrer">
+    <img src="https://namespace.so/oss/badge.svg" alt="CI powered by Namespace" height="32">
+</a>
 
 ## Licence
 
@@ -248,14 +269,9 @@ Le code de ce dépôt est sous double licence, au choix :
 - Apache License, version 2.0 ([LICENSE-APACHE](../LICENSE-APACHE))
 - Licence MIT ([LICENSE-MIT](../LICENSE-MIT))
 
-### Code tiers
-
-`crates/openlogi-hidpp` est un fork intégré de [`hidpp`](https://crates.io/crates/hidpp)
-par [@lus](https://github.com/lus), sous licence 0BSD.
-
 ### Logo et ressources de marque
 
-Merci à [@kubai087](https://github.com/kubai087) pour la conception du logo OpenLogi. Le logo et l'icône d'application OpenLogi — les ressources de marque sous [`design/`](../design/) — sont © 2026 AprilNEA, tous droits réservés, et ne sont pas couverts par les licences MIT/Apache ci-dessus ; voir [`design/LICENSE`](../design/LICENSE). Forker le code ne confère aucun droit sur le nom, le logo ou l'icône d'OpenLogi ; merci de ne pas les utiliser pour représenter vos propres projets, forks ou distributions sans autorisation écrite préalable.
+Le logo et l'icône d'application OpenLogi — les ressources de marque sous [`design/`](../design/) — sont © 2026 AprilNEA, tous droits réservés, et ne sont pas couverts par les licences MIT/Apache ci-dessus ; voir [`design/LICENSE`](../design/LICENSE). Forker le code ne confère aucun droit sur le nom, le logo ou l'icône d'OpenLogi ; merci de ne pas les utiliser pour représenter vos propres projets, forks ou distributions sans autorisation écrite préalable.
 
 ---
 

@@ -14,7 +14,7 @@ use openlogi_core::uinput;
 
 use crate::PermissionStatus;
 
-/// Probe Linux input-device access: `/dev/uinput` (write), at least one
+/// Probe Linux input-device access: `/dev/uinput` (read/write), at least one
 /// Logitech `/dev/hidraw*` (read/write), and those devices' `/dev/input/event*`
 /// nodes (read).
 ///
@@ -33,7 +33,7 @@ use crate::PermissionStatus;
 #[must_use]
 pub fn input_device_access() -> PermissionStatus {
     Probes {
-        uinput_writable: probe_uinput(),
+        uinput_read_write: probe_uinput(),
         hidraw: probe_logitech_hidraw(),
         event: probe_logitech_event(),
     }
@@ -66,8 +66,8 @@ pub(crate) enum EventProbe {
 /// All three probes, taken together.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Probes {
-    /// `/dev/uinput` opened for writing.
-    pub(crate) uinput_writable: bool,
+    /// `/dev/uinput` opened for reading and writing.
+    pub(crate) uinput_read_write: bool,
     pub(crate) hidraw: HidrawProbe,
     pub(crate) event: EventProbe,
 }
@@ -81,7 +81,7 @@ pub(crate) struct Probes {
 /// reported as broken.
 impl From<Probes> for PermissionStatus {
     fn from(probes: Probes) -> Self {
-        match (probes.uinput_writable, probes.hidraw, probes.event) {
+        match (probes.uinput_read_write, probes.hidraw, probes.event) {
             (false, _, _) | (_, HidrawProbe::Denied, _) | (_, _, EventProbe::Denied) => {
                 Self::Denied
             }
@@ -91,11 +91,24 @@ impl From<Probes> for PermissionStatus {
     }
 }
 
-/// Is `/dev/uinput` writable? NotFound (module not loaded) counts as no.
+/// Can the injector and the hook create their virtual devices on
+/// `/dev/uinput`? NotFound (module not loaded) counts as no.
 fn probe_uinput() -> bool {
+    probe_uinput_at(Path::new("/dev/uinput"))
+}
+
+/// Open `node` for reading and writing, as `evdev`'s
+/// `VirtualDeviceBuilder::new` does before it creates a device.
+///
+/// A write-only probe is not enough. Another package's rule that sets the
+/// node's mode to `0620` clamps the ACL mask, so logind's `uaccess` entry
+/// grants write alone. The node then passes a write-only `open()`, and device
+/// creation still fails with `EACCES` (#1414).
+pub(crate) fn probe_uinput_at(node: &Path) -> bool {
     fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .open("/dev/uinput")
+        .open(node)
         .is_ok()
 }
 
@@ -153,6 +166,14 @@ fn probe_logitech_hidraw() -> HidrawProbe {
 /// a Logitech device would report `Denied` for that, which is a working system.
 /// [`is_hookable_logitech_mouse`] applies the same `clicks && moves` test the
 /// hook's own `is_hookable_mouse` does.
+///
+/// Clicking and moving is not enough either: the node must also be one the
+/// OpenLogi udev rules grant, and they grant only what udev classifies as a
+/// mouse (`ID_INPUT_MOUSE`). systemd's hwdb clears that for a few keyboards
+/// whose receiver node also reports `REL_X`, `REL_Y` and `BTN_LEFT` — the MX
+/// Keys and the Craft on a Unifying receiver — so their nodes stay root-owned
+/// on a correctly configured machine, and their keystrokes stay private.
+/// Counting such a node reported `Denied` (#2365). See [`UdevMouse`].
 fn probe_logitech_event() -> EventProbe {
     let Ok(entries) = fs::read_dir("/dev/input") else {
         return EventProbe::NonePresent;
@@ -161,35 +182,100 @@ fn probe_logitech_event() -> EventProbe {
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
-    classify_event_nodes(
-        names.iter().map(String::as_str),
-        |node, attr| fs::read_to_string(format!("/sys/class/input/{node}/device/{attr}")).ok(),
-        |node| {
-            fs::OpenOptions::new()
-                .read(true)
-                .open(Path::new("/dev/input").join(node))
-                .map(|_| ())
-                .map_err(|e| e.kind())
-        },
-    )
+    classify_event_nodes(names.iter().map(String::as_str), &SystemNodes)
+}
+
+/// What [`classify_event_nodes`] reads about each `/dev/input` entry: the
+/// running system's, or a fixture's in the tests.
+pub(crate) trait EventNodes {
+    /// The entry's sysfs `device/<attr>`, e.g. `attr(node, "id/vendor")`.
+    fn attr(&self, node: &str, attr: &str) -> Option<String>;
+
+    /// What udev's database says the entry is.
+    fn udev_mouse(&self, node: &str) -> UdevMouse;
+
+    /// Open the entry for reading, as the hook does.
+    fn open(&self, node: &str) -> Result<(), ErrorKind>;
+}
+
+/// sysfs under `/sys/class/input`, udev's database under `/run/udev/data`, and
+/// the nodes under `/dev/input`.
+struct SystemNodes;
+
+impl EventNodes for SystemNodes {
+    fn attr(&self, node: &str, attr: &str) -> Option<String> {
+        fs::read_to_string(format!("/sys/class/input/{node}/device/{attr}")).ok()
+    }
+
+    /// udev keys its record of a character device by `c<major>:<minor>`, which
+    /// sysfs `dev` holds as `13:67`.
+    fn udev_mouse(&self, node: &str) -> UdevMouse {
+        fs::read_to_string(format!("/sys/class/input/{node}/dev"))
+            .and_then(|dev| fs::read_to_string(format!("/run/udev/data/c{}", dev.trim())))
+            .map_or(UdevMouse::Unrecorded, |record| {
+                UdevMouse::from_record(&record)
+            })
+    }
+
+    fn open(&self, node: &str) -> Result<(), ErrorKind> {
+        fs::OpenOptions::new()
+            .read(true)
+            .open(Path::new("/dev/input").join(node))
+            .map(|_| ())
+            .map_err(|e| e.kind())
+    }
+}
+
+/// udev's answer to whether an event node is a mouse: the `ID_INPUT_MOUSE`
+/// property that `70-openlogi.rules` matches before it tags a node `uaccess`.
+///
+/// Only [`UdevMouse::NotMouse`] takes a node out of the probe. Without a record
+/// (no udev, or a sandbox that hides its database) the capability test decides
+/// alone, as it did before udev was consulted.
+///
+/// The hook does not consult udev, so on a setup that makes every input node
+/// readable (the `input`-group variant of the rules) it still grabs such a
+/// keyboard (#2367). That does not change the verdict: only a node that
+/// refuses `open()` reports `Denied`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UdevMouse {
+    /// The record sets `ID_INPUT_MOUSE=1`.
+    Mouse,
+    /// The record does not: the `input_id` builtin, or an hwdb entry such as
+    /// the MX Keys' `ID_INPUT_MOUSE=0`, classified the node as something else.
+    NotMouse,
+    /// udev keeps no record of the node that this process can read.
+    Unrecorded,
+}
+
+impl UdevMouse {
+    /// Classify a udev database record, whose `E:` lines are the node's
+    /// properties.
+    pub(crate) fn from_record(record: &str) -> Self {
+        if record.lines().any(|line| line == "E:ID_INPUT_MOUSE=1") {
+            Self::Mouse
+        } else {
+            Self::NotMouse
+        }
+    }
 }
 
 /// The decision half of [`probe_logitech_event`], over `/dev/input` entry
-/// names, a sysfs attribute reader (`attr(node, "id/vendor")`), and an
-/// `open()` — so which nodes count is testable without device nodes. Only a
-/// candidate node is opened.
+/// names and what [`EventNodes`] reads about them — so which nodes count is
+/// testable without device nodes. Only a candidate node is opened.
 pub(crate) fn classify_event_nodes<'a>(
     nodes: impl IntoIterator<Item = &'a str>,
-    attr: impl Fn(&str, &str) -> Option<String>,
-    open: impl Fn(&str) -> Result<(), ErrorKind>,
+    source: &impl EventNodes,
 ) -> EventProbe {
     fold_event_access(
         nodes
             .into_iter()
             .filter(|node| {
-                node.starts_with("event") && is_hookable_logitech_mouse(|name| attr(node, name))
+                node.starts_with("event")
+                    && is_hookable_logitech_mouse(|attr| source.attr(node, attr))
+                    && source.udev_mouse(node) != UdevMouse::NotMouse
             })
-            .map(open),
+            .map(|node| source.open(node)),
     )
 }
 

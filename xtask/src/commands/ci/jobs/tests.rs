@@ -114,6 +114,11 @@ fn wasm_checks_the_crates_ci_checks() {
     }
 }
 
+/// The job id and `name:` of the aggregate at the end of `ci.yml`: the one
+/// status check the master ruleset requires. It runs no command, so it has no
+/// [`Job`] and nothing to reproduce; what must not drift is its `needs`.
+const AGGREGATE_JOB: (&str, &str) = ("ci-results", "CI results");
+
 /// The other direction: a job added to `ci.yml` that this runner cannot even
 /// name is a job nobody can reproduce locally.
 #[test]
@@ -126,12 +131,53 @@ fn every_ci_yml_job_name_resolves() {
     let names: Vec<&str> = workflow
         .lines()
         .filter_map(|line| line.strip_prefix("    name: "))
+        .filter(|name| *name != AGGREGATE_JOB.1)
         .collect();
     assert!(!names.is_empty(), "found no job names in ci.yml");
     for name in names {
         assert!(
             Job::resolve(name).is_some(),
             "ci.yml has a job named {name} that `cargo xtask ci` cannot run"
+        );
+    }
+}
+
+/// The aggregate is the only check the master ruleset requires, so a job it
+/// does not `need` is a job whose failure cannot block a merge.
+#[test]
+fn ci_results_needs_every_job() {
+    let Some(workflow) = workflow() else {
+        return;
+    };
+    let (aggregate_id, _) = AGGREGATE_JOB;
+    // Job ids sit at one indent level under `jobs:` and end the line with a
+    // colon; every key inside a job is indented further.
+    let job_ids: Vec<&str> = workflow
+        .lines()
+        .skip_while(|line| *line != "jobs:")
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter(|line| !line.starts_with(' ') && !line.starts_with('#'))
+        .filter_map(|line| line.strip_suffix(':'))
+        .filter(|id| *id != aggregate_id)
+        .collect();
+    assert!(job_ids.len() > 1, "found no job ids in ci.yml");
+
+    let mut lines = workflow.lines();
+    assert!(
+        lines.any(|line| line == format!("  {aggregate_id}:")),
+        "ci.yml has no `{aggregate_id}` job"
+    );
+    let needs: Vec<&str> = lines
+        .skip_while(|line| *line != "    needs:")
+        .skip(1)
+        .map_while(|line| line.strip_prefix("      - "))
+        .collect();
+    assert!(!needs.is_empty(), "`{aggregate_id}` lists no `needs`");
+
+    for id in job_ids {
+        assert!(
+            needs.contains(&id),
+            "`{aggregate_id}` does not need `{id}`, so that job cannot block a merge"
         );
     }
 }
@@ -170,10 +216,7 @@ fn names_are_unique_across_jobs() {
 #[test]
 fn matrix_leg_names_resolve() {
     // What someone copies out of a CI run's job list.
-    for name in [
-        "MSRV (cargo check, macos-latest)",
-        "MSRV (cargo check, ubuntu-latest)",
-    ] {
+    for name in ["MSRV (cargo check, macos)", "MSRV (cargo check, linux)"] {
         assert_eq!(Job::resolve(name).as_deref(), Some(&[Job::Msrv][..]));
     }
     for name in ["tests (macos, arm64)", "tests (macos, x86_64)"] {
@@ -235,11 +278,10 @@ fn jobs_name_the_hosts_ci_gives_them() {
     assert_eq!(hosts(Job::TestsLinux), vec![Host::Linux]);
     assert_eq!(hosts(Job::TestsMacos), vec![Host::Macos]);
     assert_eq!(hosts(Job::TestsWindows), vec![Host::Windows]);
-    // CI's msrv matrix is macos-latest + ubuntu-latest — there is no
-    // Windows leg to reproduce.
+    // CI's msrv matrix is macOS + Linux — there is no Windows leg to reproduce.
     assert_eq!(hosts(Job::Msrv), vec![Host::Linux, Host::Macos]);
     // Natively on Windows, everywhere else as the cross-lint proxy.
     assert_eq!(hosts(Job::ClippyWindows), Host::ANY.to_vec());
-    // macos-latest only: nothing cross-lints the macOS cfg.
+    // macOS only: nothing cross-lints the macOS cfg.
     assert_eq!(hosts(Job::ClippyMacos), vec![Host::Macos]);
 }

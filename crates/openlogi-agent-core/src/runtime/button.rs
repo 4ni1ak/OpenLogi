@@ -23,8 +23,6 @@ use super::ActionDispatchTarget;
 const EVENT_QUEUE_CAPACITY: usize = 128;
 /// Bounds how long graceful process exit waits for terminal handlers.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-/// Lets the worker observe the out-of-band shutdown channel even while idle.
-const SHUTDOWN_POLL_PERIOD: Duration = Duration::from_millis(10);
 
 /// Process-unique identity of one HID++ hardware capture incarnation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -284,6 +282,11 @@ impl ActivePress {
         self.token.key.source.device_key()
     }
 
+    /// Whether the OS input hook, rather than an HID++ session, captured it.
+    pub(crate) fn captured_by_os_hook(&self) -> bool {
+        matches!(self.token.key.source, ButtonSource::OsHook(_))
+    }
+
     pub(crate) fn start_action(&self) -> Option<&Action> {
         self.behavior.start_action()
     }
@@ -362,6 +365,7 @@ enum ButtonCommand {
     Input { generation: u64, input: ButtonInput },
     CancelStalePress(PressToken),
     CancelSource(ButtonSource),
+    CancelGKeys(ButtonSource),
     CancelHooks,
     CancelPointerExcept(openlogi_hook::PointerTarget),
     Wake,
@@ -410,6 +414,15 @@ impl ButtonState {
         self.cancel_where(|key| key.source == *source)
     }
 
+    /// The G-key presses `source` holds: they belong to the M profile that
+    /// was active when they went down, and another profile's release must
+    /// not end them. The source's other presses keep running.
+    fn cancel_g_keys(&mut self, source: &ButtonSource) -> Vec<ActivePress> {
+        self.cancel_where(|key| {
+            key.source == *source && matches!(key.control, PressControl::Button(ButtonId::GKey(_)))
+        })
+    }
+
     fn cancel_hooks(&mut self) -> Vec<ActivePress> {
         self.cancel_where(|key| matches!(key.source, ButtonSource::OsHook(_)))
     }
@@ -452,11 +465,17 @@ impl ButtonState {
             .collect()
     }
 
-    fn has_due_long_press(&self, now: Instant) -> bool {
+    /// The earliest long-press threshold still pending, which is the only
+    /// reason the worker has to wake without a command.
+    fn next_deadline(&self) -> Option<Instant> {
         self.active
             .values()
             .filter_map(|press| press.behavior.deadline())
-            .any(|deadline| deadline <= now)
+            .min()
+    }
+
+    fn has_due_long_press(&self, now: Instant) -> bool {
+        self.next_deadline().is_some_and(|deadline| deadline <= now)
     }
 
     fn due_long_presses(&self, now: Instant) -> Vec<PressToken> {
@@ -633,8 +652,22 @@ impl ButtonInputHandle {
         )));
     }
 
+    /// End the G-key presses `session` holds, leaving its other keys down.
+    pub(crate) fn cancel_hidpp_g_keys(&self, session: &HidppSessionId) {
+        self.try_command(ButtonCommand::CancelGKeys(ButtonSource::Hidpp(
+            session.clone(),
+        )));
+    }
+
     pub(crate) fn invalidate_all(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.wake();
+    }
+
+    /// Make an idle worker re-read state published outside its queue. A full
+    /// queue drops the wake harmlessly: the worker is not blocked then, and
+    /// it re-reads that state between commands.
+    fn wake(&self) {
         let _ = self.events.try_send(ButtonCommand::Wake);
     }
 
@@ -698,8 +731,7 @@ impl ButtonInputHandle {
         match self.events.try_send(command) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
-                self.generation.fetch_add(1, Ordering::AcqRel);
-                warn!("button lifecycle queue full — invalidating active presses");
+                self.invalidate_after_dropped_command();
                 false
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -707,6 +739,14 @@ impl ButtonInputHandle {
                 false
             }
         }
+    }
+
+    /// A dropped command may have been a release, so every active press is
+    /// invalidated. The worker can drain the full queue and block before the
+    /// generation changes, so the change needs its wake like any other.
+    fn invalidate_after_dropped_command(&self) {
+        self.invalidate_all();
+        warn!("button lifecycle queue full — invalidating active presses");
     }
 
     fn stop_accepting(&self) {
@@ -762,6 +802,9 @@ impl ButtonRuntimeOwner {
             let _ = worker.join();
             return false;
         }
+        // Send the wake only after the shutdown request is visible. Otherwise
+        // an idle worker could consume it first and block again on `events`.
+        self.input.wake();
         if wait.recv_timeout(timeout).is_err() {
             warn!("button lifecycle worker did not shut down before the deadline");
             // Dropping a JoinHandle detaches the worker; the queued request
