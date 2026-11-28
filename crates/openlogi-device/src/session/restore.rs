@@ -32,7 +32,9 @@ pub trait RestorePlan {
 #[derive(Clone, Copy)]
 enum RetiredChannelPolicy {
     /// Inventory declared the transport obsolete; wait for another current
-    /// publication instead of writing underneath its replacement.
+    /// publication instead of writing underneath its replacement. Only
+    /// holds while the retired channel has not yet been seen out of its
+    /// route: see [`PendingRestore::retry`].
     ReplacementOnly,
     /// The session stopped normally but a restore write failed, so retrying
     /// the still-current original transport is safe.
@@ -113,17 +115,29 @@ impl<P: RestorePlan> PendingRestore<P> {
     /// every awaited restore write. A concurrent replacement returns this
     /// token as pending, with every control still owed, so the new winner is
     /// restored on the next attempt.
-    pub async fn retry(self, registry: &ChannelRegistry) -> RestoreOutcome<P> {
+    ///
+    /// The retired channel is refused only while it has never left its
+    /// route, as after a dead-channel report inventory has yet to act on.
+    /// Once a retry finds the route empty or won by another channel,
+    /// inventory has withdrawn it, and publishing that same connection again
+    /// is a new publication. Inventory does exactly that with a cached
+    /// channel whose node it unpublished for one pass; refusing it then would
+    /// owe the restore, and block the successor, forever (#2674).
+    pub async fn retry(mut self, registry: &ChannelRegistry) -> RestoreOutcome<P> {
         let Some(current) = registry.lookup(&self.route) else {
+            self.retired_policy = RetiredChannelPolicy::CurrentAllowed;
             return RestoreOutcome::RestorePending(self);
         };
-        if matches!(self.retired_policy, RetiredChannelPolicy::ReplacementOnly)
-            && self
-                .retired_channel
-                .upgrade()
-                .is_some_and(|retired| Arc::ptr_eq(current.channel(), &retired))
+        if self
+            .retired_channel
+            .upgrade()
+            .is_some_and(|retired| Arc::ptr_eq(current.channel(), &retired))
         {
-            return RestoreOutcome::RestorePending(self);
+            if matches!(self.retired_policy, RetiredChannelPolicy::ReplacementOnly) {
+                return RestoreOutcome::RestorePending(self);
+            }
+        } else {
+            self.retired_policy = RetiredChannelPolicy::CurrentAllowed;
         }
         let restored = self.plan.restore_on(&current).await;
         if restored && registry.is_current(&current) {

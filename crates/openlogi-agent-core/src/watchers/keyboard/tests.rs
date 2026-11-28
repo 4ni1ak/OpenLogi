@@ -485,6 +485,159 @@ async fn each_published_keyboard_runs_its_own_session() {
     actions.shutdown();
 }
 
+/// `0x1b04` index of the keyboard [`publish_search_keyboard`] scripts.
+const REPROG: u8 = 2;
+
+/// A keyboard at `route` whose only `0x1b04` control is the divertable
+/// Search key. `setCidReporting` writes are echoed.
+async fn publish_search_keyboard(
+    registry: &ChannelRegistry,
+    node_id: &str,
+    route: DeviceRoute,
+) -> (
+    openlogi_device::SharedChannel,
+    openlogi_device::replay::ReplayChannelHandle,
+) {
+    let [cid_high, cid_low] = 0x00d4u16.to_be_bytes();
+    openlogi_device::test_support::publish_scripted_channel(
+        registry,
+        node_id,
+        route,
+        move |request| {
+            if request.len() < 7 {
+                return None;
+            }
+            let mut response = vec![0; 20];
+            response[..4].copy_from_slice(&request[..4]);
+            response[0] = 0x11;
+            match (request[2], request[3] >> 4) {
+                (0, 1) => response[4] = 4,
+                (0, 0) if request[4..6] == [0x1b, 0x04] => response[4] = REPROG,
+                (REPROG, 0) => response[4] = 1,
+                (REPROG, 1) => {
+                    response[4..6].copy_from_slice(&[cid_high, cid_low]);
+                    // Flags: divertable.
+                    response[8] = 0x20;
+                }
+                (REPROG, 2) => response[4..6].copy_from_slice(&[cid_high, cid_low]),
+                (REPROG, 3) => return Some(request.to_vec()),
+                _ => {}
+            }
+            Some(response)
+        },
+    )
+    .await
+}
+
+/// The diversion bit of every `setCidReporting` written to the Search key.
+fn search_key_writes(handle: &openlogi_device::replay::ReplayChannelHandle) -> Vec<bool> {
+    handle
+        .written_reports()
+        .into_iter()
+        .filter(|report| report[2] == REPROG && report[3] >> 4 == 3)
+        .map(|report| report[6] & 0x01 != 0)
+        .collect()
+}
+
+/// #2674: inventory unpublishes the keyboard's node for one pass (a probe
+/// with nothing to show after resume) and then publishes the same open
+/// channel again. The session stops on the withdrawal with its restore owed;
+/// that restore must land on the republished channel and let the keyboard
+/// re-arm, instead of waiting forever for a "replacement" that never comes.
+#[tokio::test]
+async fn a_restore_owed_to_a_republished_channel_lands_and_rearms() {
+    use openlogi_device::test_support::{republish_scripted_channel, withdraw_scripted_channel};
+    use std::time::Duration;
+
+    let route = target().route;
+    let registry = ChannelRegistry::default();
+    let (shared, handle) = publish_search_keyboard(&registry, "keyboard", route.clone()).await;
+    let access = ReceiverAccess::default();
+    let (_signal, device_io) = openlogi_hid::device_io_channel();
+    let device_access = DeviceAccess {
+        channel: CaptureChannelSlot::default(),
+        registry: registry.clone(),
+        receiver_access: access.clone(),
+        device_io,
+        transport_turns: crate::hardware::TransportTurns::default(),
+    };
+    let (ring, _ring_rx) = mpsc::unbounded_channel();
+    let mut actions = crate::runtime::ActionRuntime::new(
+        Arc::default(),
+        Arc::default(),
+        device_access.clone(),
+        ring,
+    )
+    .unwrap();
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let channels = KeyboardSessionChannels {
+        access: device_access,
+        events,
+    };
+    let published = [spec_at("keyboard-a", route.clone())];
+    let (_spec_tx, specs) = watch::channel(Arc::new(published.to_vec()));
+    let requests = access.subscribe_requests();
+    let mut state = KeyboardManagerState::new(actions.dispatcher());
+    let wait = Duration::from_secs(5);
+
+    state
+        .reconcile(ReceiverRequestState::default(), true, &published, &channels)
+        .await;
+    tokio::time::timeout(wait, async {
+        while search_key_writes(&handle).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the session diverts the Search key");
+    assert_eq!(search_key_writes(&handle), [true]);
+
+    withdraw_scripted_channel(&registry, "keyboard");
+    let done = tokio::time::timeout(wait, async {
+        loop {
+            match event_rx.recv().await {
+                Some(KeyboardSessionEvent::Done(done)) => break done,
+                Some(KeyboardSessionEvent::Input(_)) => {}
+                None => panic!("the manager keeps its event channel"),
+            }
+        }
+    })
+    .await
+    .expect("the withdrawal stops the session");
+    assert!(
+        done.pending_restore.is_some(),
+        "a withdrawn channel cannot take the restore yet"
+    );
+    assert!(state.handle_session_event(KeyboardSessionEvent::Done(done), true, &requests, &specs,));
+
+    // The production loop expedites owed restores on a registry change.
+    republish_scripted_channel(&registry, "keyboard", &shared);
+    state.expedite_pending_restores();
+    state
+        .reconcile(ReceiverRequestState::default(), true, &published, &channels)
+        .await;
+    assert!(
+        !state.has_pending_restores(),
+        "the restore lands on the republished channel"
+    );
+    assert_eq!(search_key_writes(&handle), [true, false]);
+
+    // Only the restart pacing remains; once it elapses the keyboard re-arms.
+    tokio::time::sleep(RETRY_DELAY).await;
+    state
+        .reconcile(ReceiverRequestState::default(), true, &published, &channels)
+        .await;
+    assert!(
+        state
+            .slots
+            .get(&route)
+            .and_then(KeyboardSlot::session)
+            .is_some_and(CaptureSession::is_active),
+        "a successor session captures the keyboard again"
+    );
+    actions.shutdown();
+}
+
 /// A session body that panics used to take its completion report down with
 /// it, leaving the keyboard slot `Running` and the keys never re-armed.
 #[tokio::test]

@@ -98,6 +98,28 @@ pub async fn publish_scripted_channel(
     (shared, handle)
 }
 
+/// Unpublish every route of `node_id` while its channel stays open, as
+/// inventory does for a node whose pass produced no inventory.
+#[cfg(feature = "test-support")]
+pub fn withdraw_scripted_channel(registry: &ChannelRegistry, node_id: &str) {
+    registry.remove_node(&NodeId::from(node_id.to_owned()));
+}
+
+/// Publish the already-open `shared` under `node_id` again, as inventory
+/// does when a withdrawn node's cached channel probes healthy again.
+#[cfg(feature = "test-support")]
+pub fn republish_scripted_channel(
+    registry: &ChannelRegistry,
+    node_id: &str,
+    shared: &SharedChannel,
+) {
+    registry.replace_node(
+        NodeId::from(node_id.to_owned()),
+        [shared.route().clone()],
+        Arc::clone(shared.channel()),
+    );
+}
+
 /// Outcome produced when the scripted backend opens a listed node.
 ///
 /// The cases are distinct contracts the enumerator must not conflate: only

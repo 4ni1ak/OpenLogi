@@ -108,6 +108,9 @@ pub use write::{
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support {
-    pub use crate::channel::scripted::{publish_scripted_channel, scripted_shared_channel};
+    pub use crate::channel::scripted::{
+        publish_scripted_channel, republish_scripted_channel, scripted_shared_channel,
+        withdraw_scripted_channel,
+    };
     pub use crate::replay::ReplayChannelHandle as ScriptedRawHidHandle;
 }
