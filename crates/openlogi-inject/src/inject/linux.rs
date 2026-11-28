@@ -11,6 +11,7 @@ use std::process::{Child, Command};
 use std::sync::{
     LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::time::{Duration, Instant};
 
@@ -1190,13 +1191,45 @@ fn kwin_switch_desktop(method: &str) -> Option<()> {
     }
 }
 
+/// How long a media key waits for the players to report their
+/// `PlaybackStatus`. A player that has not answered by then counts as unknown,
+/// so one hung idle app cannot hold the command up.
+const MPRIS_STATUS_DEADLINE: Duration = Duration::from_millis(250);
+
 /// Send `command` to the MPRIS player in use (see [`pick_player`]), falling
 /// back to the corresponding XF86 multimedia key when no player is clearly the
-/// one in use, so the desktop's media-key daemon picks it. When a player is found but the call fails, the fallback
-/// is suppressed to avoid double-toggling (the player likely handles the
-/// XF86 key too).
-fn mpris_command(command: &str) {
-    if try_mpris_command(command).is_none() {
+/// one in use, so the desktop's media-key daemon picks it. When a player is
+/// chosen but the call fails, the fallback is suppressed to avoid
+/// double-toggling (the player likely handles the XF86 key too).
+///
+/// The bus calls run on their own thread, in press order, so a slow player
+/// never holds up the button worker that dispatched the action.
+fn mpris_command(command: &'static str) {
+    static WORKER: LazyLock<Option<Mutex<mpsc::Sender<&'static str>>>> = LazyLock::new(|| {
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        std::thread::Builder::new()
+            .name("openlogi-mpris".into())
+            .spawn(move || rx.into_iter().for_each(run_mpris_command))
+            .map_err(|e| tracing::warn!("MPRIS worker failed to start: {e}"))
+            .ok()?;
+        Some(Mutex::new(tx))
+    });
+    let queued = WORKER.as_ref().is_some_and(|tx| {
+        tx.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(command)
+            .is_ok()
+    });
+    if !queued {
+        run_mpris_command(command);
+    }
+}
+
+fn run_mpris_command(command: &'static str) {
+    let sent = SESSION_BUS.as_ref().and_then(|conn| {
+        try_mpris_command(&SessionMpris(conn.clone()), command, MPRIS_STATUS_DEADLINE)
+    });
+    if sent.is_none() {
         let fallback = match command {
             "PlayPause" => KeyCode::KEY_PLAYPAUSE,
             "Next" => KeyCode::KEY_NEXTSONG,
@@ -1207,26 +1240,74 @@ fn mpris_command(command: &str) {
     }
 }
 
-fn try_mpris_command(command: &str) -> Option<()> {
-    let conn = SESSION_BUS.as_ref()?;
-    let reply = conn
-        .call_method(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "ListNames",
-            &(),
-        )
-        .ok()?;
-    let names = reply.body().deserialize::<Vec<String>>().ok()?;
-    let players: Vec<(String, Option<String>)> = names
+/// The session-bus calls a media key makes, so tests can stand in for the bus.
+trait MprisBus: Clone + Send + 'static {
+    /// Every name on the bus, or `None` when the bus does not answer.
+    fn names(&self) -> Option<Vec<String>>;
+    /// A player's `PlaybackStatus` (`Playing`, `Paused` or `Stopped`), or
+    /// `None` when it does not answer.
+    fn playback_status(&self, player: &str) -> Option<String>;
+    /// Call `command` on `player`'s `org.mpris.MediaPlayer2.Player`.
+    fn send(&self, player: &str, command: &str) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+struct SessionMpris(DbusConn);
+
+impl MprisBus for SessionMpris {
+    fn names(&self) -> Option<Vec<String>> {
+        let reply = self
+            .0
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ListNames",
+                &(),
+            )
+            .ok()?;
+        reply.body().deserialize::<Vec<String>>().ok()
+    }
+
+    fn playback_status(&self, player: &str) -> Option<String> {
+        let reply = self
+            .0
+            .call_method(
+                Some(player),
+                "/org/mpris/MediaPlayer2",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.mpris.MediaPlayer2.Player", "PlaybackStatus"),
+            )
+            .ok()?;
+        let body = reply.body();
+        let value = body.deserialize::<zbus::zvariant::Value<'_>>().ok()?;
+        value.downcast::<String>().ok()
+    }
+
+    fn send(&self, player: &str, command: &str) -> Result<(), String> {
+        self.0
+            .call_method(
+                Some(player),
+                "/org/mpris/MediaPlayer2",
+                Some("org.mpris.MediaPlayer2.Player"),
+                command,
+                &(),
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Send `command` to the player [`pick_player`] chooses. `None` means no
+/// player was chosen and the caller should press the XF86 key instead.
+fn try_mpris_command(bus: &impl MprisBus, command: &str, deadline: Duration) -> Option<()> {
+    let names: Vec<String> = bus
+        .names()?
         .into_iter()
         .filter(|n| n.starts_with("org.mpris.MediaPlayer2."))
-        .map(|n| {
-            let status = playback_status(conn, &n);
-            (n, status)
-        })
         .collect();
+    let players = playback_statuses(bus, names, deadline);
     let Some(player) = pick_player(&players) else {
         tracing::debug!(
             players = players.len(),
@@ -1234,41 +1315,44 @@ fn try_mpris_command(command: &str) -> Option<()> {
         );
         return None;
     };
-    match conn.call_method(
-        Some(player),
-        "/org/mpris/MediaPlayer2",
-        Some("org.mpris.MediaPlayer2.Player"),
-        command,
-        &(),
-    ) {
-        Ok(_) => {
-            tracing::debug!("MPRIS {command} via {player}");
-            Some(())
-        }
-        Err(e) => {
-            // Player was identified — suppress XF86 fallback to avoid
-            // double-toggling if the player also handles multimedia keys.
-            tracing::warn!("MPRIS {command} on {player} failed: {e}");
-            Some(())
-        }
+    match bus.send(player, command) {
+        Ok(()) => tracing::debug!("MPRIS {command} via {player}"),
+        // Player was identified — suppress XF86 fallback to avoid
+        // double-toggling if the player also handles multimedia keys.
+        Err(e) => tracing::warn!("MPRIS {command} on {player} failed: {e}"),
     }
+    Some(())
 }
 
-/// A player's `PlaybackStatus` (`Playing`, `Paused` or `Stopped`), or `None`
-/// when it does not answer.
-fn playback_status(conn: &DbusConn, player: &str) -> Option<String> {
-    let reply = conn
-        .call_method(
-            Some(player),
-            "/org/mpris/MediaPlayer2",
-            Some("org.freedesktop.DBus.Properties"),
-            "Get",
-            &("org.mpris.MediaPlayer2.Player", "PlaybackStatus"),
-        )
-        .ok()?;
-    let body = reply.body();
-    let value = body.deserialize::<zbus::zvariant::Value<'_>>().ok()?;
-    value.downcast::<String>().ok()
+/// Ask every player for its `PlaybackStatus` at once and wait at most
+/// `deadline` for the answers; a player that has not answered counts as
+/// unknown. A late answer is dropped by its own thread.
+fn playback_statuses<B: MprisBus>(
+    bus: &B,
+    names: Vec<String>,
+    deadline: Duration,
+) -> Vec<(String, Option<String>)> {
+    let (tx, rx) = mpsc::channel();
+    for (index, name) in names.iter().enumerate() {
+        let (bus, name, tx) = (bus.clone(), name.clone(), tx.clone());
+        let spawned = std::thread::Builder::new()
+            .name("openlogi-mpris-status".into())
+            .spawn(move || drop(tx.send((index, bus.playback_status(&name)))));
+        if let Err(e) = spawned {
+            tracing::debug!("MPRIS status query not started: {e}");
+        }
+    }
+    drop(tx);
+    let mut statuses = vec![None; names.len()];
+    let until = Instant::now() + deadline;
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok((index, status)) => statuses[index] = status,
+            // Timeout, or every query has answered.
+            Err(_) => break,
+        }
+    }
+    names.into_iter().zip(statuses).collect()
 }
 
 /// The player a media key should reach, from `(bus name, PlaybackStatus)`:
@@ -1305,12 +1389,12 @@ mod tests {
     use openlogi_core::binding::{HeldKeys, KeyCombo, KeyboardUsage, NativeAction, Shortcut};
 
     use super::{
-        HELPER_PREFIXES, KEY_CAPABILITIES, ScrollOutput, action_scroll, capture_region_mods, combo,
-        desktop_switch_mods, generic_linux_lock_fallback_chord, hid_usage_to_linux,
-        hyprland_helper, hyprland_lock_fallback_chord, hyprland_lock_helper,
+        HELPER_PREFIXES, KEY_CAPABILITIES, MprisBus, ScrollOutput, action_scroll,
+        capture_region_mods, combo, desktop_switch_mods, generic_linux_lock_fallback_chord,
+        hid_usage_to_linux, hyprland_helper, hyprland_lock_fallback_chord, hyprland_lock_helper,
         hyprland_session_from_signature, key_ev, key_phase_events, modifiers_to_keycodes,
-        pick_player, rel_ev, resolve_allowlisted_under, scroll_events, syn, unheld_modifiers,
-        wait_with_retry,
+        pick_player, rel_ev, resolve_allowlisted_under, scroll_events, syn, try_mpris_command,
+        unheld_modifiers, wait_with_retry,
     };
     use crate::inject::{HeldChordKind, HeldOutput, KeyPhase};
 
@@ -1318,6 +1402,107 @@ mod tests {
         list.iter()
             .map(|(n, s)| (format!("org.mpris.MediaPlayer2.{n}"), s.map(str::to_owned)))
             .collect()
+    }
+
+    /// A session bus with scripted players: name, `PlaybackStatus` (`None`
+    /// fails the property read) and how long the status query takes.
+    #[derive(Clone)]
+    struct FakeBus {
+        players: std::sync::Arc<Vec<(&'static str, Option<&'static str>, std::time::Duration)>>,
+        sent: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl FakeBus {
+        fn new(players: &[(&'static str, Option<&'static str>, u64)]) -> Self {
+            Self {
+                players: std::sync::Arc::new(
+                    players
+                        .iter()
+                        .map(|&(n, s, ms)| (n, s, std::time::Duration::from_millis(ms)))
+                        .collect(),
+                ),
+                sent: std::sync::Arc::default(),
+            }
+        }
+
+        fn sent(&self) -> Vec<(String, String)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl MprisBus for FakeBus {
+        fn names(&self) -> Option<Vec<String>> {
+            let mut names = vec!["org.freedesktop.Notifications".to_owned()];
+            names.extend(
+                self.players
+                    .iter()
+                    .map(|(n, ..)| format!("org.mpris.MediaPlayer2.{n}")),
+            );
+            Some(names)
+        }
+
+        fn playback_status(&self, player: &str) -> Option<String> {
+            let (_, status, delay) = self.players.iter().find(|(n, ..)| player.ends_with(n))?;
+            std::thread::sleep(*delay);
+            status.map(str::to_owned)
+        }
+
+        fn send(&self, player: &str, command: &str) -> Result<(), String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((player.to_owned(), command.to_owned()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_command_reaches_the_playing_player_through_the_bus() {
+        let bus = FakeBus::new(&[
+            ("chromium.instance1", Some("Stopped"), 0),
+            ("firefox.instance_1_2", Some("Playing"), 0),
+            ("spotify", None, 0),
+        ]);
+        let deadline = std::time::Duration::from_secs(5);
+        assert_eq!(try_mpris_command(&bus, "PlayPause", deadline), Some(()));
+        assert_eq!(
+            bus.sent(),
+            [(
+                "org.mpris.MediaPlayer2.firefox.instance_1_2".to_owned(),
+                "PlayPause".to_owned()
+            )]
+        );
+
+        // Nothing clearly in use: no call, the caller presses the XF86 key.
+        let unclear = FakeBus::new(&[("chromium.instance1", None, 0), ("spotify", None, 0)]);
+        assert_eq!(try_mpris_command(&unclear, "Next", deadline), None);
+        assert!(unclear.sent().is_empty());
+    }
+
+    #[test]
+    fn a_slow_idle_player_does_not_delay_the_command() {
+        // A hung idle app must not hold the press for its D-Bus timeout.
+        let bus = FakeBus::new(&[
+            ("chromium.instance1", Some("Stopped"), 3_000),
+            ("spotify", Some("Playing"), 0),
+        ]);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            try_mpris_command(&bus, "PlayPause", std::time::Duration::from_millis(200)),
+            Some(())
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            bus.sent(),
+            [(
+                "org.mpris.MediaPlayer2.spotify".to_owned(),
+                "PlayPause".to_owned()
+            )]
+        );
     }
 
     #[test]
