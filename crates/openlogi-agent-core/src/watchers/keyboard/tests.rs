@@ -551,7 +551,12 @@ async fn a_restore_owed_to_a_republished_channel_lands_and_rearms() {
 
     let route = target().route;
     let registry = ChannelRegistry::default();
-    let (shared, handle) = publish_search_keyboard(&registry, "keyboard", route.clone()).await;
+    let (shared, handle) = tokio::time::timeout(
+        Duration::from_secs(5),
+        publish_search_keyboard(&registry, "keyboard", route.clone()),
+    )
+    .await
+    .expect("the scripted keyboard publishes");
     let access = ReceiverAccess::default();
     let (_signal, device_io) = openlogi_hid::device_io_channel();
     let device_access = DeviceAccess {
@@ -580,9 +585,12 @@ async fn a_restore_owed_to_a_republished_channel_lands_and_rearms() {
     let mut state = KeyboardManagerState::new(actions.dispatcher());
     let wait = Duration::from_secs(5);
 
-    state
-        .reconcile(ReceiverRequestState::default(), true, &published, &channels)
-        .await;
+    tokio::time::timeout(
+        wait,
+        state.reconcile(ReceiverRequestState::default(), true, &published, &channels),
+    )
+    .await
+    .expect("the first reconcile arms the keyboard");
     tokio::time::timeout(wait, async {
         while search_key_writes(&handle).is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -613,9 +621,12 @@ async fn a_restore_owed_to_a_republished_channel_lands_and_rearms() {
     // The production loop expedites owed restores on a registry change.
     republish_scripted_channel(&registry, "keyboard", &shared);
     state.expedite_pending_restores();
-    state
-        .reconcile(ReceiverRequestState::default(), true, &published, &channels)
-        .await;
+    tokio::time::timeout(
+        wait,
+        state.reconcile(ReceiverRequestState::default(), true, &published, &channels),
+    )
+    .await
+    .expect("the reconcile after the republish finishes its restore");
     assert!(
         !state.has_pending_restores(),
         "the restore lands on the republished channel"
@@ -624,9 +635,12 @@ async fn a_restore_owed_to_a_republished_channel_lands_and_rearms() {
 
     // Only the restart pacing remains; once it elapses the keyboard re-arms.
     tokio::time::sleep(RETRY_DELAY).await;
-    state
-        .reconcile(ReceiverRequestState::default(), true, &published, &channels)
-        .await;
+    tokio::time::timeout(
+        wait,
+        state.reconcile(ReceiverRequestState::default(), true, &published, &channels),
+    )
+    .await
+    .expect("the reconcile after the restart pacing finishes");
     assert!(
         state
             .slots

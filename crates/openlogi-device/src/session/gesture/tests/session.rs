@@ -451,22 +451,28 @@ async fn pending_restore_lands_on_a_withdrawn_channel_published_again() {
         product_id: 0xb35b,
     };
     let (raw, handle) = ScriptedRawHidChannel::with_responder(|request| Some(request.to_vec()));
-    let channel = scripted_channel(raw).await;
+    let wait = std::time::Duration::from_secs(2);
+    let channel = tokio::time::timeout(wait, scripted_channel(raw))
+        .await
+        .expect("the scripted channel opens");
     let registry = ChannelRegistry::default();
     let node = NodeId::from("mouse-node".to_owned());
     registry.replace_node(node.clone(), [route.clone()], channel.clone());
     let pending = diverted_gesture(&route, &channel);
 
     registry.remove_node(&node);
-    let CaptureSessionOutcome::RestorePending(pending) = pending.retry(&registry).await else {
+    let withdrawn = tokio::time::timeout(wait, pending.retry(&registry))
+        .await
+        .expect("a retry on an empty route returns at once");
+    let CaptureSessionOutcome::RestorePending(pending) = withdrawn else {
         panic!("nothing publishes the route");
     };
     registry.replace_node(node, [route.clone()], channel);
 
-    assert!(matches!(
-        pending.retry(&registry).await,
-        CaptureSessionOutcome::Restored
-    ));
+    let republished = tokio::time::timeout(wait, pending.retry(&registry))
+        .await
+        .expect("the restore on the republished channel finishes");
+    assert!(matches!(republished, CaptureSessionOutcome::Restored));
     assert_eq!(handle.written_reports().len(), 1);
 }
 
